@@ -1,0 +1,2574 @@
+﻿"""
+DIALOGS - Cửa sổ hộp thoại
+"""
+
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog
+from datetime import datetime
+import re
+import logging
+from database import get_connection
+from utils import parse_number, format_date
+from ui.theme import (
+    ACCENT_BLUE, PANEL_BG, PANEL_BORDER, PAGE_BG,
+    TEXT_PRIMARY, TEXT_SECONDARY, TEXT_MUTED, ACCENT_GREEN, ACCENT_AMBER, ACCENT_RED,
+    TOPBAR_BG, TOPBAR_BORDER, create_modern_button,
+)
+
+logger = logging.getLogger(__name__)
+
+
+def _style_dialog_tree(root):
+    """Apply the softer form treatment from the design system to legacy dialogs."""
+    for widget in root.winfo_children():
+        if isinstance(widget, tk.Label):
+            try:
+                widget.configure(bg=widget.master.cget('bg'), fg=TEXT_SECONDARY, font=('Segoe UI', 9, 'bold'))
+            except tk.TclError:
+                pass
+        elif isinstance(widget, tk.Entry):
+            _style_plain_input(widget)
+        elif isinstance(widget, tk.Text):
+            _style_plain_input(widget)
+        elif isinstance(widget, tk.Button):
+            try:
+                widget.configure(font=('Segoe UI', 10, 'bold'), padx=16, pady=8, bd=0, relief='flat')
+            except tk.TclError:
+                pass
+        _style_dialog_tree(widget)
+
+
+def _style_plain_input(widget):
+    try:
+        widget.configure(
+            font=('Segoe UI', 10),
+            bg='#F8FAFC',
+            fg=TEXT_PRIMARY,
+            relief='flat',
+            bd=0,
+            insertbackground=ACCENT_BLUE,
+            highlightthickness=1,
+            highlightbackground=PANEL_BORDER,
+            highlightcolor=ACCENT_BLUE,
+        )
+    except tk.TclError:
+        pass
+
+
+class OCRProgressDialog(tk.Toplevel):
+    """
+    Progress dialog cho OCR async processing.
+    Hiển thị trạng thái, có nút Cancel để dừng OCR.
+    """
+
+    def __init__(self, parent, title="Đang xử lý OCR"):
+        super().__init__(parent)
+        self.title(title)
+        self.geometry("400x150")
+        self.resizable(False, False)
+        self.transient(parent)
+        self.grab_set()
+
+        self._cancelled = False
+        self._ocr_instance = None
+
+        self._build()
+
+    def _build(self):
+        """Build dialog UI"""
+        frame = tk.Frame(self, bg='#f0f4f8')
+        frame.pack(fill='both', expand=True, padx=16, pady=16)
+
+        # Status label
+        self.status_var = tk.StringVar(value="Đang trích xuất text từ PDF/ảnh...")
+        tk.Label(
+            frame,
+            textvariable=self.status_var,
+            bg='#f0f4f8',
+            fg='#17324D',
+            font=('Arial', 10),
+            justify='center'
+        ).pack(fill='x', pady=(0, 12))
+
+        # Progress bar (indeterminate)
+        self.progress = ttk.Progressbar(
+            frame,
+            mode='indeterminate',
+            length=300
+        )
+        self.progress.pack(fill='x', pady=(0, 16))
+        self.progress.start()
+
+        # Cancel button
+        btn_frame = tk.Frame(frame, bg='#f0f4f8')
+        btn_frame.pack(fill='x')
+        tk.Button(
+            btn_frame,
+            text="Hủy",
+            bg='#e74c3c',
+            fg='white',
+            font=('Arial', 10),
+            padx=20,
+            pady=6,
+            command=self._cancel
+        ).pack()
+
+    def _cancel(self):
+        """Cancel OCR processing"""
+        self._cancelled = True
+        self.status_var.set("Đang dừng...")
+        if self._ocr_instance:
+            try:
+                self._ocr_instance.stop()
+            except Exception as e:
+                logger.error(f"Error stopping OCR: {e}")
+
+    def set_status(self, text):
+        """Update status text"""
+        self.status_var.set(text)
+        self.update_idletasks()
+
+    def set_ocr_instance(self, ocr_instance):
+        """Set OCR instance for cancellation"""
+        self._ocr_instance = ocr_instance
+
+    def is_cancelled(self):
+        """Check if user cancelled"""
+        return self._cancelled
+
+
+
+def _parse_combo_id(value):
+    """Lấy ID từ chuỗi combobox dạng '12 - Tên'."""
+    if not value:
+        return None
+    return int(str(value).split(' - ', 1)[0])
+
+
+def _parse_combo_prefix(value):
+    """Lấy phần đầu chuỗi combobox dạng '111 - Tên'."""
+    if not value:
+        return None
+    return str(value).split(' - ', 1)[0]
+
+
+def _get_simple_catalog_values(catalog_type):
+    try:
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT name FROM simple_catalogs
+            WHERE catalog_type = ? AND active = 1
+            ORDER BY name
+        ''', (catalog_type,))
+        rows = cursor.fetchall()
+        conn.close()
+        return [r[0] for r in rows]
+    except Exception:
+        return []
+
+
+class ExpenseDialog(tk.Toplevel):
+    """Cửa sổ Thêm/Sửa chi phí."""
+
+    def __init__(self, parent, title="Thêm chi phí mới", expense_data=None, expense_id=None):
+        super().__init__(parent)
+        self.title(title)
+        self.geometry("760x720")
+        self.minsize(680, 580)
+        self.resizable(True, True)
+
+        self.result = None
+        self.expense_id = expense_id
+        self.expense_data = expense_data
+
+        self._build_form()
+        if expense_id and not expense_data:
+            self._load_expense(expense_id)
+        elif expense_data:
+            self._fill_expense(expense_data)
+
+        # Làm cho cửa sổ modal
+        self.transient(parent)
+        self.grab_set()
+
+    def _build_form(self):
+        """Xây dựng form."""
+        container = tk.Frame(self, bg=PAGE_BG)
+        container.pack(fill='both', expand=True)
+        canvas = tk.Canvas(container, bg=PAGE_BG, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(container, orient='vertical', command=canvas.yview)
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.pack(side='left', fill='both', expand=True)
+        scrollbar.pack(side='right', fill='y')
+
+        main_frame = tk.Frame(
+            canvas, bg=PANEL_BG,
+            highlightbackground=PANEL_BORDER, highlightthickness=1
+        )
+        window_id = canvas.create_window((18, 18), window=main_frame, anchor='nw')
+        main_frame.bind('<Configure>', lambda _event: canvas.configure(scrollregion=canvas.bbox('all')))
+        canvas.bind('<Configure>', lambda event: canvas.itemconfigure(window_id, width=event.width))
+
+        # ── Ngày chi ──────────────────────────────────────
+        tk.Label(main_frame, text="Ngày chi:", font=('Arial', 10),
+                bg='#f0f4f8', fg='#333').grid(row=0, column=0, sticky='w', pady=5)
+
+        self.date_var = tk.StringVar(value=datetime.now().strftime('%d/%m/%Y'))
+        date_entry = tk.Entry(main_frame, textvariable=self.date_var,
+                             font=('Arial', 10), width=20, relief='solid', bd=1)
+        date_entry.grid(row=0, column=1, sticky='w', pady=5)
+
+        # ── Dự án ──────────────────────────────────────────
+        tk.Label(main_frame, text="Dự án:", font=('Arial', 10),
+                bg='#f0f4f8', fg='#333').grid(row=1, column=0, sticky='w', pady=5)
+
+        self.project_var = tk.StringVar()
+        projects = self._get_projects()
+        self.project_combo = ttk.Combobox(main_frame, textvariable=self.project_var,
+                                    values=projects, width=30, state='readonly')
+        self.project_combo.grid(row=1, column=1, sticky='ew', pady=5)
+        if projects:
+            self.project_combo.current(0)
+        self.project_combo.bind('<<ComboboxSelected>>', lambda _e: self._reload_project_links())
+
+        # ── Hợp đồng (tùy chọn) ────────────────────────────
+        tk.Label(main_frame, text="Hợp đồng:", font=('Arial', 10),
+                bg='#f0f4f8', fg='#333').grid(row=2, column=0, sticky='w', pady=5)
+        self.contract_var = tk.StringVar()
+        self.contract_combo = ttk.Combobox(main_frame, textvariable=self.contract_var,
+                                         values=[''], width=30, state='readonly')
+        self.contract_combo.grid(row=2, column=1, sticky='ew', pady=5)
+
+        # ── Hạng mục công trình (tùy chọn) ─────────────────
+        tk.Label(main_frame, text="Hạng mục:", font=('Arial', 10),
+                bg='#f0f4f8', fg='#333').grid(row=3, column=0, sticky='w', pady=5)
+        self.work_item_var = tk.StringVar()
+        self.work_item_combo = ttk.Combobox(main_frame, textvariable=self.work_item_var,
+                                            values=[''], width=30, state='readonly')
+        self.work_item_combo.grid(row=3, column=1, sticky='ew', pady=5)
+        self._reload_project_links()
+
+        # ── Loại chi phí ───────────────────────────────────
+        tk.Label(main_frame, text="Loại chi phí:", font=('Arial', 10),
+                bg='#f0f4f8', fg='#333').grid(row=4, column=0, sticky='w', pady=5)
+
+        self.category_var = tk.StringVar()
+        categories = self._get_categories()
+        self.category_combo = ttk.Combobox(main_frame, textvariable=self.category_var,
+                                     values=categories, width=30, state='readonly')
+        self.category_combo.grid(row=4, column=1, sticky='ew', pady=5)
+        if categories:
+            self.category_combo.current(0)
+
+        # ── Mô tả ──────────────────────────────────────────
+        tk.Label(main_frame, text="Mô tả:", font=('Arial', 10),
+                bg='#f0f4f8', fg='#333').grid(row=5, column=0, sticky='nw', pady=5)
+
+        self.description_text = tk.Text(main_frame, font=('Arial', 10),
+                                       height=4, width=40, relief='solid', bd=1)
+        self.description_text.grid(row=5, column=1, sticky='ew', pady=5)
+
+        # ── Số tiền ────────────────────────────────────────
+        tk.Label(main_frame, text="Số tiền (₫):", font=('Arial', 10),
+                bg='#f0f4f8', fg='#333').grid(row=6, column=0, sticky='w', pady=5)
+
+        self.amount_var = tk.StringVar()
+        amount_entry = tk.Entry(main_frame, textvariable=self.amount_var,
+                               font=('Arial', 10), width=20, relief='solid', bd=1)
+        amount_entry.grid(row=6, column=1, sticky='w', pady=5)
+
+        # ── Người chi ──────────────────────────────────────
+        tk.Label(main_frame, text="Người chi:", font=('Arial', 10),
+                bg='#f0f4f8', fg='#333').grid(row=7, column=0, sticky='w', pady=5)
+
+        self.paid_by_var = tk.StringVar()
+        paid_by_entry = ttk.Combobox(main_frame, textvariable=self.paid_by_var,
+                                    values=_get_simple_catalog_values('employee'), width=30)
+        paid_by_entry.grid(row=7, column=1, sticky='ew', pady=5)
+
+        # ── Hình thức thanh toán ──────────────────────────
+        tk.Label(main_frame, text="Hình thức:", font=('Arial', 10),
+                bg='#f0f4f8', fg='#333').grid(row=8, column=0, sticky='w', pady=5)
+
+        payment_methods = _get_simple_catalog_values('payment_method') or ['Tiền mặt', 'Chuyển khoản', 'Séc', 'Khác']
+        self.method_var = tk.StringVar(value=payment_methods[0])
+        method_combo = ttk.Combobox(main_frame, textvariable=self.method_var,
+                                   values=payment_methods,
+                                   width=30, state='readonly')
+        method_combo.grid(row=8, column=1, sticky='ew', pady=5)
+
+        extra_specs = [
+            ('department', 'Phòng ban:', 'Phòng VT-TB'),
+            ('purpose', 'Mục đích sử dụng:', ''),
+            ('item_list', 'Danh sách/Nội dung lên mẫu:', ''),
+            ('accounting_staff', 'Kế toán ký:', 'Kế toán'),
+            ('department_head', 'Trưởng phòng ký:', ''),
+            ('prepared_by', 'Người lập:', ''),
+            ('attachments', 'Hồ sơ đính kèm:', ''),
+        ]
+        self.extra_vars = {}
+        for offset, (key, label, default) in enumerate(extra_specs, 9):
+            tk.Label(main_frame, text=label, font=('Arial', 10),
+                    bg='#f0f4f8', fg='#333').grid(row=offset, column=0, sticky='w', pady=5)
+            var = tk.StringVar(value=default)
+            self.extra_vars[key] = var
+            ttk.Combobox(
+                main_frame, textvariable=var,
+                values=_get_simple_catalog_values('department') if key == 'department' else [],
+                width=40
+            ).grid(row=offset, column=1, sticky='ew', pady=5)
+
+        # ── Ghi chú ────────────────────────────────────────
+        tk.Label(main_frame, text="Ghi chú:", font=('Arial', 10),
+                bg='#f0f4f8', fg='#333').grid(row=16, column=0, sticky='nw', pady=5)
+
+        self.notes_text = tk.Text(main_frame, font=('Arial', 10),
+                                 height=2, width=40, relief='solid', bd=1)
+        self.notes_text.grid(row=16, column=1, sticky='ew', pady=5)
+
+        # ── Nút chức năng ──────────────────────────────────
+        button_frame = tk.Frame(main_frame, bg=PANEL_BG)
+        button_frame.grid(row=17, column=0, columnspan=2, sticky='ew', pady=20)
+
+        tk.Button(button_frame, text="💾 Lưu", font=('Arial', 10, 'bold'),
+                 bg='#27ae60', fg='white', padx=20, pady=8, cursor='hand2',
+                 command=self._save).pack(side='left', padx=5)
+
+        tk.Button(button_frame, text="❌ Hủy", font=('Arial', 10),
+                 bg='#95a5a6', fg='white', padx=20, pady=8, cursor='hand2',
+                 command=self.destroy).pack(side='left', padx=5)
+
+        # Cấu hình grid
+        main_frame.columnconfigure(1, weight=1)
+        for child in main_frame.winfo_children():
+            info = child.grid_info()
+            if info:
+                child.grid_configure(padx=(18, 18), pady=(6, 6))
+        _style_dialog_tree(main_frame)
+
+    def _load_expense(self, expense_id):
+        try:
+            from modules.accounting import ExpenseManager
+            row = ExpenseManager().get_expense_by_id(expense_id)
+            if row:
+                self._fill_expense(row)
+        except Exception as exc:
+            messagebox.showerror("Lỗi", f"Không tải được chi phí: {exc}")
+
+    def _fill_expense(self, row):
+        from utils import format_date
+        if row.get('expense_date'):
+            try:
+                self.date_var.set(format_date(row['expense_date'], '%d/%m/%Y'))
+            except Exception:
+                self.date_var.set(str(row['expense_date']))
+        if row.get('project_id'):
+            for val in self.project_combo['values']:
+                if val.startswith(f"{row['project_id']} -"):
+                    self.project_var.set(val)
+                    break
+        self._reload_project_links()
+        if row.get('category_id'):
+            conn = get_connection()
+            cur = conn.cursor()
+            cur.execute('SELECT id, name FROM expense_categories WHERE id = ?', (row['category_id'],))
+            cat = cur.fetchone()
+            conn.close()
+            if cat:
+                self.category_var.set(f"{cat[0]} - {cat[1]}")
+        if row.get('contract_id'):
+            for val in self.contract_combo['values']:
+                if val.startswith(f"{row['contract_id']} -"):
+                    self.contract_var.set(val)
+                    break
+        if row.get('work_item_id'):
+            for val in self.work_item_combo['values']:
+                if val.startswith(f"{row['work_item_id']} -"):
+                    self.work_item_var.set(val)
+                    break
+        self.description_text.delete('1.0', 'end')
+        self.description_text.insert('1.0', row.get('description') or '')
+        self.amount_var.set(str(row.get('amount') or 0))
+        self.paid_by_var.set(row.get('paid_by') or '')
+        if row.get('payment_method'):
+            self.method_var.set(row['payment_method'])
+        self.notes_text.delete('1.0', 'end')
+        self.notes_text.insert('1.0', row.get('notes') or '')
+        for key, var in self.extra_vars.items():
+            if row.get(key):
+                var.set(row[key])
+
+    def _get_projects(self):
+        """Lấy danh sách dự án."""
+        try:
+            conn = get_connection()
+            cursor = conn.cursor()
+            cursor.execute('SELECT id, name FROM projects WHERE status = "active"')
+            projects = cursor.fetchall()
+            conn.close()
+            return [f"{p[0]} - {p[1]}" for p in projects]
+        except:
+            return []
+
+    def _get_categories(self):
+        """Lấy danh sách loại chi phí."""
+        try:
+            conn = get_connection()
+            cursor = conn.cursor()
+            cursor.execute('SELECT id, name FROM expense_categories ORDER BY name')
+            categories = cursor.fetchall()
+            conn.close()
+            return [f"{c[0]} - {c[1]}" for c in categories]
+        except:
+            return []
+
+    def _reload_project_links(self):
+        project_id = _parse_combo_id(self.project_var.get())
+        contracts = ['']
+        work_items = ['']
+        if project_id:
+            try:
+                conn = get_connection()
+                cursor = conn.cursor()
+                cursor.execute('''
+                    SELECT id, contract_no, partner_name FROM project_contracts
+                    WHERE project_id = ? ORDER BY contract_no
+                ''', (project_id,))
+                contracts.extend([f"{r[0]} - {r[1]} ({r[2]})" for r in cursor.fetchall()])
+                cursor.execute('''
+                    SELECT id, item_code, item_name FROM construction_work_items
+                    WHERE project_id = ? ORDER BY item_code
+                ''', (project_id,))
+                work_items.extend([f"{r[0]} - {r[1]} {r[2]}" for r in cursor.fetchall()])
+                conn.close()
+            except Exception:
+                pass
+        self.contract_combo['values'] = contracts
+        self.work_item_combo['values'] = work_items
+        if contracts:
+            self.contract_combo.current(0)
+        if work_items:
+            self.work_item_combo.current(0)
+
+    def _save(self):
+        """Lưu dữ liệu."""
+        # Kiểm tra dữ liệu
+        if not self.amount_var.get().strip():
+            messagebox.showwarning("Lỗi", "Vui lòng nhập số tiền!")
+            return
+
+        if not self.category_var.get():
+            messagebox.showwarning("Lỗi", "Vui lòng chọn loại chi phí!")
+            return
+
+        try:
+            self.result = {
+                'expense_id': self.expense_id,
+                'date': self.date_var.get(),
+                'project_id': _parse_combo_id(self.project_var.get()),
+                'category_id': _parse_combo_id(self.category_var.get()),
+                'contract_id': _parse_combo_id(self.contract_var.get()),
+                'work_item_id': _parse_combo_id(self.work_item_var.get()),
+                'description': self.description_text.get('1.0', 'end-1c'),
+                'amount': parse_number(self.amount_var.get()),
+                'paid_by': self.paid_by_var.get(),
+                'method': self.method_var.get(),
+                'notes': self.notes_text.get('1.0', 'end-1c'),
+                'extra_fields': {key: var.get().strip() for key, var in self.extra_vars.items()},
+            }
+            self.destroy()
+        except ValueError:
+            messagebox.showerror("Lỗi", "Số tiền không hợp lệ!")
+
+
+class BulkExpenseDialog(tk.Toplevel):
+    """Nhập nhiều chi phí bằng cách dán bảng từ Excel."""
+
+    HEADERS = [
+        'Ngày', 'Dự án ID', 'Loại chi phí ID', 'Mô tả', 'Số tiền',
+        'Người chi', 'Hình thức', 'Ghi chú', 'Phòng ban',
+        'Mục đích sử dụng', 'Nội dung lên mẫu', 'Kế toán ký',
+        'Trưởng phòng ký', 'Người lập', 'Hồ sơ đính kèm'
+    ]
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.title("Nhập chi phí hàng loạt")
+        self.geometry("1080x640")
+        self.minsize(920, 540)
+        self.result = None
+        self._build()
+        self.transient(parent)
+        self.grab_set()
+
+    def _build(self):
+        frame = tk.Frame(self, bg='#f0f4f8')
+        frame.pack(fill='both', expand=True, padx=14, pady=14)
+
+        tk.Label(
+            frame,
+            text="Dán dữ liệu từ Excel theo đúng thứ tự cột bên dưới. Có thể dán cả dòng tiêu đề.",
+            bg='#f0f4f8', fg='#17324D', font=('Arial', 10, 'bold')
+        ).pack(anchor='w')
+
+        header_text = '\t'.join(self.HEADERS)
+        tk.Label(frame, text=header_text, bg='#f0f4f8', fg='#6B7280',
+                 font=('Consolas', 9), wraplength=1020, justify='left').pack(anchor='w', pady=(6, 8))
+
+        text_wrap = tk.Frame(frame)
+        text_wrap.pack(fill='both', expand=True)
+        self.text = tk.Text(text_wrap, font=('Consolas', 10), wrap='none', undo=True)
+        y_scroll = ttk.Scrollbar(text_wrap, orient='vertical', command=self.text.yview)
+        x_scroll = ttk.Scrollbar(text_wrap, orient='horizontal', command=self.text.xview)
+        self.text.configure(yscrollcommand=y_scroll.set, xscrollcommand=x_scroll.set)
+        self.text.grid(row=0, column=0, sticky='nsew')
+        y_scroll.grid(row=0, column=1, sticky='ns')
+        x_scroll.grid(row=1, column=0, sticky='ew')
+        text_wrap.rowconfigure(0, weight=1)
+        text_wrap.columnconfigure(0, weight=1)
+
+        sample = [
+            '18/05/2026', '', '', 'Thuê xe cẩu chở vật tư về dự án',
+            '5,940,000.000', 'Nguyễn Văn A', 'Tiền mặt', '',
+            'Phòng VT-TB', 'Phục vụ dự án', 'Thuê xe cẩu chở vật tư',
+            'Kế toán', 'Trưởng phòng', 'Người lập', 'Hóa đơn; Biên bản giao hàng'
+        ]
+        self.text.insert('1.0', '\t'.join(sample))
+
+        buttons = tk.Frame(frame, bg='#f0f4f8')
+        buttons.pack(fill='x', pady=(10, 0))
+        tk.Button(buttons, text="Lưu tất cả dòng hợp lệ", bg='#27ae60', fg='white',
+                  font=('Arial', 10, 'bold'), padx=18, pady=8, command=self._save).pack(side='left', padx=4)
+        tk.Button(buttons, text="Xóa dữ liệu mẫu", bg='#34495e', fg='white',
+                  font=('Arial', 10), padx=18, pady=8,
+                  command=lambda: self.text.delete('1.0', 'end')).pack(side='left', padx=4)
+        tk.Button(buttons, text="Hủy", bg='#95a5a6', fg='white',
+                  font=('Arial', 10), padx=18, pady=8, command=self.destroy).pack(side='left', padx=4)
+
+    def _save(self):
+        rows = []
+        errors = []
+        raw_lines = [line for line in self.text.get('1.0', 'end-1c').splitlines() if line.strip()]
+        for index, line in enumerate(raw_lines, 1):
+            parts = line.split('\t')
+            if len(parts) == 1:
+                parts = [p.strip() for p in line.split('|')]
+            parts = [p.strip() for p in parts]
+            if index == 1 and parts and parts[0].lower() in ('ngày', 'ngay'):
+                continue
+            if len(parts) < 5:
+                errors.append(f"Dòng {index}: thiếu cột bắt buộc.")
+                continue
+            parts.extend([''] * (len(self.HEADERS) - len(parts)))
+            try:
+                amount = parse_number(parts[4])
+                if not parts[3] or amount <= 0:
+                    raise ValueError("thiếu mô tả hoặc số tiền <= 0")
+                rows.append({
+                    'date': format_date(parts[0] or datetime.now(), '%Y-%m-%d'),
+                    'project_id': int(parts[1]) if parts[1] else None,
+                    'category_id': int(parts[2]) if parts[2] else None,
+                    'description': parts[3],
+                    'amount': amount,
+                    'paid_by': parts[5],
+                    'method': parts[6] or 'Tiền mặt',
+                    'notes': parts[7],
+                    'extra_fields': {
+                        'department': parts[8],
+                        'purpose': parts[9],
+                        'item_list': parts[10],
+                        'accounting_staff': parts[11],
+                        'department_head': parts[12],
+                        'prepared_by': parts[13],
+                        'attachments': parts[14],
+                    },
+                })
+            except Exception as exc:
+                errors.append(f"Dòng {index}: {exc}")
+
+        if not rows:
+            messagebox.showwarning("Chưa có dữ liệu hợp lệ", "\n".join(errors[:8]) or "Không có dòng hợp lệ.")
+            return
+        if errors and not messagebox.askyesno(
+            "Có dòng lỗi",
+            f"Có {len(errors)} dòng lỗi, vẫn lưu {len(rows)} dòng hợp lệ?\n\n" + "\n".join(errors[:6])
+        ):
+            return
+        self.result = {'rows': rows, 'errors': errors}
+        self.destroy()
+
+
+class BulkExpenseDialog(tk.Toplevel):
+    """Nhập nhiều chi phí hàng loạt - Modern UI với real-time validation."""
+
+    HEADERS = [
+        'Ngày', 'Dự án ID', 'Loại chi phí ID', 'Mô tả', 'Số tiền',
+        'Người chi', 'Hình thức', 'Ghi chú', 'Phòng ban',
+        'Mục đích sử dụng', 'Nội dung lên mẫu', 'Kế toán ký',
+        'Trưởng phòng ký', 'Người lập', 'Hồ sơ đính kèm'
+    ]
+    WIDTHS = [12, 10, 13, 34, 16, 18, 14, 22, 16, 24, 28, 16, 18, 16, 28]
+
+    def __init__(self, parent, rows=30):
+        super().__init__(parent)
+        self.title("Nhập chi phí hàng loạt")
+        self.geometry("1280x720")
+        self.minsize(1080, 600)
+        self.result = None
+        self.row_count = rows
+        self.cells = []
+        self.row_indicators = []  # Status indicators for each row
+        self.active_cell = (0, 0)
+
+        # Import validator
+        try:
+            from modules.bulk_expense_validator import BulkExpenseValidator
+            self.validator = BulkExpenseValidator()
+        except ImportError:
+            self.validator = None
+
+        self.validation_results = {}  # row_index -> RowValidationResult
+
+        self._build()
+        self.transient(parent)
+        self.grab_set()
+
+    def _build(self):
+        """Build the modern UI layout"""
+        main = tk.Frame(self, bg=self.theme.get('PAGE_BG', '#F0F4FA'))
+        main.pack(fill='both', expand=True)
+
+        # Header section
+        self._build_header(main)
+
+        # Content section (grid + preview)
+        content = tk.Frame(main, bg=self.theme.get('PAGE_BG', '#F0F4FA'))
+        content.pack(fill='both', expand=True, padx=12, pady=8)
+        content.columnconfigure(0, weight=3)
+        content.columnconfigure(1, weight=1)
+
+        # Grid section
+        self._build_grid_section(content)
+
+        # Preview/Summary section
+        self._build_preview_section(content)
+
+        # Footer (buttons)
+        self._build_footer(main)
+
+    def _build_header(self, parent):
+        """Build header with title and instructions"""
+        header = tk.Frame(parent, bg=self.theme.get('TOPBAR_BG', '#FFFFFF'),
+                         highlightbackground=self.theme.get('TOPBAR_BORDER', '#DCE3EC'),
+                         highlightthickness=1)
+        header.pack(fill='x')
+
+        # Title
+        tk.Label(header, text="Nhập Chi Phí Hàng Loạt", 
+                bg=self.theme.get('TOPBAR_BG', '#FFFFFF'),
+                fg=self.theme.get('TEXT_PRIMARY', '#1A2D4A'),
+                font=('Segoe UI', 13, 'bold')).pack(anchor='w', padx=16, pady=(10, 2))
+
+        # Subtitle
+        tk.Label(header, text="Dán dữ liệu từ Excel hoặc nhập trực tiếp. Ctrl+V để paste vùng dữ liệu.",
+                bg=self.theme.get('TOPBAR_BG', '#FFFFFF'),
+                fg=self.theme.get('TEXT_MUTED', '#8A9BB0'),
+                font=('Segoe UI', 9)).pack(anchor='w', padx=16, pady=(0, 10))
+
+    def _build_grid_section(self, parent):
+        """Build the data entry grid"""
+        grid_frame = tk.Frame(parent, bg=self.theme.get('PAGE_BG', '#F0F4FA'))
+        grid_frame.grid(row=0, column=0, sticky='nsew', padx=(0, 8))
+
+        # Grid wrapper with canvas
+        wrap = tk.Frame(grid_frame, bg=self.theme.get('PAGE_BG', '#F0F4FA'))
+        wrap.pack(fill='both', expand=True)
+
+        canvas = tk.Canvas(wrap, bg=self.theme.get('PANEL_BG', '#FFFFFF'),
+                         highlightthickness=1,
+                         highlightbackground=self.theme.get('PANEL_BORDER', '#DCE3EC'))
+        y_scroll = ttk.Scrollbar(wrap, orient='vertical', command=canvas.yview)
+        x_scroll = ttk.Scrollbar(wrap, orient='horizontal', command=canvas.xview)
+        canvas.configure(yscrollcommand=y_scroll.set, xscrollcommand=x_scroll.set)
+        canvas.grid(row=0, column=0, sticky='nsew')
+        y_scroll.grid(row=0, column=1, sticky='ns')
+        x_scroll.grid(row=1, column=0, sticky='ew')
+        wrap.rowconfigure(0, weight=1)
+        wrap.columnconfigure(0, weight=1)
+
+        inner = tk.Frame(canvas, bg=self.theme.get('PANEL_BG', '#FFFFFF'))
+        window_id = canvas.create_window((0, 0), window=inner, anchor='nw')
+        inner.bind('<Configure>', lambda _e: canvas.configure(scrollregion=canvas.bbox('all')))
+        canvas.bind('<Configure>', lambda _e: canvas.itemconfigure(window_id))
+
+        # Row number column + headers
+        row_num_label = tk.Label(inner, text="#", bg=self.theme.get('TEXT_PRIMARY', '#1A2D4A'),
+                                fg='white', font=('Segoe UI', 8, 'bold'), width=3, relief='solid', bd=1)
+        row_num_label.grid(row=0, column=-1, sticky='nsew')
+
+        for col, header in enumerate(self.HEADERS):
+            tk.Label(inner, text=header, bg=self.theme.get('TEXT_PRIMARY', '#1A2D4A'),
+                    fg='white', font=('Segoe UI', 8, 'bold'),
+                    width=self.WIDTHS[col], relief='solid', bd=1, padx=2, pady=3).grid(row=0, column=col, sticky='nsew')
+
+        # Sample data
+        sample = ['18/05/2026', '', '', 'Thuê xe cẩu chở vật tư về dự án', '5,940,000',
+                 'Nguyễn Văn A', 'Tiền mặt', '', 'Phòng VT-TB', 'Phục vụ dự án',
+                 'Thuê xe cẩu chở vật tư', 'Kế toán', 'Trưởng phòng', 'Người lập',
+                 'Hóa đơn; Biên bản giao hàng']
+
+        # Build rows with status indicators
+        for row_idx in range(self.row_count):
+            # Row number
+            row_num = tk.Label(inner, text=str(row_idx + 1), bg='#F8FAFC', fg=self.theme.get('TEXT_MUTED', '#8A9BB0'),
+                             font=('Segoe UI', 8), width=3, relief='solid', bd=0.5, anchor='center')
+            row_num.grid(row=row_idx + 1, column=-1, sticky='nsew')
+
+            row_cells = []
+            for col in range(len(self.HEADERS)):
+                var = tk.StringVar(value=sample[col] if row_idx == 0 else '')
+                entry = tk.Entry(inner, textvariable=var, font=('Segoe UI', 9),
+                               width=self.WIDTHS[col], relief='solid', bd=0.5)
+                entry.grid(row=row_idx + 1, column=col, sticky='nsew')
+                entry.bind('<FocusIn>', lambda _e, r=row_idx, c=col: self._on_cell_focus(r, c))
+                entry.bind('<FocusOut>', lambda _e, r=row_idx: self._validate_row(r))
+                entry.bind('<Control-v>', self._paste_from_clipboard)
+                entry.bind('<KeyRelease>', lambda _e, r=row_idx: self._debounce_validate_row(r))
+                row_cells.append(var)
+
+            self.cells.append(row_cells)
+            self.row_indicators.append(row_num)
+
+    def _build_preview_section(self, parent):
+        """Build the summary/preview section"""
+        preview = tk.Frame(parent, bg=self.theme.get('PAGE_BG', '#F0F4FA'))
+        preview.grid(row=0, column=1, sticky='nsew', padx=(8, 0))
+
+        # Summary title
+        tk.Label(preview, text="Tóm tắt", bg=self.theme.get('PAGE_BG', '#F0F4FA'),
+                fg=self.theme.get('TEXT_PRIMARY', '#1A2D4A'), font=('Segoe UI', 10, 'bold')).pack(anchor='w', pady=(0, 8))
+
+        # Summary cards
+        self.summary_frame = tk.Frame(preview, bg=self.theme.get('PAGE_BG', '#F0F4FA'))
+        self.summary_frame.pack(fill='both', expand=True)
+
+        self._update_summary()
+
+    def _build_footer(self, parent):
+        """Build footer with action buttons"""
+        footer = tk.Frame(parent, bg=self.theme.get('PAGE_BG', '#F0F4FA'))
+        footer.pack(fill='x', padx=12, pady=12)
+
+        # Left side - Save button
+        left = tk.Frame(footer, bg=self.theme.get('PAGE_BG', '#F0F4FA'))
+        left.pack(side='left', fill='x', expand=True)
+
+        tk.Button(left, text="✓ Lưu dòng hợp lệ", bg=self.theme.get('ACCENT_GREEN', '#0D9455'),
+                 fg='white', font=('Segoe UI', 10, 'bold'), padx=16, pady=8,
+                 command=self._save).pack(side='left', padx=4)
+
+        # Right side - Other buttons
+        right = tk.Frame(footer, bg=self.theme.get('PAGE_BG', '#F0F4FA'))
+        right.pack(side='right', fill='x')
+
+        tk.Button(right, text="Xuất lỗi", bg=self.theme.get('ACCENT_AMBER', '#C27A10'),
+                 fg='white', font=('Segoe UI', 10), padx=12, pady=8,
+                 command=self._export_errors).pack(side='left', padx=4)
+
+        tk.Button(right, text="Xóa mẫu", bg=self.theme.get('TEXT_SECONDARY', '#5A7A99'),
+                 fg='white', font=('Segoe UI', 10), padx=12, pady=8,
+                 command=self._clear_sample).pack(side='left', padx=4)
+
+        tk.Button(right, text="Hủy", bg=self.theme.get('TEXT_MUTED', '#8A9BB0'),
+                 fg='white', font=('Segoe UI', 10), padx=12, pady=8,
+                 command=self.destroy).pack(side='left', padx=4)
+
+    def _on_cell_focus(self, row, col):
+        """Track active cell"""
+        self.active_cell = (row, col)
+
+    def _validate_row(self, row_idx):
+        """Validate a single row"""
+        if not self.validator:
+            return
+
+        row_data = [var.get().strip() for var in self.cells[row_idx]]
+        result = self.validator.validate_row(row_data, row_idx)
+        self.validation_results[row_idx] = result
+
+        # Update visual indicator
+        indicator = self.row_indicators[row_idx]
+        if result.is_empty:
+            indicator.configure(bg='white', fg=self.theme.get('TEXT_MUTED', '#8A9BB0'))
+            indicator.config(text="")
+        elif result.status.value == 'valid':
+            indicator.configure(bg=self.theme.get('ACCENT_GREEN', '#0D9455'), fg='white')
+            indicator.config(text="✓")
+        elif result.status.value == 'warning':
+            indicator.configure(bg=self.theme.get('ACCENT_AMBER', '#C27A10'), fg='white')
+            indicator.config(text="⚠")
+        else:  # error
+            indicator.configure(bg=self.theme.get('ACCENT_RED', '#E53935'), fg='white')
+            indicator.config(text="✗")
+
+        self._update_summary()
+
+    def _debounce_validate_row(self, row_idx):
+        """Debounced row validation on keystroke"""
+        self.after(500, lambda: self._validate_row(row_idx))
+
+    def _paste_from_clipboard(self, _event=None):
+        """Handle Ctrl+V paste"""
+        try:
+            text = self.clipboard_get()
+        except Exception:
+            return 'break'
+
+        start_row, start_col = self.active_cell
+        for r_offset, line in enumerate(text.splitlines()):
+            values = line.split('\t')
+            for c_offset, value in enumerate(values):
+                row = start_row + r_offset
+                col = start_col + c_offset
+                if row < len(self.cells) and col < len(self.HEADERS):
+                    self.cells[row][col].set(value.strip())
+                    self._validate_row(row)
+        return 'break'
+
+    def _update_summary(self):
+        """Update summary cards"""
+        for widget in self.summary_frame.winfo_children():
+            widget.destroy()
+
+        if not self.validator:
+            return
+
+        # Count rows
+        total_rows = len(self.cells)
+        non_empty = sum(1 for r in self.cells if any(v.get().strip() for v in r))
+
+        # Validate all
+        all_results = []
+        for row_idx in range(total_rows):
+            if row_idx not in self.validation_results:
+                row_data = [v.get().strip() for v in self.cells[row_idx]]
+                result = self.validator.validate_row(row_data, row_idx)
+                self.validation_results[row_idx] = result
+            all_results.append(self.validation_results[row_idx])
+
+        summary = self.validator.get_summary(all_results)
+
+        # Summary cards
+        cards = [
+            ('Tổng', str(total_rows), self.theme.get('TEXT_SECONDARY', '#5A7A99')),
+            ('Hợp lệ', str(summary['valid']), self.theme.get('ACCENT_GREEN', '#0D9455')),
+            ('Cảnh báo', str(summary['warning']), self.theme.get('ACCENT_AMBER', '#C27A10')),
+            ('Lỗi', str(summary['error']), self.theme.get('ACCENT_RED', '#E53935')),
+        ]
+
+        for label, value, color in cards:
+            card = tk.Frame(self.summary_frame, bg=self.theme.get('PANEL_BG', '#FFFFFF'),
+                           highlightbackground=self.theme.get('PANEL_BORDER', '#DCE3EC'),
+                           highlightthickness=1)
+            card.pack(fill='x', pady=4)
+
+            tk.Label(card, text=label, bg=self.theme.get('PANEL_BG', '#FFFFFF'),
+                    fg=self.theme.get('TEXT_MUTED', '#8A9BB0'), font=('Segoe UI', 8)).pack(anchor='w', padx=8, pady=(6, 2))
+
+            tk.Label(card, text=value, bg=self.theme.get('PANEL_BG', '#FFFFFF'),
+                    fg=color, font=('Segoe UI', 16, 'bold')).pack(anchor='w', padx=8, pady=(0, 6))
+
+    def _export_errors(self):
+        """Export validation errors"""
+        if not self.validation_results:
+            messagebox.showinfo("Thông báo", "Không có lỗi để xuất.")
+            return
+
+        errors_text = self.validator.export_errors(list(self.validation_results.values()))
+
+        # Show in message box or copy to clipboard
+        messagebox.showinfo("Lỗi Validation", errors_text[:500] + ("..." if len(errors_text) > 500 else ""))
+
+    def _clear_sample(self):
+        """Clear the sample data"""
+        for row_cells in self.cells:
+            for var in row_cells:
+                var.set('')
+
+    def _save(self):
+        """Save valid rows"""
+        rows = []
+        errors = []
+
+        if not self.validator:
+            messagebox.showerror("Lỗi", "Validator không khả dụng")
+            return
+
+        # Validate all rows
+        for index, vars_row in enumerate(self.cells, 1):
+            row_data = [var.get().strip() for var in vars_row]
+            result = self.validator.validate_row(row_data, index - 1)
+
+            if result.is_empty:
+                continue
+
+            if not result.is_valid:
+                errors.append(f"Dòng {index}: {'; '.join(result.error_messages)}")
+                continue
+
+            if result.parsed_data:
+                rows.append({
+                    'date': result.parsed_data.get('date', ''),
+                    'project_id': int(result.parsed_data.get('project_id', 0)) if result.parsed_data.get('project_id') else None,
+                    'category_id': int(result.parsed_data.get('category_id', 0)) if result.parsed_data.get('category_id') else None,
+                    'description': result.parsed_data.get('description', ''),
+                    'amount': float(result.parsed_data.get('amount', 0)),
+                    'paid_by': result.parsed_data.get('paid_by', ''),
+                    'method': result.parsed_data.get('method', 'Tiền mặt'),
+                    'notes': result.parsed_data.get('notes', ''),
+                    'extra_fields': {
+                        'department': result.parsed_data.get('department', ''),
+                        'purpose': result.parsed_data.get('purpose', ''),
+                        'item_list': result.parsed_data.get('item_list', ''),
+                        'accounting_staff': result.parsed_data.get('accounting_staff', ''),
+                        'department_head': result.parsed_data.get('department_head', ''),
+                        'prepared_by': result.parsed_data.get('prepared_by', ''),
+                        'attachments': result.parsed_data.get('attachments', ''),
+                    },
+                })
+
+        if not rows:
+            messagebox.showwarning("Chưa có dữ liệu hợp lệ",
+                                 "\n".join(errors[:8]) or "Không có dòng hợp lệ.")
+            return
+
+        if errors and not messagebox.askyesno("Có dòng lỗi",
+            f"Có {len(errors)} dòng lỗi, vẫn lưu {len(rows)} dòng hợp lệ?\n\n" + "\n".join(errors[:5])):
+            return
+
+        self.result = {'rows': rows, 'errors': errors}
+        self.destroy()
+        self.destroy()
+
+
+class OCRImportDialog(tk.Toplevel):
+    """Công cụ đọc text từ PDF/hình ảnh - Design system mới."""
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.title("Trích xuất dữ liệu từ PDF / Hình ảnh")
+        self.geometry("1000x680")
+        self.minsize(900, 580)
+        self.result = None
+        self.extraction = None
+        self.field_vars = {}
+
+        # Áp dụng theme
+        from ui import theme as theme_module
+        self._bg = theme_module.PAGE_BG
+        self._panel_bg = theme_module.PANEL_BG
+        self._text_primary = theme_module.TEXT_PRIMARY
+        self._text_secondary = theme_module.TEXT_SECONDARY
+        self._text_muted = theme_module.TEXT_MUTED
+        self._accent_blue = theme_module.ACCENT_BLUE
+        self._accent_green = theme_module.ACCENT_GREEN
+        self._panel_border = theme_module.PANEL_BORDER
+
+        self.configure(bg=self._bg)
+        self._build()
+        self.transient(parent)
+        self.grab_set()
+
+    def _build(self):
+        """Build dialog with modern design"""
+        # Header
+        header = tk.Frame(self, bg=self._panel_bg, highlightbackground=self._panel_border, highlightthickness=1)
+        header.pack(fill='x')
+
+        header_left = tk.Frame(header, bg=self._panel_bg)
+        header_left.pack(side='left', fill='both', expand=True, padx=16, pady=14)
+
+        tk.Label(header_left, text="Trích xuất dữ liệu từ PDF / Hình ảnh",
+                 bg=self._panel_bg, fg=self._text_primary, font=('Segoe UI', 13, 'bold')).pack(anchor='w')
+        tk.Label(header_left, text="Hệ thống sẽ tự động nhận diện text, sau đó bạn có thể chỉnh sửa trước khi lưu.",
+                 bg=self._panel_bg, fg=self._text_muted, font=('Segoe UI', 9)).pack(anchor='w', pady=(4, 0))
+
+        # Buttons
+        header_right = tk.Frame(header, bg=self._panel_bg)
+        header_right.pack(side='right', padx=16, pady=14)
+
+        from ui.component_library import Button
+        Button(header_right, text="Chọn file PDF/ảnh", command=self._choose_file, 
+               variant="primary").pack(side='left', padx=4)
+        Button(header_right, text="Lưu chứng từ", command=self._save_document,
+               variant="success").pack(side='left', padx=4)
+        Button(header_right, text="Đóng", command=self.destroy,
+               variant="secondary").pack(side='left', padx=4)
+
+        # Main content
+        body = tk.Frame(self, bg=self._bg)
+        body.pack(fill='both', expand=True, padx=14, pady=14)
+
+        # Left panel: Raw OCR text
+        left_panel = tk.Frame(body, bg=self._panel_bg, highlightbackground=self._panel_border, highlightthickness=1)
+        left_panel.pack(side='left', fill='both', expand=True, padx=(0, 8))
+
+        tk.Label(left_panel, text="VĂNG BẢN OCR GỐC", anchor='w',
+                 bg=self._panel_bg, fg=self._text_muted, font=('Segoe UI', 8, 'bold')).pack(fill='x', padx=12, pady=(12, 8))
+
+        text_frame = tk.Frame(left_panel, bg=self._panel_bg)
+        text_frame.pack(fill='both', expand=True, padx=12, pady=(0, 12))
+
+        self.text = tk.Text(text_frame, font=('Consolas', 10), wrap='word',
+                           bg=self._panel_bg, fg=self._text_secondary, relief='solid', bd=1,
+                           insertbackground=self._accent_blue)
+        scroll = ttk.Scrollbar(text_frame, orient='vertical', command=self.text.yview)
+        self.text.configure(yscrollcommand=scroll.set)
+        self.text.pack(side='left', fill='both', expand=True)
+        scroll.pack(side='right', fill='y')
+
+        # Right panel: Extracted fields
+        right_panel = tk.Frame(body, bg=self._panel_bg, highlightbackground=self._panel_border, highlightthickness=1, width=320)
+        right_panel.pack(side='right', fill='y', padx=(8, 0))
+        right_panel.pack_propagate(False)
+
+        tk.Label(right_panel, text="THÔNG TIN NHẬN DIỆN", anchor='w',
+                 bg=self._panel_bg, fg=self._text_muted, font=('Segoe UI', 8, 'bold')).pack(fill='x', padx=12, pady=(12, 8))
+
+        # Fields
+        fields = [
+            ('tax_code', 'Mã số thuế'),
+            ('invoice_number', 'Số hóa đơn'),
+            ('invoice_date', 'Ngày hóa đơn'),
+            ('received_date', 'Ngày nhận'),
+            ('deadline', 'Deadline'),
+            ('total_amount', 'Tổng tiền'),
+            ('supplier_name', 'Nhà cung cấp'),
+        ]
+
+        scroll_frame = tk.Frame(right_panel, bg=self._panel_bg)
+        scroll_frame.pack(fill='both', expand=True, padx=12, pady=(0, 12))
+
+        form_inner = tk.Frame(scroll_frame, bg=self._panel_bg)
+        form_inner.pack(fill='both', expand=True)
+
+        for idx, (key, label) in enumerate(fields):
+            tk.Label(form_inner, text=label, bg=self._panel_bg, fg=self._text_secondary,
+                     font=('Segoe UI', 9, 'bold')).grid(row=idx * 2, column=0, sticky='w', padx=0, pady=(8, 2))
+            var = tk.StringVar()
+            entry = tk.Entry(form_inner, textvariable=var, font=('Segoe UI', 10), relief='solid', bd=1,
+                           bg=self._panel_bg, fg=self._text_primary, insertbackground=self._accent_blue)
+            entry.grid(row=idx * 2 + 1, column=0, sticky='ew', padx=0, pady=(0, 8))
+            self.field_vars[key] = var
+
+        form_inner.columnconfigure(0, weight=1)
+
+        # Confidence indicator
+        conf_frame = tk.Frame(form_inner, bg=self._panel_bg)
+        conf_frame.grid(row=len(fields) * 2, column=0, sticky='ew', pady=(12, 0))
+
+        self.confidence_var = tk.StringVar(value='Độ tin cậy: --')
+        tk.Label(conf_frame, textvariable=self.confidence_var, bg=self._panel_bg, fg=self._accent_green,
+                 font=('Segoe UI', 9, 'bold')).pack(anchor='w')
+
+    def _choose_file(self):
+        """Chọn file với async OCR processing"""
+        from modules.document_intake import InvoiceIntakeService
+        path = filedialog.askopenfilename(
+            title="Chọn PDF hoặc hình ảnh",
+            filetypes=[("PDF / Image", "*.pdf *.png *.jpg *.jpeg *.bmp *.tif *.tiff"), ("All files", "*.*")]
+        )
+        if not path:
+            return
+
+        # Show progress dialog
+        progress_dialog = OCRProgressDialog(self, "Đang xử lý OCR...")
+
+        try:
+            service = InvoiceIntakeService()
+
+            def on_ocr_result(ocr_result):
+                """Callback khi OCR hoàn thành"""
+                try:
+                    # Check if cancelled
+                    if progress_dialog.is_cancelled():
+                        progress_dialog.destroy()
+                        messagebox.showinfo("Đã hủy", "Xử lý OCR đã bị hủy.")
+                        return
+
+                    # Check OCR status
+                    from modules.ocr_enhanced import OCRStatus
+                    if ocr_result.status != OCRStatus.SUCCESS:
+                        progress_dialog.destroy()
+                        error_msg = ocr_result.error or "Không nhận diện được text"
+                        messagebox.showerror("Lỗi OCR", f"{error_msg}\n\nHãy kiểm tra:\n- Chất lượng ảnh/PDF\n- Cài đặt Tesseract OCR\n- Gói ngôn ngữ tiếng Việt (vie)")
+                        return
+
+                    # Parse extraction result
+                    progress_dialog.set_status("Đang phân tích dữ liệu...")
+                    self.after_idle(lambda: self._process_ocr_result(
+                        ocr_result.text,
+                        path,
+                        progress_dialog,
+                        service
+                    ))
+                except Exception as e:
+                    logger.exception(f"Error in OCR callback: {e}")
+                    progress_dialog.destroy()
+                    messagebox.showerror("Lỗi OCR", f"Lỗi xử lý kết quả: {str(e)}")
+
+            # Start async OCR
+            from modules.ocr_enhanced import OCRToolEnhanced
+            ocr = OCRToolEnhanced()
+            progress_dialog.set_ocr_instance(ocr)
+            service.text_extractor.extract_text_async(path, on_ocr_result)
+
+        except Exception as e:
+            logger.exception(f"Error starting OCR: {e}")
+            progress_dialog.destroy()
+            messagebox.showerror("Lỗi OCR", f"Lỗi khởi động: {str(e)}")
+
+    def _process_ocr_result(self, raw_text, file_path, progress_dialog, service):
+        """Xử lý kết quả OCR khi hoàn thành"""
+        try:
+            progress_dialog.destroy()
+
+            # Parse fields
+            parsed = {}
+            confidence = 0.0
+            try:
+                from modules.ocr_tools import InvoiceOCRParser
+                parsed = InvoiceOCRParser().parse(raw_text)
+                confidence = parsed.get('confidence', 0.0) or 0.0
+            except Exception as e:
+                logger.warning(f"Field parsing error: {e}")
+                confidence = 0.3  # Low confidence nếu parse fail
+
+            # Fill extraction result
+            from modules.document_intake import InvoiceExtractionResult
+            from datetime import date, timedelta
+
+            self.extraction = InvoiceExtractionResult(
+                source_file=str(file_path),
+                raw_text=raw_text,
+                tax_code=parsed.get('tax_code') or '',
+                invoice_number=parsed.get('invoice_number') or '',
+                invoice_date=parsed.get('invoice_date') or '',
+                received_date=date.today().isoformat(),
+                total_amount=parsed.get('total_amount') or 0.0,
+                deadline=(date.today() + timedelta(days=15)).isoformat(),
+            )
+
+            # Update form fields
+            values = {
+                'tax_code': self.extraction.tax_code,
+                'invoice_number': self.extraction.invoice_number,
+                'invoice_date': self.extraction.invoice_date,
+                'received_date': self.extraction.received_date,
+                'deadline': self.extraction.deadline,
+                'total_amount': f"{self.extraction.total_amount:,.3f}" if self.extraction.total_amount else '',
+                'supplier_name': parsed.get('supplier_name') or '',
+            }
+            for key, var in self.field_vars.items():
+                var.set(values.get(key, ''))
+
+            # Update confidence với màu
+            confidence_percent = int(confidence * 100)
+            if confidence_percent >= 80:
+                confidence_text = f"Độ tin cậy: {confidence_percent}% ✓"
+                confidence_color = self._accent_green
+            elif confidence_percent >= 50:
+                confidence_text = f"Độ tin cậy: {confidence_percent}% ⚠"
+                confidence_color = "#C27A10"  # Amber
+            else:
+                confidence_text = f"Độ tin cậy: {confidence_percent}% ✗"
+                confidence_color = "#E53935"  # Red
+
+            self.confidence_var.set(confidence_text)
+            # Update color (tìm confidence label và cập nhật)
+            for widget in self.winfo_children()[0].winfo_children()[1].winfo_children()[1].winfo_children():
+                if isinstance(widget, tk.Label) and "Độ tin cậy" in str(widget.cget('textvariable')):
+                    widget.configure(fg=confidence_color)
+                    break
+
+            # Display raw text
+            self.text.delete('1.0', 'end')
+            self.text.insert('1.0', raw_text)
+
+            # Show confidence alert
+            if confidence_percent < 70:
+                from ui.component_library import Alert
+                alert_frame = tk.Frame(self)
+                alert_frame.pack(fill='x', before=self.text, padx=14, pady=(0, 8))
+                Alert(alert_frame, 
+                      severity="warning" if confidence_percent >= 50 else "error",
+                      title="Độ tin cậy thấp",
+                      message="Hãy kiểm tra kỹ và chỉnh sửa các trường để đảm bảo dữ liệu chính xác").pack(fill='x')
+
+        except Exception as e:
+            logger.exception(f"Error processing OCR result: {e}")
+            messagebox.showerror("Lỗi xử lý", f"Lỗi: {str(e)}")
+
+    def _save_document(self):
+        if not self.extraction:
+            messagebox.showwarning("Chưa có dữ liệu", "Vui lòng chọn file PDF/ảnh trước.")
+            return
+        try:
+            from modules.document_intake import InvoiceIntakeService
+            document_id = InvoiceIntakeService().save_to_database(self.extraction)
+            messagebox.showinfo("Thành công", f"Đã lưu chứng từ ID {document_id} và deadline {self.extraction.deadline}.")
+        except Exception as e:
+            messagebox.showerror("Lỗi lưu chứng từ", str(e))
+
+
+class DocumentDialog(tk.Toplevel):
+    """Cửa sổ Thêm/Sửa hóa đơn/chứng từ."""
+
+    def __init__(self, parent, title="Thêm chứng từ mới", expense_id=None, document_id=None):
+        super().__init__(parent)
+        self.title(title)
+        self.geometry("650x620")
+        self.resizable(False, False)
+
+        self.result = None
+        self.expense_id = expense_id
+        self.document_id = document_id
+        self._build_form()
+        if document_id:
+            self._load_document(document_id)
+
+        self.transient(parent)
+        self.grab_set()
+
+    def _build_form(self):
+        """Xây dựng form."""
+        main_frame = tk.Frame(self, bg='#f0f4f8')
+        main_frame.pack(fill='both', expand=True, padx=15, pady=15)
+
+        # ── Loại chứng từ ──────────────────────────────────
+        tk.Label(main_frame, text="Loại chứng từ:", font=('Arial', 10),
+                bg='#f0f4f8', fg='#333').grid(row=0, column=0, sticky='w', pady=5)
+
+        self.doc_type_var = tk.StringVar()
+        doc_types = ['Hóa đơn', 'Phiếu chi', 'Phiếu nhập', 'Chứng từ khác']
+        type_combo = ttk.Combobox(main_frame, textvariable=self.doc_type_var,
+                                 values=doc_types, width=30, state='readonly')
+        type_combo.grid(row=0, column=1, sticky='ew', pady=5)
+        type_combo.current(0)
+
+        # ── Số chứng từ ────────────────────────────────────
+        tk.Label(main_frame, text="Số chứng từ:", font=('Arial', 10),
+                bg='#f0f4f8', fg='#333').grid(row=1, column=0, sticky='w', pady=5)
+
+        self.doc_number_var = tk.StringVar()
+        number_entry = tk.Entry(main_frame, textvariable=self.doc_number_var,
+                               font=('Arial', 10), width=30, relief='solid', bd=1)
+        number_entry.grid(row=1, column=1, sticky='ew', pady=5)
+
+        # ── Ngày chứng từ ──────────────────────────────────
+        tk.Label(main_frame, text="Ngày chứng từ:", font=('Arial', 10),
+                bg='#f0f4f8', fg='#333').grid(row=2, column=0, sticky='w', pady=5)
+
+        self.doc_date_var = tk.StringVar(value=datetime.now().strftime('%d/%m/%Y'))
+        date_entry = tk.Entry(main_frame, textvariable=self.doc_date_var,
+                             font=('Arial', 10), width=20, relief='solid', bd=1)
+        date_entry.grid(row=2, column=1, sticky='w', pady=5)
+
+        # ── Nhà cung cấp ───────────────────────────────────
+        tk.Label(main_frame, text="Nhà cung cấp/NCC:", font=('Arial', 10),
+                bg='#f0f4f8', fg='#333').grid(row=3, column=0, sticky='w', pady=5)
+
+        self.supplier_var = tk.StringVar()
+        supplier_entry = ttk.Combobox(main_frame, textvariable=self.supplier_var,
+                                     values=_get_simple_catalog_values('supplier'), width=30)
+        supplier_entry.grid(row=3, column=1, sticky='ew', pady=5)
+
+        # ── Nội dung ───────────────────────────────────────
+        tk.Label(main_frame, text="Nội dung:", font=('Arial', 10),
+                bg='#f0f4f8', fg='#333').grid(row=4, column=0, sticky='nw', pady=5)
+
+        self.description_text = tk.Text(main_frame, font=('Arial', 10),
+                                       height=3, width=40, relief='solid', bd=1)
+        self.description_text.grid(row=4, column=1, sticky='ew', pady=5)
+
+        # ── Số tiền ────────────────────────────────────────
+        tk.Label(main_frame, text="Số tiền (₫):", font=('Arial', 10),
+                bg='#f0f4f8', fg='#333').grid(row=5, column=0, sticky='w', pady=5)
+
+        self.amount_var = tk.StringVar()
+        amount_entry = tk.Entry(main_frame, textvariable=self.amount_var,
+                               font=('Arial', 10), width=20, relief='solid', bd=1)
+        amount_entry.grid(row=5, column=1, sticky='w', pady=5)
+
+        tk.Label(main_frame, text="VAT (%):", font=('Arial', 10),
+                bg='#f0f4f8', fg='#333').grid(row=6, column=0, sticky='w', pady=5)
+        self.vat_rate_var = tk.StringVar(value='10')
+        vat_entry = tk.Entry(main_frame, textvariable=self.vat_rate_var,
+                             font=('Arial', 10), width=10, relief='solid', bd=1)
+        vat_entry.grid(row=6, column=1, sticky='w', pady=5)
+
+        # ── Nghiệp vụ chi phí liên kết ────────────────────────────────────────
+        tk.Label(main_frame, text="Liên kết chi phí:", font=('Arial', 10),
+                bg='#f0f4f8', fg='#333').grid(row=7, column=0, sticky='w', pady=5)
+
+        self.expense_var = tk.StringVar()
+        expenses = self._get_expenses()
+        self.expense_combo = ttk.Combobox(main_frame, textvariable=self.expense_var,
+                                    values=expenses, width=45, state='readonly')
+        self.expense_combo.grid(row=7, column=1, sticky='ew', pady=5)
+        expense_combo = self.expense_combo
+        if expenses:
+            selected_index = 0
+            if self.expense_id:
+                for index, item in enumerate(expenses):
+                    if item.startswith(f"{self.expense_id} - "):
+                        selected_index = index
+                        break
+            expense_combo.current(selected_index)
+
+        # ── Trạng thái ─────────────────────────────────────
+        tk.Label(main_frame, text="Trạng thái:", font=('Arial', 10),
+                bg='#f0f4f8', fg='#333').grid(row=8, column=0, sticky='w', pady=5)
+
+        self.status_var = tk.StringVar(value='draft')
+        status_combo = ttk.Combobox(main_frame, textvariable=self.status_var,
+                                   values=['draft', 'approved', 'paid', 'rejected'],
+                                   width=30, state='readonly')
+        status_combo.grid(row=8, column=1, sticky='ew', pady=5)
+
+        # ── Nút chức năng ──────────────────────────────────
+        button_frame = tk.Frame(main_frame, bg='#f0f4f8')
+        button_frame.grid(row=9, column=0, columnspan=2, sticky='ew', pady=15)
+
+        tk.Button(button_frame, text="💾 Lưu", font=('Arial', 10, 'bold'),
+                 bg='#27ae60', fg='white', padx=20, pady=8, cursor='hand2',
+                 command=self._save).pack(side='left', padx=5)
+
+        tk.Button(button_frame, text="❌ Hủy", font=('Arial', 10),
+                 bg='#95a5a6', fg='white', padx=20, pady=8, cursor='hand2',
+                 command=self.destroy).pack(side='left', padx=5)
+
+        main_frame.columnconfigure(1, weight=1)
+
+    def _load_document(self, document_id):
+        try:
+            from modules.invoices import DocumentManager
+            doc = DocumentManager().get_document_by_id(document_id)
+            if not doc:
+                return
+            self.document_id = document_id
+            self.doc_type_var.set(doc.get('doc_type') or 'Hóa đơn')
+            self.doc_number_var.set(doc.get('doc_number') or '')
+            from utils import format_date
+            if doc.get('doc_date'):
+                try:
+                    self.doc_date_var.set(format_date(doc['doc_date'], '%d/%m/%Y'))
+                except Exception:
+                    self.doc_date_var.set(str(doc['doc_date']))
+            self.supplier_var.set(doc.get('supplier_name') or '')
+            self.description_text.delete('1.0', 'end')
+            self.description_text.insert('1.0', doc.get('description') or '')
+            self.amount_var.set(str(doc.get('amount') or 0))
+            self.vat_rate_var.set(str(doc.get('vat_rate') or 10))
+            self.status_var.set(doc.get('status') or 'draft')
+            if doc.get('expense_id'):
+                for val in self.expense_combo['values']:
+                    if val.startswith(f"{doc['expense_id']} -"):
+                        self.expense_var.set(val)
+                        break
+        except Exception as exc:
+            messagebox.showerror("Lỗi", f"Không tải chứng từ: {exc}")
+
+    def _get_expenses(self):
+        """Lấy danh sách nghiệp vụ chi phí để liên kết chứng từ."""
+        try:
+            conn = get_connection()
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT e.id, e.expense_date, COALESCE(p.name, 'Không có dự án'),
+                       COALESCE(ec.name, 'Chưa phân loại'), e.amount
+                FROM expenses e
+                LEFT JOIN projects p ON e.project_id = p.id
+                LEFT JOIN expense_categories ec ON e.category_id = ec.id
+                ORDER BY e.expense_date DESC, e.id DESC
+            ''')
+            expenses = cursor.fetchall()
+            conn.close()
+            return [
+                f"{e[0]} - {e[1]} - {e[2]} - {e[3]} - {e[4]:,.0f}"
+                for e in expenses
+            ]
+        except Exception:
+            return []
+
+    def _save(self):
+        """Lưu dữ liệu."""
+        if not self.doc_type_var.get():
+            messagebox.showwarning("Lỗi", "Vui lòng chọn loại chứng từ!")
+            return
+
+        if not self.amount_var.get().strip():
+            messagebox.showwarning("Lỗi", "Vui lòng nhập số tiền!")
+            return
+
+        if not self.expense_var.get():
+            messagebox.showwarning("Lỗi", "Vui lòng chọn nghiệp vụ chi phí để liên kết chứng từ!")
+            return
+
+        try:
+            self.result = {
+                'document_id': self.document_id,
+                'doc_type': self.doc_type_var.get(),
+                'doc_number': self.doc_number_var.get(),
+                'doc_date': self.doc_date_var.get(),
+                'supplier': self.supplier_var.get(),
+                'description': self.description_text.get('1.0', 'end-1c'),
+                'amount': parse_number(self.amount_var.get()),
+                'vat_rate': parse_number(self.vat_rate_var.get() or '10'),
+                'expense_id': _parse_combo_id(self.expense_var.get()),
+                'status': self.status_var.get(),
+            }
+            self.destroy()
+        except ValueError:
+            messagebox.showerror("Lỗi", "Dữ liệu không hợp lệ!")
+
+
+class MaterialDialog(tk.Toplevel):
+    """Cửa sổ thêm/sửa vật tư."""
+
+    def __init__(self, parent, title="Thêm vật tư mới"):
+        super().__init__(parent)
+        self.title(title)
+        self.geometry("520x360")
+        self.resizable(False, False)
+        self.result = None
+        self._build_form()
+        self.transient(parent)
+        self.grab_set()
+
+    def _build_form(self):
+        frame = tk.Frame(self, bg='#f0f4f8')
+        frame.pack(fill='both', expand=True, padx=15, pady=15)
+
+        fields = [
+            ('Mã vật tư:', 'code_var'),
+            ('Tên vật tư:', 'name_var'),
+            ('Đơn vị:', 'unit_var'),
+            ('Đơn giá:', 'price_var'),
+            ('Danh mục:', 'category_var'),
+            ('Nhà cung cấp:', 'supplier_var'),
+        ]
+        for row, (label, attr) in enumerate(fields):
+            tk.Label(frame, text=label, font=('Arial', 10), bg='#f0f4f8').grid(row=row, column=0, sticky='w', pady=6)
+            var = tk.StringVar()
+            setattr(self, attr, var)
+            tk.Entry(frame, textvariable=var, font=('Arial', 10), width=35, relief='solid', bd=1).grid(
+                row=row, column=1, sticky='ew', pady=6
+            )
+
+        self.unit_var.set('cái')
+        self.category_var.set('Vật tư xây dựng')
+
+        buttons = tk.Frame(frame, bg='#f0f4f8')
+        buttons.grid(row=len(fields), column=0, columnspan=2, sticky='ew', pady=18)
+        tk.Button(buttons, text="💾 Lưu", bg='#27ae60', fg='white', font=('Arial', 10, 'bold'),
+                 padx=20, pady=8, command=self._save).pack(side='left', padx=5)
+        tk.Button(buttons, text="❌ Hủy", bg='#95a5a6', fg='white', font=('Arial', 10),
+                 padx=20, pady=8, command=self.destroy).pack(side='left', padx=5)
+        frame.columnconfigure(1, weight=1)
+
+    def _get_simple_catalog(self, catalog_type):
+        try:
+            conn = get_connection()
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT name FROM simple_catalogs
+                WHERE catalog_type = ? AND active = 1
+                ORDER BY name
+            ''', (catalog_type,))
+            rows = cursor.fetchall()
+            conn.close()
+            return [r[0] for r in rows]
+        except Exception:
+            return []
+
+    def _save(self):
+        if not self.code_var.get().strip() or not self.name_var.get().strip():
+            messagebox.showwarning("Lỗi", "Vui lòng nhập mã và tên vật tư.")
+            return
+        try:
+            self.result = {
+                'code': self.code_var.get().strip(),
+                'name': self.name_var.get().strip(),
+                'unit': self.unit_var.get().strip(),
+                'unit_price': parse_number(self.price_var.get() or '0'),
+                'category': self.category_var.get().strip(),
+                'supplier': self.supplier_var.get().strip(),
+            }
+            self.destroy()
+        except ValueError:
+            messagebox.showerror("Lỗi", "Đơn giá không hợp lệ.")
+
+
+class InventoryTransactionDialog(tk.Toplevel):
+    """Cửa sổ nhập/xuất kho vật tư."""
+
+    def __init__(self, parent, material_manager, transaction_type='import'):
+        super().__init__(parent)
+        self.title("Nhập kho" if transaction_type == 'import' else "Xuất kho")
+        self.geometry("620x360")
+        self.resizable(False, False)
+        self.material_manager = material_manager
+        self.transaction_type = transaction_type
+        self.result = None
+        self._build_form()
+        self.transient(parent)
+        self.grab_set()
+
+    def _build_form(self):
+        frame = tk.Frame(self, bg='#f0f4f8')
+        frame.pack(fill='both', expand=True, padx=15, pady=15)
+
+        tk.Label(frame, text="Vật tư:", font=('Arial', 10), bg='#f0f4f8').grid(row=0, column=0, sticky='w', pady=6)
+        self.material_var = tk.StringVar()
+        materials = [
+            f"{m[0]} - {m[1]} - {m[2]} ({m[4]} {m[3] or ''})"
+            for m in self.material_manager.get_material_choices()
+        ]
+        material_combo = ttk.Combobox(frame, textvariable=self.material_var, values=materials, width=48, state='readonly')
+        material_combo.grid(row=0, column=1, sticky='ew', pady=6)
+        if materials:
+            material_combo.current(0)
+
+        tk.Label(frame, text="Số lượng:", font=('Arial', 10), bg='#f0f4f8').grid(row=1, column=0, sticky='w', pady=6)
+        self.quantity_var = tk.StringVar()
+        tk.Entry(frame, textvariable=self.quantity_var, font=('Arial', 10), width=20, relief='solid', bd=1).grid(
+            row=1, column=1, sticky='w', pady=6
+        )
+
+        tk.Label(frame, text="Dự án:", font=('Arial', 10), bg='#f0f4f8').grid(row=2, column=0, sticky='w', pady=6)
+        self.project_var = tk.StringVar()
+        projects = self._get_projects()
+        project_combo = ttk.Combobox(frame, textvariable=self.project_var, values=projects, width=38, state='readonly')
+        project_combo.grid(row=2, column=1, sticky='ew', pady=6)
+        if projects:
+            project_combo.current(0)
+
+        tk.Label(frame, text="Ghi chú:", font=('Arial', 10), bg='#f0f4f8').grid(row=3, column=0, sticky='nw', pady=6)
+        self.notes_text = tk.Text(frame, height=4, width=42, font=('Arial', 10), relief='solid', bd=1)
+        self.notes_text.grid(row=3, column=1, sticky='ew', pady=6)
+
+        buttons = tk.Frame(frame, bg='#f0f4f8')
+        buttons.grid(row=4, column=0, columnspan=2, sticky='ew', pady=16)
+        tk.Button(buttons, text="💾 Lưu", bg='#27ae60', fg='white', font=('Arial', 10, 'bold'),
+                 padx=20, pady=8, command=self._save).pack(side='left', padx=5)
+        tk.Button(buttons, text="❌ Hủy", bg='#95a5a6', fg='white', font=('Arial', 10),
+                 padx=20, pady=8, command=self.destroy).pack(side='left', padx=5)
+        frame.columnconfigure(1, weight=1)
+
+    def _get_projects(self):
+        try:
+            conn = get_connection()
+            cursor = conn.cursor()
+            cursor.execute('SELECT id, name FROM projects WHERE status = "active" ORDER BY name')
+            rows = cursor.fetchall()
+            conn.close()
+            return [f"{r[0]} - {r[1]}" for r in rows]
+        except Exception:
+            return []
+
+    def _save(self):
+        if not self.material_var.get():
+            messagebox.showwarning("Lỗi", "Vui lòng chọn vật tư.")
+            return
+        try:
+            quantity = parse_number(self.quantity_var.get())
+            if quantity <= 0:
+                raise ValueError
+            self.result = {
+                'material_id': _parse_combo_id(self.material_var.get()),
+                'transaction_type': self.transaction_type,
+                'quantity': quantity,
+                'project_id': _parse_combo_id(self.project_var.get()),
+                'notes': self.notes_text.get('1.0', 'end-1c'),
+            }
+            self.destroy()
+        except ValueError:
+            messagebox.showerror("Lỗi", "Số lượng không hợp lệ.")
+
+
+class AccountDialog(tk.Toplevel):
+    """Cửa sổ thêm tài khoản/tiểu mục kế toán."""
+
+    def __init__(self, parent, account_manager):
+        super().__init__(parent)
+        self.title("Thêm tài khoản / tiểu mục")
+        self.geometry("600x430")
+        self.resizable(False, False)
+        self.account_manager = account_manager
+        self.result = None
+        self._build_form()
+        self.transient(parent)
+        self.grab_set()
+
+    def _build_form(self):
+        frame = tk.Frame(self, bg='#f0f4f8')
+        frame.pack(fill='both', expand=True, padx=15, pady=15)
+
+        labels = [
+            ('Số hiệu tài khoản:', 'code_var'),
+            ('Tên tài khoản:', 'name_var'),
+            ('Loại tài khoản:', 'type_var'),
+        ]
+        for row, (label, attr) in enumerate(labels):
+            tk.Label(frame, text=label, font=('Arial', 10), bg='#f0f4f8').grid(row=row, column=0, sticky='w', pady=6)
+            var = tk.StringVar()
+            setattr(self, attr, var)
+            tk.Entry(frame, textvariable=var, font=('Arial', 10), width=38, relief='solid', bd=1).grid(row=row, column=1, sticky='ew', pady=6)
+
+        self.type_var.set('Tùy chỉnh')
+
+        tk.Label(frame, text="Tài khoản cha:", font=('Arial', 10), bg='#f0f4f8').grid(row=3, column=0, sticky='w', pady=6)
+        self.parent_var = tk.StringVar()
+        parents = [''] + [f"{a[0]} - {a[1]}" for a in self.account_manager.get_parent_choices()]
+        ttk.Combobox(frame, textvariable=self.parent_var, values=parents, width=38, state='readonly').grid(row=3, column=1, sticky='ew', pady=6)
+
+        tk.Label(frame, text="Mô tả:", font=('Arial', 10), bg='#f0f4f8').grid(row=4, column=0, sticky='nw', pady=6)
+        self.description_text = tk.Text(frame, height=5, width=42, font=('Arial', 10), relief='solid', bd=1)
+        self.description_text.grid(row=4, column=1, sticky='ew', pady=6)
+
+        buttons = tk.Frame(frame, bg='#f0f4f8')
+        buttons.grid(row=5, column=0, columnspan=2, sticky='ew', pady=16)
+        tk.Button(buttons, text="💾 Lưu", bg='#27ae60', fg='white', font=('Arial', 10, 'bold'),
+                 padx=20, pady=8, command=self._save).pack(side='left', padx=5)
+        tk.Button(buttons, text="❌ Hủy", bg='#95a5a6', fg='white', font=('Arial', 10),
+                 padx=20, pady=8, command=self.destroy).pack(side='left', padx=5)
+        frame.columnconfigure(1, weight=1)
+
+    def _save(self):
+        if not self.code_var.get().strip() or not self.name_var.get().strip():
+            messagebox.showwarning("Lỗi", "Vui lòng nhập số hiệu và tên tài khoản.")
+            return
+        self.result = {
+            'account_code': self.code_var.get().strip(),
+            'account_name': self.name_var.get().strip(),
+            'account_type': self.type_var.get().strip(),
+            'parent_code': _parse_combo_prefix(self.parent_var.get()) if self.parent_var.get() else None,
+            'description': self.description_text.get('1.0', 'end-1c'),
+        }
+        self.destroy()
+
+
+class SimpleCatalogDialog(tk.Toplevel):
+    """Dialog thêm nhanh danh mục đơn giản."""
+
+    def __init__(self, parent, title="Thêm danh mục", fields=None):
+        super().__init__(parent)
+        self.title(title)
+        self.geometry("520x260")
+        self.resizable(False, False)
+        self.result = None
+        self.fields = fields or [('name', 'Tên:', ''), ('description', 'Mô tả:', '')]
+        self.vars = {}
+        self._build_form()
+        self.transient(parent)
+        self.grab_set()
+
+    def _build_form(self):
+        frame = tk.Frame(self, bg='#f0f4f8')
+        frame.pack(fill='both', expand=True, padx=15, pady=15)
+
+        for row, (key, label, default) in enumerate(self.fields):
+            tk.Label(frame, text=label, font=('Arial', 10), bg='#f0f4f8').grid(row=row, column=0, sticky='w', pady=7)
+            var = tk.StringVar(value=default)
+            self.vars[key] = var
+            tk.Entry(frame, textvariable=var, font=('Arial', 10), width=38, relief='solid', bd=1).grid(
+                row=row, column=1, sticky='ew', pady=7
+            )
+
+        buttons = tk.Frame(frame, bg='#f0f4f8')
+        buttons.grid(row=len(self.fields), column=0, columnspan=2, sticky='ew', pady=18)
+        tk.Button(buttons, text="Luu", bg='#27ae60', fg='white', font=('Arial', 10, 'bold'),
+                 padx=20, pady=8, command=self._save).pack(side='left', padx=5)
+        tk.Button(buttons, text="Huy", bg='#95a5a6', fg='white', font=('Arial', 10),
+                 padx=20, pady=8, command=self.destroy).pack(side='left', padx=5)
+        frame.columnconfigure(1, weight=1)
+
+    def _save(self):
+        values = {key: var.get().strip() for key, var in self.vars.items()}
+        first_key = self.fields[0][0]
+        if not values.get(first_key):
+            messagebox.showwarning("Lỗi", "Vui lòng nhập thông tin bắt buộc.")
+            return
+        self.result = values
+        self.destroy()
+
+
+class AccountMappingDialog(tk.Toplevel):
+    """Dialog thiết lập tài khoản gợi ý cho loại chi phí."""
+
+    def __init__(self, parent, account_manager, category_id, category_name, suggestion=None):
+        super().__init__(parent)
+        self.title("Gợi ý tài khoản hạch toán")
+        self.geometry("620x320")
+        self.resizable(False, False)
+        self.account_manager = account_manager
+        self.category_id = category_id
+        self.category_name = category_name
+        self.suggestion = suggestion or {}
+        self.result = None
+        self._build_form()
+        self.transient(parent)
+        self.grab_set()
+
+    def _build_form(self):
+        frame = tk.Frame(self, bg='#f0f4f8')
+        frame.pack(fill='both', expand=True, padx=15, pady=15)
+
+        tk.Label(frame, text=f"Loại chi phí: {self.category_name}", font=('Arial', 11, 'bold'),
+                 bg='#f0f4f8', fg='#1a56a5').grid(row=0, column=0, columnspan=2, sticky='w', pady=(0, 12))
+
+        accounts = [f"{a[0]} - {a[1]}" for a in self.account_manager.get_parent_choices()]
+
+        tk.Label(frame, text="Tài khoản Nợ:", font=('Arial', 10), bg='#f0f4f8').grid(row=1, column=0, sticky='w', pady=7)
+        self.debit_var = tk.StringVar()
+        debit_combo = ttk.Combobox(frame, textvariable=self.debit_var, values=accounts, width=45)
+        debit_combo.grid(row=1, column=1, sticky='ew', pady=7)
+
+        tk.Label(frame, text="Tài khoản Có:", font=('Arial', 10), bg='#f0f4f8').grid(row=2, column=0, sticky='w', pady=7)
+        self.credit_var = tk.StringVar()
+        credit_combo = ttk.Combobox(frame, textvariable=self.credit_var, values=accounts, width=45)
+        credit_combo.grid(row=2, column=1, sticky='ew', pady=7)
+
+        tk.Label(frame, text="Ghi chu:", font=('Arial', 10), bg='#f0f4f8').grid(row=3, column=0, sticky='nw', pady=7)
+        self.notes_text = tk.Text(frame, height=4, width=44, font=('Arial', 10), relief='solid', bd=1)
+        self.notes_text.grid(row=3, column=1, sticky='ew', pady=7)
+
+        debit = self.suggestion.get('debit_account', '')
+        credit = self.suggestion.get('credit_account', '')
+        for item in accounts:
+            if item.startswith(f"{debit} - "):
+                self.debit_var.set(item)
+            if item.startswith(f"{credit} - "):
+                self.credit_var.set(item)
+        if not self.debit_var.get() and debit:
+            self.debit_var.set(debit)
+        if not self.credit_var.get() and credit:
+            self.credit_var.set(credit)
+        self.notes_text.insert('1.0', self.suggestion.get('notes', ''))
+
+        buttons = tk.Frame(frame, bg='#f0f4f8')
+        buttons.grid(row=4, column=0, columnspan=2, sticky='ew', pady=16)
+        tk.Button(buttons, text="Luu mapping", bg='#27ae60', fg='white', font=('Arial', 10, 'bold'),
+                 padx=20, pady=8, command=self._save).pack(side='left', padx=5)
+        tk.Button(buttons, text="Huy", bg='#95a5a6', fg='white', font=('Arial', 10),
+                 padx=20, pady=8, command=self.destroy).pack(side='left', padx=5)
+        frame.columnconfigure(1, weight=1)
+
+    def _save(self):
+        if not self.debit_var.get().strip() or not self.credit_var.get().strip():
+            messagebox.showwarning("Lỗi", "Vui lòng chọn tài khoản Nợ và Có.")
+            return
+        self.result = {
+            'category_id': self.category_id,
+            'debit_account': _parse_combo_prefix(self.debit_var.get()),
+            'credit_account': _parse_combo_prefix(self.credit_var.get()),
+            'notes': self.notes_text.get('1.0', 'end-1c'),
+        }
+        self.destroy()
+
+
+class TemplateFieldDialog(tk.Toplevel):
+    """Dialog thêm/sửa trường dữ liệu của biểu mẫu."""
+
+    def __init__(self, parent, knowledge_manager):
+        super().__init__(parent)
+        self.title("Thêm trường dữ liệu biểu mẫu")
+        self.geometry("650x430")
+        self.resizable(False, False)
+        self.knowledge_manager = knowledge_manager
+        self.result = None
+        self._build_form()
+        self.transient(parent)
+        self.grab_set()
+
+    def _build_form(self):
+        frame = tk.Frame(self, bg='#f0f4f8')
+        frame.pack(fill='both', expand=True, padx=15, pady=15)
+
+        tk.Label(frame, text="Biểu mẫu:", font=('Arial', 10), bg='#f0f4f8').grid(row=0, column=0, sticky='w', pady=6)
+        self.form_var = tk.StringVar()
+        self.form_choices = [
+            f"{row[0]} - {row[1]} - {row[2]}"
+            for row in self.knowledge_manager.get_form_choices()
+        ]
+        form_combo = ttk.Combobox(frame, textvariable=self.form_var, values=self.form_choices, width=52, state='readonly')
+        form_combo.grid(row=0, column=1, sticky='ew', pady=6)
+        if self.form_choices:
+            form_combo.current(0)
+
+        fields = [
+            ('field_key', 'Mã trường:', ''),
+            ('field_label', 'Tên hiển thị:', ''),
+            ('default_value', 'Giá trị mặc định:', ''),
+            ('display_order', 'Thứ tự:', '0'),
+        ]
+        self.vars = {}
+        for index, (key, label, default) in enumerate(fields, 1):
+            tk.Label(frame, text=label, font=('Arial', 10), bg='#f0f4f8').grid(row=index, column=0, sticky='w', pady=6)
+            var = tk.StringVar(value=default)
+            self.vars[key] = var
+            tk.Entry(frame, textvariable=var, font=('Arial', 10), width=40, relief='solid', bd=1).grid(
+                row=index, column=1, sticky='ew', pady=6
+            )
+
+        tk.Label(frame, text="Kiểu dữ liệu:", font=('Arial', 10), bg='#f0f4f8').grid(row=5, column=0, sticky='w', pady=6)
+        self.type_var = tk.StringVar(value='text')
+        ttk.Combobox(frame, textvariable=self.type_var,
+                     values=['text', 'long_text', 'number', 'date', 'money', 'choice'],
+                     width=30, state='readonly').grid(row=5, column=1, sticky='w', pady=6)
+
+        self.required_var = tk.IntVar(value=0)
+        tk.Checkbutton(frame, text="Bắt buộc nhập", variable=self.required_var,
+                       bg='#f0f4f8', font=('Arial', 10)).grid(row=6, column=1, sticky='w', pady=6)
+
+        tk.Label(frame, text="Ghi chú:", font=('Arial', 10), bg='#f0f4f8').grid(row=7, column=0, sticky='nw', pady=6)
+        self.notes_text = tk.Text(frame, height=4, width=44, font=('Arial', 10), relief='solid', bd=1)
+        self.notes_text.grid(row=7, column=1, sticky='ew', pady=6)
+
+        buttons = tk.Frame(frame, bg='#f0f4f8')
+        buttons.grid(row=8, column=0, columnspan=2, sticky='ew', pady=16)
+        tk.Button(buttons, text="Lưu", bg='#27ae60', fg='white', font=('Arial', 10, 'bold'),
+                 padx=20, pady=8, command=self._save).pack(side='left', padx=5)
+        tk.Button(buttons, text="Hủy", bg='#95a5a6', fg='white', font=('Arial', 10),
+                 padx=20, pady=8, command=self.destroy).pack(side='left', padx=5)
+        frame.columnconfigure(1, weight=1)
+
+    def _save(self):
+        if not self.form_var.get():
+            messagebox.showwarning("Lỗi", "Vui lòng chọn biểu mẫu.")
+            return
+        if not self.vars['field_key'].get().strip() or not self.vars['field_label'].get().strip():
+            messagebox.showwarning("Lỗi", "Vui lòng nhập mã trường và tên hiển thị.")
+            return
+        try:
+            self.result = {
+                'form_template_id': int(self.form_var.get().split(' - ', 1)[0]),
+                'field_key': self.vars['field_key'].get().strip(),
+                'field_label': self.vars['field_label'].get().strip(),
+                'field_type': self.type_var.get(),
+                'required': self.required_var.get(),
+                'default_value': self.vars['default_value'].get().strip(),
+                'display_order': int(self.vars['display_order'].get() or 0),
+                'notes': self.notes_text.get('1.0', 'end-1c'),
+            }
+            self.destroy()
+        except ValueError:
+            messagebox.showerror("Lỗi", "Thứ tự phải là số.")
+
+
+class TemplateMappingDialog(tk.Toplevel):
+    """Dialog thiết lập ô điền dữ liệu trên file Excel mẫu."""
+
+    def __init__(self, parent, knowledge_manager):
+        super().__init__(parent)
+        self.title("Thiết lập vị trí điền dữ liệu")
+        self.geometry("660x300")
+        self.resizable(False, False)
+        self.knowledge_manager = knowledge_manager
+        self.result = None
+        self._build_form()
+        self.transient(parent)
+        self.grab_set()
+
+    def _build_form(self):
+        frame = tk.Frame(self, bg='#f0f4f8')
+        frame.pack(fill='both', expand=True, padx=15, pady=15)
+
+        tk.Label(frame, text="Biểu mẫu:", font=('Arial', 10), bg='#f0f4f8').grid(row=0, column=0, sticky='w', pady=6)
+        self.form_var = tk.StringVar()
+        self.form_choices = [
+            f"{row[0]} - {row[1]} - {row[2]}"
+            for row in self.knowledge_manager.get_form_choices()
+        ]
+        form_combo = ttk.Combobox(frame, textvariable=self.form_var, values=self.form_choices, width=56, state='readonly')
+        form_combo.grid(row=0, column=1, sticky='ew', pady=6)
+        if self.form_choices:
+            form_combo.current(0)
+
+        self.vars = {}
+        for index, (key, label, default) in enumerate([
+            ('field_key', 'Mã trường:', 'company_name'),
+            ('cell_address', 'Ô Excel:', 'C6'),
+        ], 1):
+            tk.Label(frame, text=label, font=('Arial', 10), bg='#f0f4f8').grid(row=index, column=0, sticky='w', pady=6)
+            var = tk.StringVar(value=default)
+            self.vars[key] = var
+            tk.Entry(frame, textvariable=var, font=('Arial', 10), width=36, relief='solid', bd=1).grid(
+                row=index, column=1, sticky='ew', pady=6
+            )
+
+        tk.Label(frame, text="Chế độ dòng:", font=('Arial', 10), bg='#f0f4f8').grid(row=3, column=0, sticky='w', pady=6)
+        self.row_mode_var = tk.StringVar(value='fixed')
+        ttk.Combobox(frame, textvariable=self.row_mode_var,
+                     values=['fixed', 'same_row'], width=20, state='readonly').grid(row=3, column=1, sticky='w', pady=6)
+
+        note = (
+            "Ví dụ: field_key=amount, Ô Excel=C13. "
+            "Phần mềm chỉ điền đúng ô này, không thêm dòng/cột hay thay đổi bố cục mẫu."
+        )
+        tk.Label(frame, text=note, font=('Arial', 9), bg='#f0f4f8', fg='#6B7280',
+                 wraplength=560, justify='left').grid(row=4, column=0, columnspan=2, sticky='w', pady=8)
+
+        buttons = tk.Frame(frame, bg='#f0f4f8')
+        buttons.grid(row=5, column=0, columnspan=2, sticky='ew', pady=14)
+        tk.Button(buttons, text="Lưu mapping", bg='#27ae60', fg='white', font=('Arial', 10, 'bold'),
+                  padx=20, pady=8, command=self._save).pack(side='left', padx=5)
+        tk.Button(buttons, text="Hủy", bg='#95a5a6', fg='white', font=('Arial', 10),
+                  padx=20, pady=8, command=self.destroy).pack(side='left', padx=5)
+        frame.columnconfigure(1, weight=1)
+
+    def _save(self):
+        if not self.form_var.get():
+            messagebox.showwarning("Lỗi", "Vui lòng chọn biểu mẫu.")
+            return
+        field_key = self.vars['field_key'].get().strip()
+        cell_address = self.vars['cell_address'].get().strip().upper()
+        if not field_key or not cell_address:
+            messagebox.showwarning("Lỗi", "Vui lòng nhập mã trường và ô Excel.")
+            return
+        if not re.match(r'^[A-Z]{1,3}[0-9]{1,7}$', cell_address):
+            messagebox.showwarning("Lỗi", "Ô Excel chưa đúng định dạng, ví dụ C6 hoặc H12.")
+            return
+        self.result = {
+            'form_template_id': int(self.form_var.get().split(' - ', 1)[0]),
+            'field_key': field_key,
+            'cell_address': cell_address,
+            'row_mode': self.row_mode_var.get(),
+        }
+        self.destroy()
+
+
+class ConstructionRecordDialog(tk.Toplevel):
+    """Dialog nhập nhanh nghiệp vụ công trường."""
+
+    def __init__(self, parent, record_type):
+        super().__init__(parent)
+        self.record_type = record_type
+        titles = {
+            'work_item': 'Thêm hạng mục công việc',
+            'diary': 'Thêm nhật ký công trường',
+            'milestone': 'Thêm mốc tiến độ',
+            'equipment': 'Thêm ca máy/thiết bị',
+            'safety': 'Thêm kiểm tra an toàn',
+        }
+        self.title(titles.get(record_type, 'Thêm dữ liệu công trường'))
+        self.geometry("680x520")
+        self.resizable(False, False)
+        self.result = None
+        self.vars = {}
+        self.text_widgets = {}
+        self._build_form()
+        self.transient(parent)
+        self.grab_set()
+
+    def _project_choices(self):
+        try:
+            conn = get_connection()
+            cursor = conn.cursor()
+            cursor.execute('SELECT id, code, name FROM projects WHERE status = "active" ORDER BY code, name')
+            rows = cursor.fetchall()
+            conn.close()
+            return [f"{r[0]} - {r[1]} - {r[2]}" for r in rows]
+        except Exception:
+            return []
+
+    def _add_entry(self, frame, row, key, label, default=''):
+        tk.Label(frame, text=label, font=('Arial', 10), bg='#f0f4f8').grid(row=row, column=0, sticky='w', pady=5)
+        var = tk.StringVar(value=default)
+        self.vars[key] = var
+        tk.Entry(frame, textvariable=var, font=('Arial', 10), width=44, relief='solid', bd=1).grid(row=row, column=1, sticky='ew', pady=5)
+
+    def _add_text(self, frame, row, key, label, height=3):
+        tk.Label(frame, text=label, font=('Arial', 10), bg='#f0f4f8').grid(row=row, column=0, sticky='nw', pady=5)
+        widget = tk.Text(frame, height=height, width=46, font=('Arial', 10), relief='solid', bd=1)
+        self.text_widgets[key] = widget
+        widget.grid(row=row, column=1, sticky='ew', pady=5)
+
+    def _build_form(self):
+        frame = tk.Frame(self, bg='#f0f4f8')
+        frame.pack(fill='both', expand=True, padx=15, pady=15)
+
+        tk.Label(frame, text="Dự án:", font=('Arial', 10), bg='#f0f4f8').grid(row=0, column=0, sticky='w', pady=5)
+        self.vars['project_id'] = tk.StringVar()
+        projects = self._project_choices()
+        project_combo = ttk.Combobox(frame, textvariable=self.vars['project_id'], values=projects, width=48, state='readonly')
+        project_combo.grid(row=0, column=1, sticky='ew', pady=5)
+        if projects:
+            project_combo.current(0)
+
+        if self.record_type == 'work_item':
+            self._add_entry(frame, 1, 'item_code', 'Mã hạng mục:')
+            self._add_entry(frame, 2, 'item_name', 'Tên hạng mục:')
+            self._add_entry(frame, 3, 'unit', 'Đơn vị:', 'm2')
+            self._add_entry(frame, 4, 'planned_quantity', 'Khối lượng dự toán:', '0')
+            self._add_entry(frame, 5, 'completed_quantity', 'Khối lượng đã làm:', '0')
+            self._add_entry(frame, 6, 'unit_price', 'Đơn giá:', '0')
+            self._add_entry(frame, 7, 'status', 'Trạng thái:', 'Kế hoạch')
+            self._add_text(frame, 8, 'notes', 'Ghi chú:', 3)
+        elif self.record_type == 'diary':
+            self._add_entry(frame, 1, 'diary_date', 'Ngày nhật ký:', datetime.now().strftime('%Y-%m-%d'))
+            self._add_entry(frame, 2, 'weather', 'Thời tiết:')
+            self._add_entry(frame, 3, 'manpower', 'Nhân lực:')
+            self._add_entry(frame, 4, 'equipment', 'Thiết bị:')
+            self._add_text(frame, 5, 'work_content', 'Nội dung thi công:', 4)
+            self._add_text(frame, 6, 'issues', 'Vướng mắc/phát sinh:', 3)
+            self._add_entry(frame, 7, 'reporter', 'Người lập:')
+        elif self.record_type == 'milestone':
+            self._add_entry(frame, 1, 'milestone_name', 'Mốc tiến độ:')
+            self._add_entry(frame, 2, 'planned_date', 'Ngày kế hoạch:', datetime.now().strftime('%Y-%m-%d'))
+            self._add_entry(frame, 3, 'actual_date', 'Ngày thực tế:')
+            self._add_entry(frame, 4, 'status', 'Trạng thái:', 'Kế hoạch')
+            self._add_text(frame, 5, 'notes', 'Ghi chú:', 4)
+        elif self.record_type == 'equipment':
+            self._add_entry(frame, 1, 'usage_date', 'Ngày sử dụng:', datetime.now().strftime('%Y-%m-%d'))
+            self._add_entry(frame, 2, 'equipment_name', 'Tên máy/thiết bị:')
+            self._add_entry(frame, 3, 'operator', 'Người vận hành:')
+            self._add_entry(frame, 4, 'hours', 'Số giờ/ca:', '0')
+            self._add_entry(frame, 5, 'fuel_cost', 'Chi phí nhiên liệu:', '0')
+            self._add_text(frame, 6, 'notes', 'Ghi chú:', 4)
+        else:
+            self._add_entry(frame, 1, 'check_date', 'Ngày kiểm tra:', datetime.now().strftime('%Y-%m-%d'))
+            self._add_entry(frame, 2, 'check_item', 'Nội dung kiểm tra:')
+            self._add_entry(frame, 3, 'result', 'Kết quả:', 'Đạt')
+            self._add_entry(frame, 4, 'responsible', 'Người phụ trách:')
+            self._add_text(frame, 5, 'action_required', 'Việc cần xử lý:', 3)
+            self._add_entry(frame, 6, 'deadline', 'Hạn xử lý:')
+            self._add_entry(frame, 7, 'status', 'Trạng thái:', 'Đang mở')
+
+        buttons = tk.Frame(frame, bg='#f0f4f8')
+        buttons.grid(row=12, column=0, columnspan=2, sticky='ew', pady=18)
+        tk.Button(buttons, text="Lưu", bg='#27ae60', fg='white', font=('Arial', 10, 'bold'),
+                 padx=22, pady=8, command=self._save).pack(side='left', padx=5)
+        tk.Button(buttons, text="Hủy", bg='#95a5a6', fg='white', font=('Arial', 10),
+                 padx=22, pady=8, command=self.destroy).pack(side='left', padx=5)
+        frame.columnconfigure(1, weight=1)
+
+    def _num(self, key):
+        return float((self.vars.get(key).get() or '0').replace(',', ''))
+
+    def _text(self, key):
+        widget = self.text_widgets.get(key)
+        return widget.get('1.0', 'end-1c') if widget else ''
+
+    def _save(self):
+        project_id = _parse_combo_id(self.vars['project_id'].get())
+        try:
+            data = {'project_id': project_id}
+            if self.record_type == 'work_item':
+                data.update({
+                    'item_code': self.vars['item_code'].get().strip(),
+                    'item_name': self.vars['item_name'].get().strip(),
+                    'unit': self.vars['unit'].get().strip(),
+                    'planned_quantity': self._num('planned_quantity'),
+                    'completed_quantity': self._num('completed_quantity'),
+                    'unit_price': self._num('unit_price'),
+                    'status': self.vars['status'].get().strip(),
+                    'notes': self._text('notes'),
+                })
+                if not data['item_name']:
+                    raise ValueError('Vui lòng nhập tên hạng mục.')
+            elif self.record_type == 'diary':
+                data.update({key: self.vars[key].get().strip() for key in ['diary_date', 'weather', 'manpower', 'equipment', 'reporter']})
+                data['work_content'] = self._text('work_content')
+                data['issues'] = self._text('issues')
+            elif self.record_type == 'milestone':
+                data.update({key: self.vars[key].get().strip() for key in ['milestone_name', 'planned_date', 'actual_date', 'status']})
+                data['notes'] = self._text('notes')
+            elif self.record_type == 'equipment':
+                data.update({
+                    'usage_date': self.vars['usage_date'].get().strip(),
+                    'equipment_name': self.vars['equipment_name'].get().strip(),
+                    'operator': self.vars['operator'].get().strip(),
+                    'hours': self._num('hours'),
+                    'fuel_cost': self._num('fuel_cost'),
+                    'notes': self._text('notes'),
+                })
+            else:
+                data.update({key: self.vars[key].get().strip() for key in ['check_date', 'check_item', 'result', 'responsible', 'deadline', 'status']})
+                data['action_required'] = self._text('action_required')
+            self.result = data
+            self.destroy()
+        except ValueError as exc:
+            messagebox.showerror("Lỗi", str(exc))
+
+
+class RenderTemplateDialog(tk.Toplevel):
+    """Dialog chọn dữ liệu để sinh biểu mẫu đã điền."""
+
+    def __init__(self, parent, renderer, form_id=None):
+        super().__init__(parent)
+        self.title("Tạo biểu mẫu để in")
+        self.geometry("760x620")
+        self.resizable(True, True)
+        self.renderer = renderer
+        self.form_id = form_id
+        self.result = None
+        self.record_rows = []
+        self.manual_widgets = {}
+        self._build_form()
+        self.transient(parent)
+        self.grab_set()
+
+    def _build_form(self):
+        frame = tk.Frame(self, bg='#f0f4f8')
+        frame.pack(fill='both', expand=True, padx=15, pady=15)
+
+        tk.Label(frame, text="Biểu mẫu:", font=('Arial', 10), bg='#f0f4f8').grid(row=0, column=0, sticky='w', pady=5)
+        self.form_var = tk.StringVar()
+        forms = self.renderer.get_forms()
+        self.form_choices = [f"{row['id']} - {row['form_code']} - {row['form_name']}" for row in forms]
+        form_combo = ttk.Combobox(frame, textvariable=self.form_var, values=self.form_choices, width=68, state='readonly')
+        form_combo.grid(row=0, column=1, sticky='ew', pady=5)
+        if self.form_choices:
+            selected = 0
+            if self.form_id:
+                for idx, item in enumerate(self.form_choices):
+                    if item.startswith(f"{self.form_id} - "):
+                        selected = idx
+                        break
+            form_combo.current(selected)
+        form_combo.bind('<<ComboboxSelected>>', lambda _event: self._build_manual_fields())
+
+        tk.Label(frame, text="Nguồn dữ liệu:", font=('Arial', 10), bg='#f0f4f8').grid(row=1, column=0, sticky='w', pady=5)
+        self.source_var = tk.StringVar(value='expense')
+        source_combo = ttk.Combobox(
+            frame, textvariable=self.source_var,
+            values=[
+                'expense - Chi phí',
+                'document - Chứng từ/Hóa đơn',
+                'project - Dự án',
+                'material - Vật tư',
+                'manual - Nhập thủ công',
+            ],
+            width=34, state='readonly'
+        )
+        source_combo.grid(row=1, column=1, sticky='w', pady=5)
+        source_combo.bind('<<ComboboxSelected>>', lambda _event: self._refresh_records())
+
+        search_frame = tk.Frame(frame, bg='#f0f4f8')
+        search_frame.grid(row=2, column=0, columnspan=2, sticky='ew', pady=6)
+        tk.Label(search_frame, text="Tìm nghiệp vụ:", font=('Arial', 10), bg='#f0f4f8').pack(side='left')
+        self.search_var = tk.StringVar()
+        tk.Entry(search_frame, textvariable=self.search_var, font=('Arial', 10), width=32).pack(side='left', padx=6)
+        tk.Button(search_frame, text="Tìm", bg='#2874A6', fg='white', padx=12, pady=6,
+                  command=self._refresh_records).pack(side='left')
+
+        records_frame = tk.LabelFrame(frame, text="  Nghiệp vụ liên kết  ", bg='#f0f4f8', fg='#17324D',
+                                      font=('Arial', 10, 'bold'), padx=8, pady=8)
+        records_frame.grid(row=3, column=0, columnspan=2, sticky='nsew', pady=6)
+        self.records_tree = ttk.Treeview(records_frame, columns=('ID', 'Ngày/Mã', 'Đối tượng', 'Nội dung', 'Số tiền', 'Trạng thái'),
+                                         height=7, show='tree headings')
+        for col, width in zip(('ID', 'Ngày/Mã', 'Đối tượng', 'Nội dung', 'Số tiền', 'Trạng thái'), (60, 100, 170, 250, 100, 100)):
+            self.records_tree.heading(col, text=col)
+            self.records_tree.column(col, width=width)
+        records_y = ttk.Scrollbar(records_frame, orient='vertical', command=self.records_tree.yview)
+        records_x = ttk.Scrollbar(records_frame, orient='horizontal', command=self.records_tree.xview)
+        self.records_tree.configure(yscrollcommand=records_y.set, xscrollcommand=records_x.set)
+        self.records_tree.grid(row=0, column=0, sticky='nsew')
+        records_y.grid(row=0, column=1, sticky='ns')
+        records_x.grid(row=1, column=0, sticky='ew')
+        records_frame.rowconfigure(0, weight=1)
+        records_frame.columnconfigure(0, weight=1)
+
+        manual_frame = tk.LabelFrame(frame, text="  Trường nhập thêm/thủ công  ", bg='#f0f4f8', fg='#17324D',
+                                     font=('Arial', 10, 'bold'), padx=8, pady=8)
+        manual_frame.grid(row=4, column=0, columnspan=2, sticky='nsew', pady=6)
+        self.manual_canvas = tk.Canvas(manual_frame, bg='#f0f4f8', height=210, highlightthickness=0)
+        self.manual_inner = tk.Frame(self.manual_canvas, bg='#f0f4f8')
+        scrollbar = ttk.Scrollbar(manual_frame, orient='vertical', command=self.manual_canvas.yview)
+        self.manual_canvas.configure(yscrollcommand=scrollbar.set)
+        self.manual_canvas.create_window((0, 0), window=self.manual_inner, anchor='nw')
+        self.manual_inner.bind('<Configure>', lambda _event: self.manual_canvas.configure(scrollregion=self.manual_canvas.bbox('all')))
+        self.manual_canvas.pack(side='left', fill='both', expand=True)
+        scrollbar.pack(side='right', fill='y')
+
+        buttons = tk.Frame(frame, bg='#f0f4f8')
+        buttons.grid(row=5, column=0, columnspan=2, sticky='ew', pady=12)
+        tk.Button(buttons, text="Tạo biểu mẫu", bg='#2E7D32', fg='white', font=('Arial', 10, 'bold'),
+                  padx=20, pady=8, command=self._save).pack(side='left', padx=5)
+        tk.Button(buttons, text="Hủy", bg='#95a5a6', fg='white', font=('Arial', 10),
+                  padx=20, pady=8, command=self.destroy).pack(side='left', padx=5)
+
+        frame.columnconfigure(1, weight=1)
+        frame.rowconfigure(3, weight=1)
+        frame.rowconfigure(4, weight=1)
+        self._refresh_records()
+        self._build_manual_fields()
+
+    def _source_type(self):
+        return self.source_var.get().split(' - ', 1)[0]
+
+    def _selected_form_id(self):
+        if not self.form_var.get():
+            return None
+        return int(self.form_var.get().split(' - ', 1)[0])
+
+    def _refresh_records(self):
+        source_type = self._source_type()
+        for item in self.records_tree.get_children():
+            self.records_tree.delete(item)
+        if source_type == 'manual':
+            return
+        self.record_rows = self.renderer.get_accounting_records(source_type, self.search_var.get().strip())
+        for row in self.record_rows:
+            values = list(row)
+            while len(values) < 6:
+                values.append('')
+            if len(values) >= 7:
+                display = (values[0], values[1], values[2], values[4], values[5], values[6])
+            else:
+                display = tuple(values[:6])
+            self.records_tree.insert('', 'end', values=display)
+
+    def _build_manual_fields(self):
+        for child in self.manual_inner.winfo_children():
+            child.destroy()
+        self.manual_widgets = {}
+        form_id = self._selected_form_id()
+        if not form_id:
+            return
+        fields = self.renderer.get_form_fields(form_id)
+        for idx, field in enumerate(fields):
+            tk.Label(self.manual_inner, text=field['field_label'], bg='#f0f4f8',
+                     font=('Arial', 10)).grid(row=idx, column=0, sticky='w', padx=5, pady=4)
+            var = tk.StringVar(value=field[4] if len(field) > 4 else '')
+            self.manual_widgets[field['field_key']] = var
+            tk.Entry(self.manual_inner, textvariable=var, font=('Arial', 10), width=48).grid(
+                row=idx, column=1, sticky='ew', padx=5, pady=4
+            )
+        self.manual_inner.columnconfigure(1, weight=1)
+
+    def _manual_values(self):
+        return {key: var.get().strip() for key, var in self.manual_widgets.items() if var.get().strip()}
+
+    def _selected_record_id(self):
+        if self._source_type() == 'manual':
+            return None
+        if not self.records_tree.selection():
+            raise ValueError('Vui lòng chọn một nghiệp vụ để liên kết, hoặc chọn nguồn Nhập thủ công.')
+        values = self.records_tree.item(self.records_tree.selection()[0], 'values')
+        return int(values[0])
+
+    def _save(self):
+        try:
+            form_id = self._selected_form_id()
+            if not form_id:
+                raise ValueError('Vui lòng chọn biểu mẫu.')
+            source_type = self._source_type()
+            record_id = self._selected_record_id()
+            output_path = self.renderer.render_form(
+                form_id, source_type, record_id, self._manual_values()
+            )
+            self.result = {'output_path': output_path}
+            self.destroy()
+        except Exception as exc:
+            messagebox.showerror("Lỗi", str(exc))
+
+
+class ExpensePrintDialog(tk.Toplevel):
+    """Chọn chứng từ cần in từ một nghiệp vụ chi phí."""
+
+    def __init__(self, parent, renderer, expense_id):
+        super().__init__(parent)
+        self.title("In chứng từ từ chi phí")
+        self.geometry("980x680")
+        self.minsize(860, 560)
+        self.resizable(True, True)
+        self.renderer = renderer
+        self.expense_id = expense_id
+        self.result = None
+        self.manual_widgets = {}
+        self._build_form()
+        self.transient(parent)
+        self.grab_set()
+
+    def _build_form(self):
+        frame = tk.Frame(self, bg='#f0f4f8')
+        frame.pack(fill='both', expand=True, padx=15, pady=15)
+        frame.rowconfigure(1, weight=1)
+        frame.columnconfigure(0, weight=1)
+
+        tk.Label(frame, text=f"Chi phí ID: {self.expense_id}", font=('Arial', 11, 'bold'),
+                 bg='#f0f4f8', fg='#17324D').grid(row=0, column=0, sticky='w', pady=(0, 8))
+
+        templates_frame = tk.LabelFrame(frame, text="  Chọn loại chứng từ cần in  ",
+                                        bg='#f0f4f8', fg='#17324D',
+                                        font=('Arial', 10, 'bold'), padx=8, pady=8)
+        templates_frame.grid(row=1, column=0, sticky='nsew')
+
+        columns = ('ID', 'Mã mẫu', 'Tên biểu mẫu', 'Phạm vi')
+        self.template_tree = ttk.Treeview(templates_frame, columns=columns, height=14, show='tree headings')
+        for col, width in zip(columns, (70, 160, 560, 160)):
+            self.template_tree.heading(col, text=col)
+            self.template_tree.column(col, width=width, minwidth=width, stretch=False)
+        for row in self.renderer.get_recommended_forms_for_expense(self.expense_id):
+            self.template_tree.insert('', 'end', values=(row['id'], row['form_code'], row['form_name'], row[3]))
+        template_y = ttk.Scrollbar(templates_frame, orient='vertical', command=self.template_tree.yview)
+        template_x = ttk.Scrollbar(templates_frame, orient='horizontal', command=self.template_tree.xview)
+        self.template_tree.configure(yscrollcommand=template_y.set, xscrollcommand=template_x.set)
+        self.template_tree.grid(row=0, column=0, sticky='nsew')
+        template_y.grid(row=0, column=1, sticky='ns')
+        template_x.grid(row=1, column=0, sticky='ew')
+        templates_frame.rowconfigure(0, weight=1)
+        templates_frame.columnconfigure(0, weight=1)
+        self.template_tree.bind('<<TreeviewSelect>>', lambda _event: self._build_extra_fields())
+
+        extra_frame = tk.LabelFrame(frame, text="  Nhập thêm nếu cần  ",
+                                    bg='#f0f4f8', fg='#17324D',
+                                    font=('Arial', 10, 'bold'), padx=8, pady=8)
+        extra_frame.grid(row=2, column=0, sticky='ew', pady=8)
+        self.extra_inner = tk.Frame(extra_frame, bg='#f0f4f8')
+        self.extra_inner.pack(fill='x')
+
+        buttons = tk.Frame(frame, bg='#f0f4f8')
+        buttons.grid(row=3, column=0, sticky='ew', pady=8)
+        tk.Button(buttons, text="Tạo và mở để in", bg='#2E7D32', fg='white',
+                  font=('Arial', 10, 'bold'), padx=18, pady=8,
+                  command=self._save).pack(side='left', padx=5)
+        tk.Button(buttons, text="Hủy", bg='#95a5a6', fg='white',
+                  font=('Arial', 10), padx=18, pady=8,
+                  command=self.destroy).pack(side='left', padx=5)
+
+    def _selected_form_id(self):
+        if not self.template_tree.selection():
+            raise ValueError('Vui lòng chọn loại chứng từ cần in.')
+        values = self.template_tree.item(self.template_tree.selection()[0], 'values')
+        return int(values[0])
+
+    def _build_extra_fields(self):
+        for child in self.extra_inner.winfo_children():
+            child.destroy()
+        self.manual_widgets = {}
+        try:
+            form_id = self._selected_form_id()
+        except Exception:
+            return
+        fields = self.renderer.get_form_fields(form_id)[:8]
+        for idx, field in enumerate(fields):
+            tk.Label(self.extra_inner, text=field['field_label'], bg='#f0f4f8',
+                     font=('Arial', 10)).grid(row=idx // 2, column=(idx % 2) * 2, sticky='w', padx=5, pady=4)
+            var = tk.StringVar(value='')
+            self.manual_widgets[field['field_key']] = var
+            tk.Entry(self.extra_inner, textvariable=var, width=24).grid(row=idx // 2, column=(idx % 2) * 2 + 1, sticky='w', padx=5, pady=4)
+
+    def _manual_values(self):
+        return {key: var.get().strip() for key, var in self.manual_widgets.items() if var.get().strip()}
+
+    def _save(self):
+        try:
+            form_id = self._selected_form_id()
+            output_path = self.renderer.render_form(
+                form_id, 'expense', self.expense_id, self._manual_values()
+            )
+            self.result = {'output_path': output_path}
+            self.destroy()
+        except Exception as exc:
+            messagebox.showerror("Lỗi", str(exc))
+
+
+class ContractDialog(tk.Toplevel):
+    """Thêm/sửa hợp đồng dự án."""
+
+    def __init__(self, parent, projects, contract_types, contract_data=None):
+        super().__init__(parent)
+        self.title("Hợp đồng dự án")
+        self.geometry("520x580")
+        self.result = None
+        self.projects = projects
+        self.contract_types = contract_types
+        frame = tk.Frame(self, bg='#f0f4f8', padx=16, pady=16)
+        frame.pack(fill='both', expand=True)
+        self.vars = {}
+        specs = [
+            ('project_id', 'Dự án:', 'combobox', [f"{p[0]} - {p[1]}" for p in projects]),
+            ('contract_type', 'Loại HĐ:', 'combobox', list(contract_types.values())),
+            ('contract_no', 'Số HĐ:', 'entry', ''),
+            ('partner_name', 'Đối tác:', 'entry', ''),
+            ('signed_date', 'Ngày ký:', 'entry', datetime.now().strftime('%Y-%m-%d')),
+            ('contract_value', 'Giá trị HĐ:', 'entry', '0'),
+            ('vat_rate', 'VAT %:', 'entry', '10'),
+            ('retention_rate', 'Giữ lại %:', 'entry', '5'),
+            ('advance_received', 'Tạm ứng thu:', 'entry', '0'),
+            ('advance_paid', 'Tạm ứng chi:', 'entry', '0'),
+            ('start_date', 'Bắt đầu:', 'entry', ''),
+            ('end_date', 'Kết thúc:', 'entry', ''),
+            ('status', 'Trạng thái:', 'combobox', ['active', 'completed', 'cancelled']),
+            ('notes', 'Ghi chú:', 'entry', ''),
+        ]
+        for idx, (key, label, kind, default) in enumerate(specs):
+            tk.Label(frame, text=label, bg='#f0f4f8').grid(row=idx, column=0, sticky='w', pady=4)
+            var = tk.StringVar(value=default if kind != 'combobox' else (default[0] if default else ''))
+            self.vars[key] = var
+            if kind == 'combobox':
+                ttk.Combobox(frame, textvariable=var, values=default, width=38).grid(row=idx, column=1, sticky='ew')
+            else:
+                tk.Entry(frame, textvariable=var, width=40).grid(row=idx, column=1, sticky='ew')
+        if contract_data:
+            self.vars['contract_type'].set(contract_types.get(contract_data.get('contract_type'), ''))
+            for key in self.vars:
+                if key in contract_data and key not in ('project_id', 'contract_type'):
+                    self.vars[key].set(str(contract_data[key] or ''))
+        tk.Button(frame, text="Lưu", bg='#27ae60', fg='white', command=self._save).grid(row=len(specs), column=0, pady=12)
+        tk.Button(frame, text="Hủy", command=self.destroy).grid(row=len(specs), column=1, pady=12)
+        self.transient(parent)
+        self.grab_set()
+
+    def _save(self):
+        self.result = {k: v.get().strip() for k, v in self.vars.items()}
+        self.result['project_id'] = _parse_combo_id(self.result.get('project_id', ''))
+        type_map = {v: k for k, v in self.contract_types.items()}
+        self.result['contract_type'] = type_map.get(self.result['contract_type'], 'customer')
+        for num_key in ('contract_value', 'vat_rate', 'retention_rate', 'advance_received', 'advance_paid'):
+            try:
+                self.result[num_key] = float(self.result.get(num_key, 0) or 0)
+            except ValueError:
+                self.result[num_key] = 0
+        self.destroy()
+
+
+class BillingDialog(tk.Toplevel):
+    """Nghiệm thu / đợt thanh toán."""
+
+    def __init__(self, parent, contracts):
+        super().__init__(parent)
+        self.title("Nghiệm thu / thanh toán")
+        self.geometry("480x420")
+        self.result = None
+        frame = tk.Frame(self, padx=16, pady=16)
+        frame.pack(fill='both', expand=True)
+        self.vars = {}
+        contract_values = [f"{c[0]} - {c[1]}" for c in contracts]
+        specs = [
+            ('contract_id', 'Hợp đồng:', 'combo', contract_values),
+            ('billing_date', 'Ngày:', 'entry', datetime.now().strftime('%Y-%m-%d')),
+            ('milestone_name', 'Mốc/đợt:', 'entry', 'Đợt 1'),
+            ('quantity_or_percent', '%/KL:', 'entry', '20'),
+            ('amount_before_vat', 'Giá trị trước VAT:', 'entry', '0'),
+            ('status', 'Trạng thái:', 'combo', ['draft', 'submitted', 'approved', 'paid']),
+            ('notes', 'Ghi chú:', 'entry', ''),
+        ]
+        for idx, (key, label, kind, default) in enumerate(specs):
+            tk.Label(frame, text=label).grid(row=idx, column=0, sticky='w', pady=4)
+            init = default[0] if kind == 'combo' and default else str(default)
+            var = tk.StringVar(value=init)
+            self.vars[key] = var
+            if kind == 'combo':
+                ttk.Combobox(frame, textvariable=var, values=default, width=36).grid(row=idx, column=1)
+            else:
+                tk.Entry(frame, textvariable=var, width=38).grid(row=idx, column=1)
+        self.create_revenue_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(frame, text="Ghi nhận doanh thu khi duyệt", variable=self.create_revenue_var).grid(row=7, column=0, columnspan=2)
+        tk.Button(frame, text="Lưu", bg='#27ae60', fg='white', command=self._save).grid(row=8, column=0, pady=10)
+        tk.Button(frame, text="Hủy", command=self.destroy).grid(row=8, column=1)
+        self.transient(parent)
+        self.grab_set()
+
+    def _save(self):
+        self.result = {k: v.get().strip() for k, v in self.vars.items()}
+        self.result['contract_id'] = _parse_combo_id(self.result['contract_id'])
+        self.result['create_revenue'] = self.create_revenue_var.get()
+        for nk in ('quantity_or_percent', 'amount_before_vat'):
+            try:
+                self.result[nk] = float(self.result.get(nk, 0) or 0)
+            except ValueError:
+                self.result[nk] = 0
+        self.destroy()
+
+
+class CostPlanDialog(tk.Toplevel):
+    """Dự toán chi phí theo loại."""
+
+    def __init__(self, parent, projects, categories):
+        super().__init__(parent)
+        self.title("Dự toán chi phí")
+        self.geometry("440x280")
+        self.result = None
+        frame = tk.Frame(self, padx=16, pady=16)
+        frame.pack()
+        self.project_var = tk.StringVar(value=f"{projects[0][0]} - {projects[0][1]}" if projects else '')
+        self.category_var = tk.StringVar(value=f"{categories[0][0]} - {categories[0][1]}" if categories else '')
+        self.amount_var = tk.StringVar(value='0')
+        self.notes_var = tk.StringVar()
+        tk.Label(frame, text="Dự án:").grid(row=0, column=0, sticky='w')
+        ttk.Combobox(frame, textvariable=self.project_var,
+                     values=[f"{p[0]} - {p[1]}" for p in projects], width=36).grid(row=0, column=1)
+        tk.Label(frame, text="Loại chi phí:").grid(row=1, column=0, sticky='w')
+        ttk.Combobox(frame, textvariable=self.category_var,
+                     values=[f"{c[0]} - {c[1]}" for c in categories], width=36).grid(row=1, column=1)
+        tk.Label(frame, text="Dự toán (₫):").grid(row=2, column=0, sticky='w')
+        tk.Entry(frame, textvariable=self.amount_var, width=38).grid(row=2, column=1)
+        tk.Label(frame, text="Ghi chú:").grid(row=3, column=0, sticky='w')
+        tk.Entry(frame, textvariable=self.notes_var, width=38).grid(row=3, column=1)
+        tk.Button(frame, text="Lưu", bg='#27ae60', fg='white', command=self._save).grid(row=4, column=0, pady=10)
+        tk.Button(frame, text="Hủy", command=self.destroy).grid(row=4, column=1)
+        self.transient(parent)
+        self.grab_set()
+
+    def _save(self):
+        try:
+            self.result = {
+                'project_id': _parse_combo_id(self.project_var.get()),
+                'category_id': _parse_combo_id(self.category_var.get()),
+                'planned_amount': float(self.amount_var.get().replace(',', '') or 0),
+                'notes': self.notes_var.get(),
+            }
+            self.destroy()
+        except ValueError:
+            messagebox.showerror("Lỗi", "Số tiền không hợp lệ")
+
+
+class RevenueDialog(tk.Toplevel):
+    """Ghi nhận doanh thu dự án."""
+
+    def __init__(self, parent, projects):
+        super().__init__(parent)
+        self.title("Ghi nhận doanh thu")
+        self.geometry("440x300")
+        self.result = None
+        frame = tk.Frame(self, padx=16, pady=16)
+        frame.pack()
+        self.project_var = tk.StringVar(value=f"{projects[0][0]} - {projects[0][1]}" if projects else '')
+        self.date_var = tk.StringVar(value=datetime.now().strftime('%Y-%m-%d'))
+        self.amount_var = tk.StringVar(value='0')
+        self.vat_var = tk.StringVar(value='0')
+        self.desc_var = tk.StringVar()
+        tk.Label(frame, text="Dự án:").grid(row=0, column=0)
+        ttk.Combobox(frame, textvariable=self.project_var,
+                     values=[f"{p[0]} - {p[1]}" for p in projects], width=36).grid(row=0, column=1)
+        tk.Label(frame, text="Ngày:").grid(row=1, column=0)
+        tk.Entry(frame, textvariable=self.date_var, width=38).grid(row=1, column=1)
+        tk.Label(frame, text="Doanh thu:").grid(row=2, column=0)
+        tk.Entry(frame, textvariable=self.amount_var, width=38).grid(row=2, column=1)
+        tk.Label(frame, text="VAT:").grid(row=3, column=0)
+        tk.Entry(frame, textvariable=self.vat_var, width=38).grid(row=3, column=1)
+        tk.Label(frame, text="Diễn giải:").grid(row=4, column=0)
+        tk.Entry(frame, textvariable=self.desc_var, width=38).grid(row=4, column=1)
+        tk.Button(frame, text="Lưu", bg='#27ae60', fg='white', command=self._save).grid(row=5, column=0, pady=10)
+        tk.Button(frame, text="Hủy", command=self.destroy).grid(row=5, column=1)
+        self.transient(parent)
+        self.grab_set()
+
+    def _save(self):
+        try:
+            self.result = {
+                'project_id': _parse_combo_id(self.project_var.get()),
+                'revenue_date': self.date_var.get(),
+                'amount': float(self.amount_var.get().replace(',', '') or 0),
+                'vat_amount': float(self.vat_var.get().replace(',', '') or 0),
+                'description': self.desc_var.get(),
+            }
+            self.destroy()
+        except ValueError:
+            messagebox.showerror("Lỗi", "Số tiền không hợp lệ")

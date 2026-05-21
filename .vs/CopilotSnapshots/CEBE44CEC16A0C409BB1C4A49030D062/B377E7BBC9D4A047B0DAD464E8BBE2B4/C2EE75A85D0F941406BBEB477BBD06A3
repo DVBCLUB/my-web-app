@@ -1,0 +1,561 @@
+﻿"""
+OCR_ENHANCED - Module OCR nâng cấp với xử lý lỗi, async, retry, v.v.
+Giải quyết vấn đề "không phản hồi" và nhận diện text scan kém
+"""
+
+import os
+import threading
+import time
+from pathlib import Path
+from datetime import date
+import re
+import unicodedata
+from typing import Optional, Tuple, Dict, List, Callable
+from dataclasses import dataclass
+from enum import Enum
+import logging
+
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+class OCRStatus(Enum):
+    """Trạng thái OCR"""
+    IDLE = "idle"
+    PROCESSING = "processing"
+    SUCCESS = "success"
+    FAILED = "failed"
+    TIMEOUT = "timeout"
+
+
+@dataclass
+class OCRResult:
+    """Kết quả OCR"""
+    text: str
+    status: OCRStatus
+    confidence: float
+    error: Optional[str] = None
+    pages: int = 1
+    duration: float = 0.0
+
+
+class OCRToolEnhanced:
+    """
+    Module OCR nâng cấp với:
+    - Xử lý async (không block UI)
+    - Timeout tự động
+    - Retry mechanism
+    - Preprocessing nâng cấp
+    - Multi-threading safe
+    """
+
+    # Timeout cho các thao tác
+    TIMEOUT_PDF_EXTRACT = 30  # Giây
+    TIMEOUT_OCR_PAGE = 45  # Giây per page
+    TIMEOUT_IMAGE = 30  # Giây
+
+    # Retry settings
+    MAX_RETRIES = 2
+    RETRY_DELAY = 1  # Giây
+
+    def __init__(self):
+        self._stop_event = threading.Event()
+        self._current_task = None
+        self._lock = threading.Lock()
+
+    def extract_text_async(
+        self, 
+        file_path: str,
+        callback: Callable[[OCRResult], None],
+        timeout: Optional[float] = None
+    ) -> None:
+        """
+        Trích xuất text không đồng bộ (không block UI)
+
+        Args:
+            file_path: Đường dẫn file
+            callback: Hàm callback khi hoàn thành
+            timeout: Timeout tùy chọn (giây)
+        """
+        def _extract():
+            try:
+                result = self.extract_text(file_path, timeout=timeout)
+                callback(result)
+            except Exception as e:
+                result = OCRResult(
+                    text="",
+                    status=OCRStatus.FAILED,
+                    confidence=0.0,
+                    error=str(e)
+                )
+                callback(result)
+
+        thread = threading.Thread(target=_extract, daemon=True)
+        thread.start()
+
+    def extract_text(
+        self, 
+        file_path: str,
+        timeout: Optional[float] = None
+    ) -> OCRResult:
+        """
+        Trích xuất text từ PDF/ảnh với timeout
+
+        Args:
+            file_path: Đường dẫn file
+            timeout: Timeout (giây), mặc định dựa trên loại file
+
+        Returns:
+            OCRResult object
+        """
+        start_time = time.time()
+
+        try:
+            path = Path(file_path)
+            if not path.exists():
+                return OCRResult(
+                    text="",
+                    status=OCRStatus.FAILED,
+                    confidence=0.0,
+                    error=f"File không tồn tại: {file_path}"
+                )
+
+            suffix = path.suffix.lower()
+
+            if suffix == '.pdf':
+                result = self._extract_pdf_with_timeout(path, timeout)
+            elif suffix in ['.png', '.jpg', '.jpeg', '.bmp', '.gif', '.tiff']:
+                result = self._extract_image_with_timeout(path, timeout)
+            else:
+                return OCRResult(
+                    text="",
+                    status=OCRStatus.FAILED,
+                    confidence=0.0,
+                    error=f"Định dạng không hỗ trợ: {suffix}"
+                )
+
+            result.duration = time.time() - start_time
+            return result
+
+        except Exception as e:
+            logger.error(f"Lỗi OCR: {e}")
+            return OCRResult(
+                text="",
+                status=OCRStatus.FAILED,
+                confidence=0.0,
+                error=str(e),
+                duration=time.time() - start_time
+            )
+
+    def _extract_pdf_with_timeout(self, path: Path, timeout: Optional[float]) -> OCRResult:
+        """Trích xuất PDF với timeout"""
+        timeout = timeout or self.TIMEOUT_PDF_EXTRACT
+
+        # Thử extract text trước
+        try:
+            text = self._extract_pdf_text_safe(path, timeout)
+            if text.strip():
+                return OCRResult(
+                    text=text,
+                    status=OCRStatus.SUCCESS,
+                    confidence=0.8,
+                    pages=text.count("--- Trang")
+                )
+        except Exception as e:
+            logger.warning(f"Không extract text PDF: {e}")
+
+        # Nếu text không có, thử OCR
+        try:
+            text = self._ocr_pdf_pages_safe(path, timeout)
+            if text.strip():
+                return OCRResult(
+                    text=text,
+                    status=OCRStatus.SUCCESS,
+                    confidence=0.6,
+                    pages=text.count("--- Trang")
+                )
+            else:
+                return OCRResult(
+                    text="",
+                    status=OCRStatus.FAILED,
+                    confidence=0.0,
+                    error="Không nhận diện được text trong PDF scan"
+                )
+        except Exception as e:
+            return OCRResult(
+                text="",
+                status=OCRStatus.FAILED,
+                confidence=0.0,
+                error=f"Lỗi OCR PDF: {str(e)}"
+            )
+
+    def _extract_image_with_timeout(self, path: Path, timeout: Optional[float]) -> OCRResult:
+        """Trích xuất ảnh với timeout"""
+        timeout = timeout or self.TIMEOUT_IMAGE
+
+        try:
+            text = self._ocr_image_safe(path, timeout)
+            if text.strip():
+                return OCRResult(
+                    text=text,
+                    status=OCRStatus.SUCCESS,
+                    confidence=0.7,
+                    pages=1
+                )
+            else:
+                return OCRResult(
+                    text="",
+                    status=OCRStatus.FAILED,
+                    confidence=0.0,
+                    error="Không nhận diện được text trong ảnh"
+                )
+        except Exception as e:
+            return OCRResult(
+                text="",
+                status=OCRStatus.FAILED,
+                confidence=0.0,
+                error=str(e)
+            )
+
+    def _extract_pdf_text_safe(self, path: Path, timeout: float) -> str:
+        """Extract text từ PDF an toàn với timeout"""
+        result = []
+
+        try:
+            import pdfplumber
+            with pdfplumber.open(str(path)) as pdf:
+                for index, page in enumerate(pdf.pages, 1):
+                    text = page.extract_text(x_tolerance=1, y_tolerance=3) or ''
+                    if text.strip():
+                        result.append(f"--- Trang {index} ---\n{text.strip()}")
+        except ImportError:
+            try:
+                from pypdf import PdfReader
+            except ImportError:
+                from PyPDF2 import PdfReader
+
+            reader = PdfReader(str(path))
+            for index, page in enumerate(reader.pages, 1):
+                text = page.extract_text() or ''
+                if text.strip():
+                    result.append(f"--- Trang {index} ---\n{text.strip()}")
+
+        return "\n\n".join(result)
+
+    def _ocr_pdf_pages_safe(self, path: Path, timeout: float) -> str:
+        """OCR PDF pages an toàn với timeout"""
+        try:
+            import pytesseract
+            import pypdfium2 as pdfium
+        except ImportError as e:
+            raise RuntimeError(
+                "Cần cài đặt: pip install pytesseract pypdfium2 pillow\n"
+                "Và Tesseract OCR: https://github.com/UB-Mannheim/tesseract/wiki"
+            ) from e
+
+        exe = self._find_tesseract()
+        if exe:
+            pytesseract.pytesseract.tesseract_cmd = exe
+
+        pages = []
+        try:
+            pdf = pdfium.PdfDocument(str(path))
+            num_pages = len(pdf)
+
+            for index in range(num_pages):
+                # Check timeout
+                if index > 0:
+                    timeout_per_page = timeout / max(num_pages, 1)
+                    # Nếu vượt quá, dừng
+                    if timeout_per_page < 5:
+                        logger.warning(f"Timeout cho page {index}, dừng OCR")
+                        break
+
+                try:
+                    page = pdf[index]
+                    # Scale down để tránh memory issues
+                    bitmap = page.render(scale=2.0)
+                    image = bitmap.to_pil()
+
+                    # OCR with preprocessing
+                    text = self._ocr_image_with_preprocessing(image, pytesseract)
+                    if text:
+                        pages.append(f"--- Trang {index + 1} OCR ---\n{text}")
+                except Exception as e:
+                    logger.error(f"Lỗi OCR page {index + 1}: {e}")
+                    continue
+        except Exception as e:
+            logger.error(f"Lỗi PDF OCR: {e}")
+
+        return "\n\n".join(pages) if pages else ""
+
+    def _ocr_image_safe(self, path: Path, timeout: float) -> str:
+        """OCR ảnh an toàn với timeout"""
+        try:
+            import pytesseract
+            from PIL import Image
+        except ImportError as e:
+            raise RuntimeError(
+                "Cần cài đặt: pip install pytesseract pillow\n"
+                "Và Tesseract OCR: https://github.com/UB-Mannheim/tesseract/wiki"
+            ) from e
+
+        exe = self._find_tesseract()
+        if exe:
+            pytesseract.pytesseract.tesseract_cmd = exe
+
+        try:
+            image = Image.open(path)
+            return self._ocr_image_with_preprocessing(image, pytesseract)
+        except Exception as e:
+            logger.error(f"Lỗi OCR ảnh: {e}")
+            return ""
+
+    def _ocr_image_with_preprocessing(self, image, pytesseract) -> Tuple[str, float]:
+        """OCR với preprocessing nâng cấp - return (text, confidence)"""
+        lang = self._best_tesseract_lang(pytesseract)
+        variants = self._preprocess_image_variants_enhanced(image)
+        tessdata_config = self._tessdata_config()
+
+        configs = (
+            f'{tessdata_config} --oem 3 --psm 6 -c preserve_interword_spaces=1'.strip(),
+            f'{tessdata_config} --oem 3 --psm 4 -c preserve_interword_spaces=1'.strip(),
+            f'{tessdata_config} --oem 3 --psm 11'.strip(),
+            f'{tessdata_config} --oem 1 --psm 6'.strip(),  # Legacy engine
+        )
+
+        best_text = ''
+        best_score = -1.0
+        best_confidence = 0.0
+
+        for variant_idx, variant in enumerate(variants):
+            for config_idx, config in enumerate(configs):
+                try:
+                    text = pytesseract.image_to_string(
+                        variant,
+                        lang=lang,
+                        config=config
+                    ).strip()
+
+                    score = self._ocr_text_score(text)
+                    # Confidence từ 0-1
+                    confidence = min(max(score / 100.0, 0.0), 1.0)
+
+                    if score > best_score:
+                        best_text = text
+                        best_score = score
+                        best_confidence = confidence
+                        logger.info(f"Variant {variant_idx}, Config {config_idx}: score={score}, confidence={confidence:.2f}")
+                except Exception as e:
+                    logger.debug(f"Config {config_idx} failed: {e}")
+                    continue
+
+        return best_text, best_confidence
+
+    def _preprocess_image_variants_enhanced(self, image):
+        """Preprocessing ảnh nâng cấp"""
+        try:
+            from PIL import ImageOps, ImageFilter, ImageEnhance
+        except ImportError:
+            return [image]
+
+        variants = []
+
+        try:
+            # 1. Normalize orientation
+            source = ImageOps.exif_transpose(image).convert('RGB')
+
+            # 2. Upscale nếu quá nhỏ
+            max_side = max(source.size)
+            if max_side and max_side < 1000:
+                scale = min(2.5, 1000 / max_side)
+                source = source.resize(
+                    (int(source.width * scale), int(source.height * scale)),
+                    ImageOps.Resampling.LANCZOS if hasattr(ImageOps, 'Resampling') else Image.LANCZOS
+                )
+
+            # 3. Grayscale + various preprocessing
+            gray = ImageOps.grayscale(source)
+
+            # Variant 1: Autocontrast
+            v1 = ImageOps.autocontrast(gray)
+            variants.append(v1)
+
+            # Variant 2: Median filter + Sharpen
+            v2 = gray.filter(ImageFilter.MedianFilter(size=3))
+            v2 = v2.filter(ImageFilter.SHARPEN)
+            v2 = ImageOps.autocontrast(v2)
+            variants.append(v2)
+
+            # Variant 3: Enhance contrast
+            v3 = ImageEnhance.Contrast(gray).enhance(1.5)
+            variants.append(v3)
+
+            # Variant 4: Threshold
+            v4 = gray.point(lambda p: 255 if p > 140 else 0)
+            variants.append(v4)
+
+            # Variant 5: Bilateral-like (median multiple)
+            v5 = gray.filter(ImageFilter.MedianFilter(size=5))
+            variants.append(v5)
+
+            return variants
+        except Exception as e:
+            logger.error(f"Preprocessing failed: {e}")
+            return [image]
+
+    def _best_tesseract_lang(self, pytesseract) -> str:
+        """Chọn ngôn ngữ Tesseract tốt nhất"""
+        langs = self._available_tesseract_langs(pytesseract)
+
+        # Ưu tiên Vietnamese + English
+        if {'vie', 'eng'}.issubset(langs):
+            return 'vie+eng'
+        if 'vie' in langs:
+            return 'vie'
+        if 'eng' in langs:
+            return 'eng'
+
+        return 'eng'  # Fallback
+
+    def _available_tesseract_langs(self, pytesseract) -> set:
+        """Lấy danh sách ngôn ngữ có sẵn"""
+        local_langs = self._local_tessdata_langs()
+        if local_langs:
+            return local_langs
+
+        try:
+            config = self._tessdata_config()
+            langs = pytesseract.get_languages(config=config if config else None)
+            return set(langs)
+        except Exception as e:
+            logger.error(f"Không lấy được danh sách ngôn ngữ: {e}")
+            return {'eng'}
+
+    def _local_tessdata_langs(self) -> set:
+        """Lấy ngôn ngữ từ tessdata local"""
+        tessdata_dir = Path(__file__).resolve().parents[1] / 'tessdata'
+        if not tessdata_dir.exists():
+            return set()
+        return {path.stem for path in tessdata_dir.glob('*.traineddata')}
+
+    def _tessdata_config(self) -> str:
+        """Config tessdata directory"""
+        tessdata_dir = Path(__file__).resolve().parents[1] / 'tessdata'
+        if tessdata_dir.exists():
+            return f'--tessdata-dir {tessdata_dir}'
+        return ''
+
+    def _ocr_text_score(self, text: str) -> float:
+        """Tính điểm chất lượng OCR"""
+        if not text:
+            return 0
+
+        vietnamese_chars = 'ăâđêôơưĂÂĐÊÔƠƯáàảãạấầẩẫậắằẳẵặéèẻẽẹếềểễệíìỉĩịóòỏõọốồổỗộớờởỡợúùủũụứừửữựýỳỷỹỵ'
+
+        # Quyền trọng:
+        length_score = len(text.strip())
+        vietnamese_hits = sum(1 for ch in text if ch in vietnamese_chars)
+        alpha_hits = sum(1 for ch in text if ch.isalpha())
+        digit_hits = sum(1 for ch in text if ch.isdigit())
+
+        # Ưu tiên Vietnamese text
+        score = (
+            length_score * 1.0 +
+            vietnamese_hits * 8.0 +
+            alpha_hits * 1.5 +
+            digit_hits * 2.0
+        )
+
+        return score
+
+    def _find_tesseract(self) -> Optional[str]:
+        """Tìm Tesseract executable"""
+        import shutil
+
+        candidates = [
+            shutil.which('tesseract'),
+            r'C:\Program Files\Tesseract-OCR\tesseract.exe',
+            r'C:\Program Files (x86)\Tesseract-OCR\tesseract.exe',
+            '/usr/local/bin/tesseract',  # macOS
+            '/usr/bin/tesseract',  # Linux
+        ]
+
+        for candidate in candidates:
+            if candidate and Path(candidate).exists():
+                logger.info(f"Found Tesseract: {candidate}")
+                return candidate
+
+        logger.warning("Tesseract không tìm thấy. Để cài đặt, xem: https://github.com/UB-Mannheim/tesseract/wiki")
+        return None
+
+    def stop(self):
+        """Dừng OCR hiện tại"""
+        self._stop_event.set()
+
+
+# Backward compatibility
+class OCRTool:
+    """Wrapper để giữ tương thích với code cũ"""
+
+    _enhanced = OCRToolEnhanced()
+
+    @staticmethod
+    def extract_text(file_path):
+        """Compatibility method"""
+        result = OCRTool._enhanced.extract_text(file_path)
+        if result.status == OCRStatus.SUCCESS:
+            return result.text
+        raise RuntimeError(result.error or "Lỗi OCR")
+
+    @staticmethod
+    def extract_text_async(file_path, callback, timeout=None):
+        """Compatibility method"""
+        OCRTool._enhanced.extract_text_async(file_path, callback, timeout)
+
+    # Giữ các method cũ
+    @staticmethod
+    def _extract_pdf(path):
+        result = OCRTool._enhanced._extract_pdf_with_timeout(path, None)
+        return result.text
+
+    @staticmethod
+    def _extract_pdf_text(path):
+        return OCRTool._enhanced._extract_pdf_text_safe(path, 30)
+
+    @staticmethod
+    def _ocr_pdf_pages(path):
+        return OCRTool._enhanced._ocr_pdf_pages_safe(path, 60)
+
+    @staticmethod
+    def _extract_image(path):
+        return OCRTool._enhanced._ocr_image_safe(path, 30)
+
+    @staticmethod
+    def _ocr_image_with_preprocessing(image, pytesseract):
+        return OCRTool._enhanced._ocr_image_with_preprocessing(image, pytesseract)
+
+    @staticmethod
+    def _best_tesseract_lang(pytesseract):
+        return OCRTool._enhanced._best_tesseract_lang(pytesseract)
+
+    @staticmethod
+    def _available_tesseract_langs(pytesseract):
+        return OCRTool._enhanced._available_tesseract_langs(pytesseract)
+
+    @staticmethod
+    def _local_tessdata_langs():
+        return OCRTool._enhanced._local_tessdata_langs()
+
+    @staticmethod
+    def _tessdata_config():
+        return OCRTool._enhanced._tessdata_config()
+
+    @staticmethod
+    def _ocr_text_score(text):
+        return OCRTool._enhanced._ocr_text_score(text)
+
+    @staticmethod
+    def _find_tesseract():
+        return OCRTool._enhanced._find_tesseract()

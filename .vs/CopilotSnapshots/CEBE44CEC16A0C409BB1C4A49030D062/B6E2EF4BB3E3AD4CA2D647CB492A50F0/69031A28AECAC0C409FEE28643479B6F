@@ -1,0 +1,91 @@
+﻿"""
+=============================================================================
+PHẦN MỀM QUẢN LÝ KẾ TOÁN - CÔNG TY TRUNG HẢI (ERP SYSTEM)
+=============================================================================
+
+CÀI ĐẶT THƯ VIỆN TRƯỚC:
+    pip install pandas openpyxl python-docx docxtpl matplotlib pillow
+
+CHỨC NĂNG:
+    ✓ Hạch toán & quản lý chi phí
+    ✓ Quản lý hóa đơn / chứng từ
+    ✓ Liên kết file chứng từ
+    ✓ Mẫu chứng từ (in PDF/Word)
+    ✓ Quản lý vật tư / kho
+    ✓ Báo cáo & biểu đồ thống kê
+    ✓ Quản lý dự án xây dựng
+    ✓ Quản lý người dùng & quyền hạn
+
+=============================================================================
+"""
+
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
+import os
+import threading
+from datetime import datetime
+import sqlite3
+from pathlib import Path
+
+# Import các module con
+from database import init_database
+from ui.main_window import MainWindow
+
+
+def check_dependencies():
+    """Kiểm tra các thư viện bắt buộc."""
+    required = ['pandas', 'openpyxl', 'docxtpl', 'matplotlib']
+    missing = []
+
+    for lib in required:
+        try:
+            __import__(lib)
+        except ImportError:
+            missing.append(lib)
+
+    if missing:
+        msg = f"Thiếu thư viện: {', '.join(missing)}\n\nChạy lệnh:\npip install {' '.join(missing)}"
+        print(f"❌ {msg}")
+        return False
+    return True
+
+
+def create_app_directories():
+    """Tạo các thư mục cần thiết cho ứng dụng."""
+    dirs = [
+        'data',
+        'templates',
+        'documents',
+        'reports',
+        'attachments',
+        'backups'
+    ]
+
+    for dir_name in dirs:
+        Path(dir_name).mkdir(exist_ok=True)
+
+
+def main():
+    """Hàm chính."""
+    # Kiểm tra thư viện
+    if not check_dependencies():
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showerror("Lỗi", "Vui lòng cài đặt các thư viện bắt buộc")
+        root.destroy()
+        return
+
+    # Tạo thư mục
+    create_app_directories()
+
+    # Khởi tạo database
+    init_database()
+
+    # Khởi tạo giao diện chính
+    root = tk.Tk()
+    app = MainWindow(root)
+    root.mainloop()
+
+
+if __name__ == '__main__':
+    main()

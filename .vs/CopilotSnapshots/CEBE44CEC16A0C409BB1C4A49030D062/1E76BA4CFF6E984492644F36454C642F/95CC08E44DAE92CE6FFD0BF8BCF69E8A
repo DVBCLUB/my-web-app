@@ -1,0 +1,316 @@
+﻿"""
+AI_SERVICE - Dịch vụ tích hợp Google Gemini API
+Cung cấp khả năng chat thông minh cho ứng dụng ERP
+"""
+
+import os
+import json
+import threading
+from datetime import datetime
+from typing import Optional, List, Dict, Callable
+from collections import deque
+
+try:
+    import google.generativeai as genai
+    GEMINI_AVAILABLE = True
+except ImportError:
+    GEMINI_AVAILABLE = False
+    genai = None
+
+import config
+
+
+class ChatMessage:
+    """Lớp đại diện cho một tin nhắn trong cuộc hội thoại"""
+
+    def __init__(self, role: str, content: str):
+        self.role = role  # 'user' hoặc 'assistant'
+        self.content = content
+        self.timestamp = datetime.now()
+
+    def to_dict(self) -> Dict:
+        return {
+            'role': self.role,
+            'content': self.content,
+            'timestamp': self.timestamp.isoformat()
+        }
+
+
+class GeminiAIService:
+    """
+    Dịch vụ tích hợp Google Gemini API
+    Quản lý chat, lịch sử cuộc trò chuyện, và tương tác với Gemini
+    """
+
+    def __init__(self, api_key: Optional[str] = None):
+        """
+        Khởi tạo dịch vụ AI
+
+        Args:
+            api_key: Google API key (nếu không có sẽ lấy từ config hoặc environment)
+        """
+        self.api_key = api_key or config.GEMINI_API_KEY
+        self.model_name = config.GEMINI_MODEL
+        self.system_prompt = config.AI_SYSTEM_PROMPT
+        self.max_history = config.AI_MAX_HISTORY
+        self.response_timeout = config.AI_RESPONSE_TIMEOUT
+
+        # Lịch sử chat
+        self.chat_history: deque = deque(maxlen=self.max_history)
+
+        # Callback cho sự kiện
+        self.on_response_received: Optional[Callable] = None
+        self.on_error_occurred: Optional[Callable] = None
+
+        # Trạng thái
+        self.is_initialized = False
+        self.is_waiting_response = False
+        self.last_error: Optional[str] = None
+
+        # Khởi tạo Gemini nếu API key có sẵn
+        if self.api_key:
+            self._initialize()
+
+    def _initialize(self) -> bool:
+        """Khởi tạo Gemini API"""
+        if not GEMINI_AVAILABLE:
+            self.last_error = "Thư viện google-generativeai chưa được cài đặt.\nChạy: pip install google-generativeai"
+            if self.on_error_occurred:
+                self.on_error_occurred(self.last_error)
+            return False
+
+        if not self.api_key:
+            self.last_error = "Chưa cấu hình GEMINI_API_KEY"
+            return False
+
+        try:
+            genai.configure(api_key=self.api_key)
+            self.model = genai.GenerativeModel(
+                model_name=self.model_name,
+                system_instruction=self.system_prompt
+            )
+            self.is_initialized = True
+            return True
+        except Exception as e:
+            self.last_error = f"Lỗi khởi tạo Gemini: {str(e)}"
+            if self.on_error_occurred:
+                self.on_error_occurred(self.last_error)
+            return False            return False
+
+    def set_api_key(self, api_key: str) -> bool:
+        """
+        Thiết lập API key mới
+
+        Args:
+            api_key: Google API key
+
+        Returns:
+            True nếu thành công, False nếu thất bại
+        """
+        self.api_key = api_key
+        self.chat_history.clear()  # Xóa lịch sử khi đổi API key
+        return self._initialize()
+
+    def is_ready(self) -> bool:
+        """Kiểm tra dịch vụ AI có sẵn sàng không"""
+        return self.is_initialized and not self.is_waiting_response
+
+    def add_message(self, role: str, content: str) -> None:
+        """
+        Thêm tin nhắn vào lịch sử
+
+        Args:
+            role: 'user' hoặc 'assistant'
+            content: Nội dung tin nhắn
+        """
+        message = ChatMessage(role, content)
+        self.chat_history.append(message)
+
+    def get_history(self) -> List[Dict]:
+        """Lấy lịch sử chat dưới dạng dict"""
+        return [msg.to_dict() for msg in self.chat_history]
+
+    def clear_history(self) -> None:
+        """Xóa lịch sử chat"""
+        self.chat_history.clear()
+
+    def send_message(self, user_message: str, callback: Optional[Callable] = None) -> Optional[str]:
+        """
+        Gửi tin nhắn tới Gemini và nhận response (đồng bộ)
+
+        Args:
+            user_message: Nội dung tin nhắn từ người dùng
+            callback: Hàm callback khi nhận được response
+
+        Returns:
+            Response từ Gemini hoặc None nếu có lỗi
+        """
+        if not self.is_ready():
+            error_msg = "Dịch vụ AI chưa sẵn sàng"
+            if self.on_error_occurred:
+                self.on_error_occurred(error_msg)
+            return None
+
+        # Thêm tin nhắn của người dùng vào lịch sử
+        self.add_message('user', user_message)
+        self.is_waiting_response = True
+
+        try:
+            # Chuẩn bị lịch sử chat cho API
+            conversation_history = [
+                {
+                    'role': msg.role if msg.role == 'user' else 'model',
+                    'parts': [msg.content]
+                }
+                for msg in self.chat_history
+            ]
+
+            # Gửi yêu cầu tới Gemini
+            if not genai or not hasattr(genai, 'types'):
+                raise RuntimeError("Google Generative AI không khả dụng")
+
+            response = self.model.generate_content(
+                conversation_history,
+                generation_config=genai.types.GenerationConfig(
+                    max_output_tokens=2000,
+                )
+            )
+
+            assistant_response = response.text
+
+            # Thêm response vào lịch sử
+            self.add_message('assistant', assistant_response)
+
+            # Gọi callback nếu có
+            if callback:
+                callback(assistant_response)
+
+            if self.on_response_received:
+                self.on_response_received(assistant_response)
+
+            return assistant_response
+
+        except Exception as e:
+            error_msg = f"Lỗi khi gửi tin nhắn: {str(e)}"
+            self.last_error = error_msg
+
+            if self.on_error_occurred:
+                self.on_error_occurred(error_msg)
+
+            return None
+        finally:
+            self.is_waiting_response = False
+
+    def send_message_async(self, user_message: str, callback: Callable) -> None:
+        """
+        Gửi tin nhắn tới Gemini không đồng bộ (trong thread riêng)
+
+        Args:
+            user_message: Nội dung tin nhắn
+            callback: Hàm callback khi nhận được response
+        """
+        def send_in_thread():
+            self.send_message(user_message, callback)
+
+        thread = threading.Thread(target=send_in_thread, daemon=True)
+        thread.start()
+
+    def get_summary(self, data: str = "") -> Optional[str]:
+        """
+        Lấy tóm tắt của một dữ liệu tài chính
+
+        Args:
+            data: Dữ liệu cần tóm tắt
+
+        Returns:
+            Tóm tắt từ Gemini
+        """
+        if not self.is_ready():
+            return None
+
+        prompt = f"Hãy tóm tắt ngắn gọn dữ liệu kế toán sau:\n\n{data}"
+        return self.send_message(prompt)
+
+    def analyze_data(self, data: str = "") -> Optional[str]:
+        """
+        Phân tích dữ liệu tài chính
+
+        Args:
+            data: Dữ liệu cần phân tích
+
+        Returns:
+            Phân tích từ Gemini
+        """
+        if not self.is_ready():
+            return None
+
+        prompt = f"Vui lòng phân tích dữ liệu kế toán sau và đưa ra nhận xét:\n\n{data}"
+        return self.send_message(prompt)
+
+    def get_advice(self, question: str) -> Optional[str]:
+        """
+        Lấy tư vấn về kế toán
+
+        Args:
+            question: Câu hỏi về kế toán
+
+        Returns:
+            Tư vấn từ Gemini
+        """
+        return self.send_message(question)
+
+    def export_history(self, filepath: str) -> bool:
+        """
+        Xuất lịch sử chat ra file JSON
+
+        Args:
+            filepath: Đường dẫn file
+
+        Returns:
+            True nếu thành công, False nếu thất bại
+        """
+        try:
+            history_data = {
+                'timestamp': datetime.now().isoformat(),
+                'messages': self.get_history()
+            }
+
+            with open(filepath, 'w', encoding='utf-8') as f:
+                json.dump(history_data, f, ensure_ascii=False, indent=2)
+
+            return True
+        except Exception as e:
+            self.last_error = f"Lỗi xuất lịch sử: {str(e)}"
+            return False
+
+
+# Instance toàn cục
+_ai_service: Optional[GeminiAIService] = None
+
+
+def get_ai_service() -> GeminiAIService:
+    """Lấy instance toàn cục của GeminiAIService"""
+    global _ai_service
+
+    if _ai_service is None:
+        _ai_service = GeminiAIService()
+
+    return _ai_service
+
+
+def initialize_ai_service(api_key: Optional[str] = None) -> bool:
+    """
+    Khởi tạo dịch vụ AI toàn cục
+
+    Args:
+        api_key: Google API key (tùy chọn)
+
+    Returns:
+        True nếu thành công, False nếu thất bại
+    """
+    service = get_ai_service()
+
+    if api_key:
+        return service.set_api_key(api_key)
+
+    return service.is_ready()

@@ -1,0 +1,283 @@
+﻿"""Design system for FasTrack ERP."""
+
+import tkinter as tk
+from tkinter import ttk
+from pathlib import Path
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+ASSETS_DIR = BASE_DIR / "assets"
+
+# Sidebar
+SIDEBAR_BG = "#0F2544"
+SIDEBAR_SECTION = "#4A6880"
+SIDEBAR_ITEM = "#8BAEC8"
+SIDEBAR_ACTIVE = "#3B82F6"
+SIDEBAR_ACTIVE_BG = "#1E3A5F"
+SIDEBAR_HOVER_BG = "#162D47"
+SIDEBAR_BORDER = "#1A3558"
+
+# Page and panels
+PAGE_BG = "#F0F4FA"
+PANEL_BG = "#FFFFFF"
+PANEL_BORDER = "#DCE3EC"
+
+# Text
+TEXT_PRIMARY = "#1A2D4A"
+TEXT_SECONDARY = "#5A7A99"
+TEXT_MUTED = "#8A9BB0"
+
+# Accents
+ACCENT_BLUE = "#1D72C8"
+ACCENT_GREEN = "#0D9455"
+ACCENT_AMBER = "#C27A10"
+ACCENT_RED = "#E53935"
+
+# Topbar
+TOPBAR_BG = "#FFFFFF"
+TOPBAR_BORDER = "#DCE3EC"
+TOPBAR_HEIGHT = 52
+
+# Pills
+PILL_PENDING_BG = "#FEF3C7"
+PILL_PENDING_FG = "#92400E"
+PILL_DONE_BG = "#D1FAE5"
+PILL_DONE_FG = "#065F46"
+PILL_PROC_BG = "#DBEAFE"
+PILL_PROC_FG = "#1E40AF"
+
+# Fonts
+FONT_TITLE = ("Segoe UI", 13, "bold")
+FONT_HEADING = ("Segoe UI", 11, "bold")
+FONT_BODY = ("Segoe UI", 10)
+FONT_SMALL = ("Segoe UI", 9)
+FONT_NAV = ("Segoe UI", 10)
+FONT_SECTION = ("Segoe UI", 8, "bold")
+FONT_KPI = ("Segoe UI", 20, "bold")
+
+THEME = {
+    # New design system names
+    "SIDEBAR_BG": SIDEBAR_BG,
+    "SIDEBAR_SECTION": SIDEBAR_SECTION,
+    "SIDEBAR_ITEM": SIDEBAR_ITEM,
+    "SIDEBAR_ACTIVE": SIDEBAR_ACTIVE,
+    "SIDEBAR_ACTIVE_BG": SIDEBAR_ACTIVE_BG,
+    "SIDEBAR_HOVER_BG": SIDEBAR_HOVER_BG,
+    "SIDEBAR_BORDER": SIDEBAR_BORDER,
+    "PAGE_BG": PAGE_BG,
+    "PANEL_BG": PANEL_BG,
+    "PANEL_BORDER": PANEL_BORDER,
+    "TEXT_PRIMARY": TEXT_PRIMARY,
+    "TEXT_SECONDARY": TEXT_SECONDARY,
+    "TEXT_MUTED": TEXT_MUTED,
+    "ACCENT_BLUE": ACCENT_BLUE,
+    "ACCENT_GREEN": ACCENT_GREEN,
+    "ACCENT_AMBER": ACCENT_AMBER,
+    "ACCENT_RED": ACCENT_RED,
+    "TOPBAR_BG": TOPBAR_BG,
+    "TOPBAR_BORDER": TOPBAR_BORDER,
+    "TOPBAR_HEIGHT": TOPBAR_HEIGHT,
+
+    # Backward-compatible keys used by existing screens
+    "primary": ACCENT_BLUE,
+    "primary_light": "#2EA3E6",
+    "primary_dark": TEXT_PRIMARY,
+    "accent": ACCENT_BLUE,
+    "accent_soft": "#EBF3FF",
+    "success": ACCENT_GREEN,
+    "success_soft": PILL_DONE_BG,
+    "danger": ACCENT_RED,
+    "danger_soft": "#FEE2E2",
+    "warning": "#FFC107",
+    "info": ACCENT_BLUE,
+    "bg": PAGE_BG,
+    "panel": PANEL_BG,
+    "sidebar": SIDEBAR_BG,
+    "sidebar_hover": SIDEBAR_HOVER_BG,
+    "sidebar_active": SIDEBAR_ACTIVE_BG,
+    "sidebar_text": SIDEBAR_ITEM,
+    "sidebar_muted": SIDEBAR_SECTION,
+    "line": PANEL_BORDER,
+    "text": TEXT_PRIMARY,
+    "muted": TEXT_SECONDARY,
+    "header_bg": TOPBAR_BG,
+    "header_border": TOPBAR_BORDER,
+    "row_hover": "#F8FAFC",
+    "row_alt": "#F8FAFC",
+    "row_selected": "#EBF3FF",
+    "link": ACCENT_BLUE,
+    "link_hover": "#155EA8",
+    "radius": 8,
+    "space_1": 4,
+    "space_2": 8,
+    "space_3": 12,
+    "space_4": 16,
+    "space_5": 24,
+    "font_family": "Segoe UI",
+    "font_size_sm": 9,
+    "font_size": 10,
+    "font_size_lg": 11,
+    "font_size_xl": 13,
+}
+
+STATUS_LABELS = {
+    "pending": "Chờ duyệt",
+    "approved": "Đã duyệt",
+    "paid": "Đã thanh toán",
+    "posted": "Đã ghi sổ",
+    "rejected": "Từ chối",
+    "draft": "Nháp",
+    "submitted": "Đã nộp",
+    "processing": "Đang xử lý",
+    "done": "Hoàn tất",
+    "active": "Đang hoạt động",
+}
+
+STATUS_COLORS = {
+    "pending": (PILL_PENDING_BG, PILL_PENDING_FG),
+    "draft": ("#F1F5F9", TEXT_SECONDARY),
+    "submitted": (PILL_PROC_BG, PILL_PROC_FG),
+    "processing": (PILL_PROC_BG, PILL_PROC_FG),
+    "approved": (PILL_DONE_BG, PILL_DONE_FG),
+    "paid": (PILL_DONE_BG, PILL_DONE_FG),
+    "posted": (PILL_DONE_BG, PILL_DONE_FG),
+    "done": (PILL_DONE_BG, PILL_DONE_FG),
+    "active": (PILL_DONE_BG, PILL_DONE_FG),
+    "rejected": ("#FEE2E2", "#991B1B"),
+}
+
+
+def apply_ttk_styles(root):
+    style = ttk.Style(root)
+    try:
+        style.theme_use("clam")
+    except tk.TclError:
+        pass
+
+    style.configure(".", background=PAGE_BG, foreground=TEXT_PRIMARY, font=FONT_BODY)
+    style.configure("TFrame", background=PAGE_BG)
+    style.configure("TLabel", background=PAGE_BG, foreground=TEXT_PRIMARY, font=FONT_BODY)
+    style.configure("TNotebook", background=PAGE_BG, borderwidth=0)
+    style.configure(
+        "TNotebook.Tab",
+        padding=(14, 8),
+        font=FONT_SMALL,
+        background=PANEL_BORDER,
+        foreground=TEXT_SECONDARY,
+    )
+    style.map(
+        "TNotebook.Tab",
+        background=[("selected", PANEL_BG), ("active", "#EBF3FF")],
+        foreground=[("selected", ACCENT_BLUE), ("active", ACCENT_BLUE)],
+    )
+
+    for name in ("Treeview", "Custom.Treeview"):
+        style.configure(
+            name,
+            background=PANEL_BG,
+            fieldbackground=PANEL_BG,
+            foreground=TEXT_SECONDARY,
+            rowheight=28,
+            font=FONT_BODY,
+            bordercolor=PANEL_BORDER,
+            lightcolor=PANEL_BORDER,
+            darkcolor=PANEL_BORDER,
+        )
+        style.map(
+            name,
+            background=[("selected", "#EBF3FF")],
+            foreground=[("selected", ACCENT_BLUE)],
+        )
+
+    for name in ("Treeview.Heading", "Custom.Treeview.Heading"):
+        style.configure(
+            name,
+            background=PAGE_BG,
+            foreground=TEXT_MUTED,
+            font=FONT_SMALL,
+            relief="flat",
+            padding=(8, 7),
+        )
+
+    style.configure("Vertical.TScrollbar", troughcolor=PAGE_BG, background=PANEL_BORDER)
+    style.configure("Horizontal.TScrollbar", troughcolor=PAGE_BG, background=PANEL_BORDER)
+
+
+def create_panel(parent, **kwargs):
+    return tk.Frame(
+        parent,
+        bg=PANEL_BG,
+        bd=0,
+        relief="flat",
+        highlightbackground=PANEL_BORDER,
+        highlightthickness=1,
+        **kwargs,
+    )
+
+
+def create_pill(parent, text, status="pending", **kwargs):
+    bg, fg = STATUS_COLORS.get(status, (PILL_PROC_BG, PILL_PROC_FG))
+    return tk.Label(parent, text=text, bg=bg, fg=fg, font=FONT_SMALL,
+                    padx=8, pady=2, bd=0, **kwargs)
+
+
+def create_modern_button(parent, text, command, variant="primary", **kwargs):
+    colors = {
+        "primary": (ACCENT_BLUE, "white", "#155EA8"),
+        "success": (ACCENT_GREEN, "white", "#087A46"),
+        "danger": (ACCENT_RED, "white", "#C62828"),
+        "warning": ("#FFC107", TEXT_PRIMARY, "#E0A800"),
+        "info": (ACCENT_BLUE, "white", "#155EA8"),
+        "accent": (ACCENT_BLUE, "white", "#155EA8"),
+        "muted": ("#6C757D", "white", "#5A6268"),
+        "secondary": (PANEL_BG, TEXT_SECONDARY, "#F8FAFC"),
+        "ghost": (PANEL_BG, TEXT_SECONDARY, "#F8FAFC"),
+        "outline": (PANEL_BG, TEXT_SECONDARY, "#F8FAFC"),
+    }
+    bg, fg, active = colors.get(variant, colors["primary"])
+    font = kwargs.pop("font", ("Segoe UI", 9, "bold"))
+    padx = kwargs.pop("padx", 14)
+    pady = kwargs.pop("pady", 6)
+    btn = tk.Button(
+        parent,
+        text=text,
+        command=command,
+        bg=bg,
+        fg=fg,
+        activebackground=active,
+        activeforeground=fg if variant in {"secondary", "ghost", "outline"} else "white",
+        font=font,
+        padx=padx,
+        pady=pady,
+        bd=0,
+        cursor="hand2",
+        relief="flat",
+        highlightthickness=0,
+        **kwargs,
+    )
+    if variant in {"secondary", "ghost", "outline"}:
+        btn.configure(highlightthickness=1, highlightbackground=PANEL_BORDER)
+    return btn
+
+
+def create_link_button(parent, text, command, **kwargs):
+    btn = tk.Label(
+        parent,
+        text=text,
+        fg=ACCENT_BLUE,
+        bg=kwargs.pop("bg", PANEL_BG),
+        font=kwargs.pop("font", ("Segoe UI", 9, "underline")),
+        cursor="hand2",
+    )
+    btn.bind("<Button-1>", lambda _e: command())
+    btn.bind("<Enter>", lambda _e: btn.configure(fg="#155EA8"))
+    btn.bind("<Leave>", lambda _e: btn.configure(fg=ACCENT_BLUE))
+    return btn
+
+
+def format_status(status):
+    return STATUS_LABELS.get(status, status or "")
+
+
+def draw_header_accent(canvas, width, height):
+    canvas.create_rectangle(0, 0, width, height, fill=TOPBAR_BG, outline="")
+    canvas.create_rectangle(0, height - 1, width, height, fill=TOPBAR_BORDER, outline="")

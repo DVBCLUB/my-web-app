@@ -1,0 +1,7 @@
+﻿pandas>=1.3.0
+openpyxl>=3.6.0
+python-docx>=0.8.11
+docxtpl>=0.15.0
+matplotlib>=3.4.0
+pillow>=8.3.0
+reportlab>=3.6.0

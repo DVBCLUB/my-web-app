@@ -1,0 +1,115 @@
+"""
+════════════════════════════════════════════════════════════════════════════════
+				  ✅ PHẦN MỀM ERP HOÀN THÀNH THÀNH CÔNG ✅
+════════════════════════════════════════════════════════════════════════════════
+
+🎉 PHẦN MỀM QUẢN LÝ KẾ TOÁN - CÔNG TY TRUNG HẢI
+   Phiên bản: 1.0.0
+   Ngày phát hành: 2024
+
+════════════════════════════════════════════════════════════════════════════════
+
+📊 CÁC CHỨC NĂNG CHÍNH:
+
+✅ Hạch toán & quản lý chi phí
+✅ Quản lý hóa đơn / chứng từ
+✅ Liên kết file chứng từ
+✅ Quản lý vật tư / kho
+✅ Báo cáo & biểu đồ thống kê
+✅ Sao lưu & phục hồi dữ liệu
+✅ Quản lý người dùng & quyền hạn
+
+════════════════════════════════════════════════════════════════════════════════
+
+📁 CÁC TỆP QUAN TRỌNG:
+
+1. main.py
+   → Chạy lệnh: python main.py
+
+2. setup_checker.py
+   → Kiểm tra setup: python setup_checker.py
+
+3. requirements.txt
+   → Cài thư viện: pip install -r requirements.txt
+
+4. README.md
+   → Hướng dẫn chi tiết
+
+5. QUICKSTART.py
+   → Hướng dẫn nhanh
+
+6. TROUBLESHOOTING.md
+   → Khắc phục sự cố
+
+════════════════════════════════════════════════════════════════════════════════
+
+🚀 BƯỚC 1: CÀI ĐẶT THƯ VIỆN
+
+	pip install -r requirements.txt
+
+════════════════════════════════════════════════════════════════════════════════
+
+🚀 BƯỚC 2: CHẠY ỨNG DỤNG
+
+	python main.py
+
+════════════════════════════════════════════════════════════════════════════════
+
+🚀 BƯỚC 3: KIỂM TRA SETUP
+
+	python setup_checker.py
+
+════════════════════════════════════════════════════════════════════════════════
+
+📚 CÁC TỆPDHƯỚNG DẪN:
+
+START_HERE.py           → Đọc này trước
+README.md              → Hướng dẫn chi tiết
+QUICKSTART.py          → Hướng dẫn nhanh
+TROUBLESHOOTING.md     → Giải quyết vấn đề
+PROJECT_SUMMARY.py     → Tóm tắt dự án
+CHANGELOG.md           → Lịch sử cập nhật
+
+════════════════════════════════════════════════════════════════════════════════
+
+💡 QUICK TIPS:
+
+1. Thêm chi phí mới:
+   Dashboard → 💰 Chi phí → ➕ Thêm chi phí
+
+2. Nhập dữ liệu Excel:
+   Dashboard → 💰 Chi phí → 📥 Nhập từ Excel
+
+3. Xuất báo cáo:
+   Dashboard → 📈 Báng Cáo → 💾 Xuất PDF/Excel
+
+4. Sao lưu dữ liệu:
+   Dashboard → ⚙️ Cài đặt → 🔄 Sao lưu ngay
+
+════════════════════════════════════════════════════════════════════════════════
+
+✨ CÔNG NGHỆ:
+
+Backend:    Python 3.8+, SQLite3
+GUI:        Tkinter
+Data:       Pandas, Openpyxl
+Reports:    ReportLab, Matplotlib
+
+════════════════════════════════════════════════════════════════════════════════
+
+📞 HỖ TRỢ:
+
+Email:   support@trunghai.vn
+Hotline: 0XXX-XXX-XXX
+Website: www.trunghai.vn
+
+════════════════════════════════════════════════════════════════════════════════
+
+✅ SẴN SÀNG SỬ DỤNG - CHẠY NGAY BẰNG LỆNH:
+
+	python main.py
+
+════════════════════════════════════════════════════════════════════════════════
+"""
+
+print(__doc__)

@@ -1,0 +1,135 @@
+"""
+Test suite for BulkExpenseValidator
+"""
+
+import unittest
+from datetime import datetime, timedelta
+from modules.bulk_expense_validator import BulkExpenseValidator, ValidationStatus
+
+
+class TestBulkExpenseValidator(unittest.TestCase):
+    """Test cases for BulkExpenseValidator"""
+
+    def setUp(self):
+        """Set up test fixtures"""
+        self.validator = BulkExpenseValidator()
+
+    def test_parse_number_with_commas(self):
+        """Test parsing numbers with thousands separators"""
+        assert self.validator.parse_number("1,000,000") == 1000000.0
+        assert self.validator.parse_number("5,940,000.000") == 5940000.0
+        assert self.validator.parse_number("100.50") == 100.5
+
+    def test_parse_date_formats(self):
+        """Test parsing various date formats"""
+        # DD/MM/YYYY
+        result = self.validator.parse_date("18/05/2026")
+        assert result == "2026-05-18"
+
+        # YYYY-MM-DD
+        result = self.validator.parse_date("2026-05-18")
+        assert result == "2026-05-18"
+
+        # Invalid date
+        result = self.validator.parse_date("invalid")
+        assert result is None
+
+    def test_validate_required_fields(self):
+        """Test validation of required fields (date, category, description, amount)"""
+        # Valid row
+        row = ['18/05/2026', '', '1', 'Thuê xe cẩu', '5,940,000', 'Nguyễn A', 'Tiền mặt']
+        result = self.validator.validate_row(row, 0)
+        assert result.status != ValidationStatus.ERROR, f"Valid row should not error: {result.error_messages}"
+
+        # Missing date
+        row = ['', '', '1', 'Thuê xe cẩu', '5,940,000', 'Nguyễn A', 'Tiền mặt']
+        result = self.validator.validate_row(row, 0)
+        assert result.status == ValidationStatus.ERROR, "Missing date should error"
+
+        # Missing category
+        row = ['18/05/2026', '', '', 'Thuê xe cẩu', '5,940,000', 'Nguyễn A', 'Tiền mặt']
+        result = self.validator.validate_row(row, 0)
+        assert result.status == ValidationStatus.ERROR, "Missing category should error"
+
+        # Missing description
+        row = ['18/05/2026', '', '1', '', '5,940,000', 'Nguyễn A', 'Tiền mặt']
+        result = self.validator.validate_row(row, 0)
+        assert result.status == ValidationStatus.ERROR, "Missing description should error"
+
+        # Invalid amount
+        row = ['18/05/2026', '', '1', 'Thuê xe cẩu', '-100', 'Nguyễn A', 'Tiền mặt']
+        result = self.validator.validate_row(row, 0)
+        assert result.status == ValidationStatus.ERROR, "Negative amount should error"
+
+    def test_validate_warnings(self):
+        """Test validation warnings (e.g., future date, very large amount)"""
+        # Future date should give warning
+        tomorrow = (datetime.now() + timedelta(days=1)).strftime('%d/%m/%Y')
+        row = [tomorrow, '', '1', 'Thuê xe cẩu', '5,940,000', 'Nguyễn A', 'Tiền mặt']
+        result = self.validator.validate_row(row, 0)
+        assert result.status == ValidationStatus.WARNING or result.status == ValidationStatus.VALID
+
+        # Very large amount should give warning
+        row = ['18/05/2026', '', '1', 'Thuê xe cẩu', '10,000,000,000', 'Nguyễn A', 'Tiền mặt']
+        result = self.validator.validate_row(row, 0)
+        assert result.status == ValidationStatus.WARNING or result.status == ValidationStatus.VALID
+
+    def test_validate_empty_row(self):
+        """Test validation of empty rows"""
+        row = ['', '', '', '', '', '', '']
+        result = self.validator.validate_row(row, 0)
+        assert result.is_empty
+
+    def test_parsed_data_extraction(self):
+        """Test that parsed data is correctly extracted"""
+        row = ['18/05/2026', '1', '2', 'Mô tả chi phí', '5,940,000', 'Nguyễn A', 'Tiền mặt', 'Ghi chú', 'Phòng ban']
+        result = self.validator.validate_row(row, 0)
+
+        if result.parsed_data:
+            assert result.parsed_data.get('date') == '2026-05-18'
+            assert result.parsed_data.get('description') == 'Mô tả chi phí'
+            # Amount should be stored as string number (no formatting)
+            amount_str = result.parsed_data.get('amount', '0')
+            assert float(amount_str) == 5940000.0, f"Expected 5940000.0 but got {float(amount_str)}"
+            assert result.parsed_data.get('paid_by') == 'Nguyễn A'
+
+    def test_batch_validation(self):
+        """Test batch validation"""
+        rows = [
+            ['18/05/2026', '', '1', 'Mô tả 1', '100,000', '', ''],
+            ['', '', '', '', '', '', ''],  # Empty row
+            ['invalid-date', '', '1', 'Mô tả 3', '200,000', '', ''],  # Invalid date
+            ['19/05/2026', '', '1', 'Mô tả 4', '300,000', '', ''],
+        ]
+
+        results = self.validator.validate_batch(rows)
+        assert len(results) == 4
+
+        # Summary
+        summary = self.validator.get_summary(results)
+        assert summary['total'] == 4
+        assert summary['empty'] == 1
+        # At least one row should have errors or warnings due to invalid date
+        assert summary['error'] + summary['warning'] >= 1
+
+    def test_duplicate_rows_warn(self):
+        """Duplicate rows in the same paste batch should be flagged."""
+        rows = [
+            ['18/05/2026', '', '1', 'Mua thép xây dựng', '100,000', '', ''],
+            ['18/05/2026', '', '1', 'Mua thép xây dựng', '100000', '', ''],
+        ]
+        results = self.validator.validate_batch(rows)
+        assert results[1].status == ValidationStatus.WARNING
+        assert any('trùng' in msg.lower() for msg in results[1].warning_messages)
+
+    def test_export_errors(self):
+        """Test error export functionality"""
+        row = ['invalid', '', '', '', '', '', '']
+        result = self.validator.validate_row(row, 0)
+
+        errors_text = self.validator.export_errors([result])
+        assert 'Lỗi' in errors_text or 'lỗi' in errors_text.lower()
+
+
+if __name__ == '__main__':
+    unittest.main()

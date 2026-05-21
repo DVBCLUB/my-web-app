@@ -1,0 +1,12 @@
+﻿HUONG DAN MO BAN APP DA SUA V2
+
+1. Mo file PythonApplication1.slnx neu dung Visual Studio.
+2. Hoac bam dup CHAY_APP.bat de chay truc tiep bang Python.
+3. Ma code nam trong thu muc PythonApplication1\.
+4. Cac file Excel mau nam trong PythonApplication1\templates\.
+5. Neu muon tuy chinh bieu mau/quy trinh/quy dinh: sua cac file Excel trong templates, mo app, vao menu Bieu mau, bam Cap nhat tu Excel mau.
+
+Dau hieu dung ban moi:
+- Menu co: Quy dinh, Bieu mau, Tai khoan.
+- Menu Bieu mau co cac tab: Bieu mau, Ho so/chung tu, Quy trinh, Dinh muc, Nhac viec.
+- Man hinh Chi phi co them: Them chung tu cho chi phi, Gan file theo chi phi, Ho so can co.

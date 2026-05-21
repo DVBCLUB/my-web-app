@@ -1,0 +1,3 @@
+﻿project_code,project_name,contract_no,partner,type,contract_value,billed,remaining
+CT001,Công trình mẫu 01,HD-TC-CT001,Chủ đầu tư mẫu,customer,2000000000.0,420000000.0,1580000000.0
+CT001,Công trình mẫu 01,HD-TP-CT001,Nhà thầu phụ mẫu,subcontract,500000000.0,0,500000000.0

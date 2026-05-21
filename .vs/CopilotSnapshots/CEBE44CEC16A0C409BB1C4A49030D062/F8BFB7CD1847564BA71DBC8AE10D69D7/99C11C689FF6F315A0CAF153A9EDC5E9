@@ -1,0 +1,272 @@
+﻿"""Intelligent document intake for invoices and expense documents."""
+
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta
+from pathlib import Path
+import re
+import logging
+
+from database import get_connection
+from modules.invoices import DocumentManager
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class InvoiceExtractionResult:
+    source_file: str
+    raw_text: str
+    tax_code: str = ''
+    invoice_number: str = ''
+    invoice_date: str = ''
+    received_date: str = ''
+    total_amount: float = 0.0
+    deadline: str = ''
+
+
+class InvoiceTextExtractor:
+    """Read text from PDF first with pdfplumber, then OCR fallback."""
+
+    def extract_text(self, file_path):
+        """Synchronous text extraction (legacy)."""
+        path = Path(file_path)
+        if not path.exists():
+            raise FileNotFoundError(str(path))
+
+        # Try standard PDF extraction first
+        if path.suffix.lower() == '.pdf':
+            text = self._extract_pdf_text(path)
+            if text.strip():
+                return text
+
+        # Fallback to OCR
+        try:
+            from modules.ocr_tools import OCRTool
+            return OCRTool.extract_text(path)
+        except Exception as e:
+            logger.error(f"Synchronous OCR failed: {e}")
+            raise
+
+    def extract_text_async(self, file_path, callback):
+        """
+        Asynchronous text extraction (non-blocking).
+
+        Args:
+            file_path: Path to PDF or image
+            callback: Function(OCRResult) called when done
+        """
+        path = Path(file_path)
+        if not path.exists():
+            from modules.ocr_enhanced import OCRResult, OCRStatus
+            callback(OCRResult(
+                text="",
+                status=OCRStatus.FAILED,
+                confidence=0.0,
+                error=f"File không tồn tại: {file_path}"
+            ))
+            return
+
+        # Try standard PDF extraction first
+        if path.suffix.lower() == '.pdf':
+            text = self._extract_pdf_text_safe(path)
+            if text.strip():
+                from modules.ocr_enhanced import OCRResult, OCRStatus
+                callback(OCRResult(
+                    text=text,
+                    status=OCRStatus.SUCCESS,
+                    confidence=0.8,
+                    pages=text.count("--- Trang")
+                ))
+                return
+
+        # Fallback to async OCR
+        try:
+            from modules.ocr_enhanced import OCRToolEnhanced
+            ocr = OCRToolEnhanced()
+            ocr.extract_text_async(str(path), callback)
+        except Exception as e:
+            logger.error(f"Async OCR extraction failed: {e}")
+            from modules.ocr_enhanced import OCRResult, OCRStatus
+            callback(OCRResult(
+                text="",
+                status=OCRStatus.FAILED,
+                confidence=0.0,
+                error=str(e)
+            ))
+
+    def _extract_pdf_text(self, path):
+        """Synchronous PDF text extraction."""
+        try:
+            import pdfplumber
+        except Exception as exc:
+            raise RuntimeError("Chưa cài pdfplumber để đọc PDF.") from exc
+        pages = []
+        with pdfplumber.open(str(path)) as pdf:
+            for index, page in enumerate(pdf.pages, 1):
+                text = page.extract_text(x_tolerance=1, y_tolerance=3) or ''
+                if text.strip():
+                    pages.append(f"--- Trang {index} ---\n{text.strip()}")
+        return "\n\n".join(pages)
+
+    def _extract_pdf_text_safe(self, path):
+        """Safe synchronous PDF text extraction (no exception raising)."""
+        try:
+            return self._extract_pdf_text(path)
+        except Exception as e:
+            logger.warning(f"PDF text extraction failed: {e}")
+            return ""
+
+
+class InvoiceFieldParser:
+    """Extract common Vietnamese invoice fields from raw text."""
+
+    TAX_CODE_PATTERNS = [
+        r'(?:mã\s*số\s*thuế|mst|tax\s*code)\s*[:：]?\s*([0-9]{10}(?:[-\s]?[0-9]{3})?)',
+        r'\b([0-9]{10}[-\s]?[0-9]{3})\b',
+        r'\b([0-9]{10})\b',
+    ]
+    INVOICE_NUMBER_PATTERNS = [
+        r'(?:số\s*hóa\s*đơn|số\s*hoá\s*đơn|invoice\s*no\.?)\s*[:：]?\s*([A-Z0-9\-./]{3,})',
+        r'(?:số\s*hd|số\s*hđ)\s*[:：]?\s*([A-Z0-9\-./]{3,})',
+        r'(?:no\.|number)\s*[:：]?\s*([A-Z0-9\-./]{3,})',
+    ]
+    DATE_PATTERNS = [
+        r'(?:ngày\s*hóa\s*đơn|ngày\s*hoá\s*đơn|ngày|date)\s*[:：]?\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})',
+        r'ngày\s*(\d{1,2})\s*tháng\s*(\d{1,2})\s*năm\s*(\d{4})',
+    ]
+    AMOUNT_PATTERNS = [
+        r'(?:tổng\s*cộng\s*tiền\s*thanh\s*toán|tổng\s*tiền\s*thanh\s*toán|tổng\s*cộng|thành\s*tiền|total\s*amount)\s*[:：]?\s*([0-9.,]+)',
+        r'(?:số\s*tiền\s*thanh\s*toán)\s*[:：]?\s*([0-9.,]+)',
+    ]
+
+    def parse(self, source_file, raw_text, received_date=None):
+        normalized = self._normalize(raw_text)
+        received = self._parse_date(received_date) or date.today()
+        invoice_date = self._extract_invoice_date(normalized)
+        result = InvoiceExtractionResult(
+            source_file=str(source_file),
+            raw_text=raw_text,
+            tax_code=self._first_match(normalized, self.TAX_CODE_PATTERNS),
+            invoice_number=self._first_match(normalized, self.INVOICE_NUMBER_PATTERNS),
+            invoice_date=invoice_date.isoformat() if invoice_date else '',
+            received_date=received.isoformat(),
+            total_amount=self._extract_amount(normalized),
+            deadline=(received + timedelta(days=15)).isoformat(),
+        )
+        return result
+
+    def _normalize(self, text):
+        return re.sub(r'\s+', ' ', text or '').strip()
+
+    def _first_match(self, text, patterns):
+        for pattern in patterns:
+            match = re.search(pattern, text, flags=re.IGNORECASE)
+            if match:
+                return match.group(1).strip().replace(' ', '')
+        return ''
+
+    def _extract_invoice_date(self, text):
+        for pattern in self.DATE_PATTERNS:
+            match = re.search(pattern, text, flags=re.IGNORECASE)
+            if not match:
+                continue
+            if len(match.groups()) == 3:
+                return self._parse_date('/'.join(match.groups()))
+            return self._parse_date(match.group(1))
+        return None
+
+    def _parse_date(self, value):
+        if isinstance(value, date):
+            return value
+        if not value:
+            return None
+        for fmt in ('%d/%m/%Y', '%d-%m-%Y', '%Y-%m-%d', '%d/%m/%y'):
+            try:
+                return datetime.strptime(str(value).strip(), fmt).date()
+            except ValueError:
+                continue
+        return None
+
+    def _extract_amount(self, text):
+        raw = self._first_match(text, self.AMOUNT_PATTERNS)
+        if not raw:
+            return 0.0
+        return self._parse_number(raw)
+
+    def _parse_number(self, value):
+        text = str(value).replace(' ', '')
+        comma = text.rfind(',')
+        dot = text.rfind('.')
+        if comma > -1 and dot > -1:
+            decimal_sep = ',' if comma > dot else '.'
+            thousand_sep = '.' if decimal_sep == ',' else ','
+            text = text.replace(thousand_sep, '').replace(decimal_sep, '.')
+        elif comma > -1:
+            parts = text.split(',')
+            text = ''.join(parts) if len(parts[-1]) == 3 and len(parts) > 1 else text.replace(',', '.')
+        elif dot > -1:
+            parts = text.split('.')
+            text = ''.join(parts) if len(parts[-1]) == 3 and len(parts) > 1 else text
+        try:
+            return float(text)
+        except ValueError:
+            return 0.0
+
+
+class InvoiceIntakeService:
+    """Coordinate extraction and persistence for invoices."""
+
+    def __init__(self):
+        self.text_extractor = InvoiceTextExtractor()
+        self.field_parser = InvoiceFieldParser()
+        self.document_manager = DocumentManager()
+
+    def extract(self, file_path, received_date=None):
+        raw_text = self.text_extractor.extract_text(file_path)
+        return self.field_parser.parse(file_path, raw_text, received_date)
+
+    def save_to_database(self, extraction, supplier_name='', description='Tự động nhập từ PDF/OCR'):
+        invoice_date = extraction.invoice_date or extraction.received_date
+        document_id = self.document_manager.add_document(
+            'Hóa đơn',
+            extraction.invoice_number or '',
+            invoice_date,
+            supplier_name or extraction.tax_code,
+            description,
+            extraction.total_amount,
+            None,
+            None,
+            extraction.source_file,
+            1,
+            None,
+            'draft',
+        )
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO imported_invoice_records
+            (document_id, source_file, tax_code, invoice_number, invoice_date,
+             received_date, total_amount, deadline, raw_text, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft')
+            ON CONFLICT(source_file, invoice_number) DO UPDATE SET
+                document_id = excluded.document_id,
+                tax_code = excluded.tax_code,
+                invoice_date = excluded.invoice_date,
+                received_date = excluded.received_date,
+                total_amount = excluded.total_amount,
+                deadline = excluded.deadline,
+                raw_text = excluded.raw_text
+        ''', (
+            document_id,
+            extraction.source_file,
+            extraction.tax_code,
+            extraction.invoice_number,
+            extraction.invoice_date,
+            extraction.received_date,
+            extraction.total_amount,
+            extraction.deadline,
+            extraction.raw_text,
+        ))
+        conn.commit()
+        conn.close()
+        return document_id
