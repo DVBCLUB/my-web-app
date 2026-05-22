@@ -8,10 +8,15 @@ Then open:
 
 from __future__ import annotations
 
+import csv
+import io
+import json
 import os
 from datetime import date, timedelta
 from functools import wraps
 from typing import Any
+from urllib.parse import quote
+from urllib import request as url_request
 
 try:
     from flask import Flask, Response, current_app, jsonify, request, session
@@ -594,6 +599,234 @@ class WebAccountingWorkspace:
         }
 
 
+class WebGoogleExportCenter:
+    """Monthly accounting export for CSV and Google Sheets."""
+
+    def __init__(self):
+        self.conn = get_connection()
+
+    def month_range(self, month: str | None):
+        month = (month or date.today().strftime("%Y-%m"))[:7]
+        year, month_no = [int(part) for part in month.split("-")]
+        start = date(year, month_no, 1)
+        if month_no == 12:
+            end = date(year + 1, 1, 1) - timedelta(days=1)
+        else:
+            end = date(year, month_no + 1, 1) - timedelta(days=1)
+        return month, start.isoformat(), end.isoformat()
+
+    def monthly_report(self, month: str | None = None):
+        month, start_date, end_date = self.month_range(month)
+        cursor = self.conn.cursor()
+        cursor.execute(
+            """
+            SELECT e.expense_date, COALESCE(p.code, '') AS project_code,
+                   COALESCE(p.name, '') AS project_name,
+                   COALESCE(ec.name, '') AS category_name,
+                   e.description, COALESCE(e.amount, 0) AS amount,
+                   e.paid_by, e.payment_method, e.status
+            FROM expenses e
+            LEFT JOIN projects p ON p.id = e.project_id
+            LEFT JOIN expense_categories ec ON ec.id = e.category_id
+            WHERE e.expense_date BETWEEN ? AND ?
+            ORDER BY e.expense_date, e.id
+            """,
+            (start_date, end_date),
+        )
+        expenses = [row_to_dict(row) for row in cursor.fetchall()]
+        cursor.execute(
+            """
+            SELECT COALESCE(ec.name, 'Khac') AS category_name,
+                   COUNT(e.id) AS line_count,
+                   COALESCE(SUM(e.amount), 0) AS amount
+            FROM expenses e
+            LEFT JOIN expense_categories ec ON ec.id = e.category_id
+            WHERE e.expense_date BETWEEN ? AND ?
+            GROUP BY e.category_id
+            ORDER BY amount DESC
+            """,
+            (start_date, end_date),
+        )
+        by_category = [row_to_dict(row) for row in cursor.fetchall()]
+        cursor.execute(
+            """
+            SELECT COALESCE(p.code, '') AS project_code,
+                   COALESCE(p.name, 'Khong gan du an') AS project_name,
+                   COUNT(e.id) AS line_count,
+                   COALESCE(SUM(e.amount), 0) AS amount
+            FROM expenses e
+            LEFT JOIN projects p ON p.id = e.project_id
+            WHERE e.expense_date BETWEEN ? AND ?
+            GROUP BY e.project_id
+            ORDER BY amount DESC
+            """,
+            (start_date, end_date),
+        )
+        by_project = [row_to_dict(row) for row in cursor.fetchall()]
+        cursor.execute(
+            """
+            SELECT COALESCE(supplier_name, 'Khac') AS supplier_name,
+                   COUNT(id) AS document_count,
+                   COALESCE(SUM(amount), 0) AS amount
+            FROM documents
+            WHERE doc_date BETWEEN ? AND ?
+            GROUP BY supplier_name
+            ORDER BY amount DESC
+            LIMIT 20
+            """,
+            (start_date, end_date),
+        )
+        suppliers = [row_to_dict(row) for row in cursor.fetchall()]
+        return {
+            "month": month,
+            "start_date": start_date,
+            "end_date": end_date,
+            "summary": {
+                "expense_count": len(expenses),
+                "expense_total": sum(float(row.get("amount") or 0) for row in expenses),
+                "category_count": len(by_category),
+                "project_count": len(by_project),
+            },
+            "expenses": expenses,
+            "by_category": by_category,
+            "by_project": by_project,
+            "top_suppliers": suppliers,
+        }
+
+    def report_to_csv(self, report: dict[str, Any]):
+        output = io.StringIO()
+        writer = csv.writer(output)
+        writer.writerow(["Bao cao thang", report["month"], report["start_date"], report["end_date"]])
+        writer.writerow([])
+        writer.writerow(["Tong chi phi", report["summary"]["expense_total"], "So dong", report["summary"]["expense_count"]])
+        writer.writerow([])
+        writer.writerow(["Chi tiet chi phi"])
+        writer.writerow(["Ngay", "Ma du an", "Du an", "Danh muc", "Dien giai", "So tien", "Nguoi chi", "Phuong thuc", "Trang thai"])
+        for row in report["expenses"]:
+            writer.writerow(
+                [
+                    row.get("expense_date"),
+                    row.get("project_code"),
+                    row.get("project_name"),
+                    row.get("category_name"),
+                    row.get("description"),
+                    row.get("amount"),
+                    row.get("paid_by"),
+                    row.get("payment_method"),
+                    row.get("status"),
+                ]
+            )
+        writer.writerow([])
+        writer.writerow(["Tong hop theo danh muc"])
+        writer.writerow(["Danh muc", "So dong", "So tien"])
+        for row in report["by_category"]:
+            writer.writerow([row.get("category_name"), row.get("line_count"), row.get("amount")])
+        writer.writerow([])
+        writer.writerow(["Tong hop theo du an"])
+        writer.writerow(["Ma du an", "Du an", "So dong", "So tien"])
+        for row in report["by_project"]:
+            writer.writerow([row.get("project_code"), row.get("project_name"), row.get("line_count"), row.get("amount")])
+        writer.writerow([])
+        writer.writerow(["Top nha cung cap/chung tu"])
+        writer.writerow(["Nha cung cap", "So chung tu", "So tien"])
+        for row in report["top_suppliers"]:
+            writer.writerow([row.get("supplier_name"), row.get("document_count"), row.get("amount")])
+        return output.getvalue()
+
+    def sheets_values(self, report: dict[str, Any]):
+        rows = [
+            ["Bao cao thang", report["month"], report["start_date"], report["end_date"]],
+            ["Tong chi phi", report["summary"]["expense_total"], "So dong", report["summary"]["expense_count"]],
+            [],
+            ["Chi tiet chi phi"],
+            ["Ngay", "Ma du an", "Du an", "Danh muc", "Dien giai", "So tien", "Nguoi chi", "Phuong thuc", "Trang thai"],
+        ]
+        rows.extend(
+            [
+                row.get("expense_date"),
+                row.get("project_code"),
+                row.get("project_name"),
+                row.get("category_name"),
+                row.get("description"),
+                row.get("amount"),
+                row.get("paid_by"),
+                row.get("payment_method"),
+                row.get("status"),
+            ]
+            for row in report["expenses"]
+        )
+        rows.extend([[], ["Tong hop theo danh muc"], ["Danh muc", "So dong", "So tien"]])
+        rows.extend([[row.get("category_name"), row.get("line_count"), row.get("amount")] for row in report["by_category"]])
+        rows.extend([[], ["Tong hop theo du an"], ["Ma du an", "Du an", "So dong", "So tien"]])
+        rows.extend([[row.get("project_code"), row.get("project_name"), row.get("line_count"), row.get("amount")] for row in report["by_project"]])
+        return rows
+
+    def export_to_sheets(self, report: dict[str, Any], spreadsheet_id: str | None = None, sheet_title: str | None = None):
+        spreadsheet_id = spreadsheet_id or os.environ.get("GOOGLE_SHEETS_SPREADSHEET_ID")
+        sheet_title = sheet_title or f"Bao cao {report['month']}"
+        if not spreadsheet_id:
+            return {
+                "ok": False,
+                "setup_needed": True,
+                "message": "Can spreadsheet_id hoac bien moi truong GOOGLE_SHEETS_SPREADSHEET_ID.",
+            }
+        try:
+            import google.auth
+            from google.auth.transport.requests import Request
+        except ImportError as exc:
+            return {"ok": False, "setup_needed": True, "message": f"Thieu google-auth: {exc}"}
+
+        credentials, _ = google.auth.default(scopes=["https://www.googleapis.com/auth/spreadsheets"])
+        credentials.refresh(Request())
+        token = credentials.token
+        base = f"https://sheets.googleapis.com/v4/spreadsheets/{spreadsheet_id}"
+        self._sheets_request(
+            f"{base}:batchUpdate",
+            token,
+            {
+                "requests": [
+                    {
+                        "addSheet": {
+                            "properties": {
+                                "title": sheet_title,
+                            }
+                        }
+                    }
+                ]
+            },
+            ignore_statuses={400},
+        )
+        values = {"range": f"'{sheet_title}'!A1", "majorDimension": "ROWS", "values": self.sheets_values(report)}
+        result = self._sheets_request(
+            f"{base}/values/{quote(sheet_title + '!A1', safe='!')}:update?valueInputOption=USER_ENTERED",
+            token,
+            values,
+        )
+        return {
+            "ok": True,
+            "spreadsheet_id": spreadsheet_id,
+            "sheet_title": sheet_title,
+            "updated_cells": result.get("updatedCells", 0),
+            "url": f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}/edit",
+        }
+
+    def _sheets_request(self, url: str, token: str, payload: dict[str, Any], ignore_statuses: set[int] | None = None):
+        body = json.dumps(payload).encode("utf-8")
+        req = url_request.Request(
+            url,
+            data=body,
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            method="POST" if ":batchUpdate" in url else "PUT",
+        )
+        try:
+            with url_request.urlopen(req, timeout=30) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except Exception as exc:
+            if ignore_statuses and getattr(getattr(exc, "fp", None), "status", None) in ignore_statuses:
+                return {}
+            raise
+
+
 def api_error(handler):
     @wraps(handler)
     def wrapper(*args, **kwargs):
@@ -1014,6 +1247,37 @@ def create_app():
                 ],
             }
         )
+
+    @app.get("/api/export/monthly-report")
+    @api_error
+    def monthly_report_export():
+        return jsonify(WebGoogleExportCenter().monthly_report(request.args.get("month")))
+
+    @app.get("/api/export/monthly-report.csv")
+    @api_error
+    def monthly_report_csv():
+        exporter = WebGoogleExportCenter()
+        report = exporter.monthly_report(request.args.get("month"))
+        csv_text = exporter.report_to_csv(report)
+        filename = f"fastrack-monthly-report-{report['month']}.csv"
+        return Response(
+            "\ufeff" + csv_text,
+            mimetype="text/csv; charset=utf-8",
+            headers={"Content-Disposition": f"attachment; filename={filename}"},
+        )
+
+    @app.post("/api/export/sheets")
+    @api_error
+    def monthly_report_sheets():
+        data = request.get_json(silent=True) or {}
+        exporter = WebGoogleExportCenter()
+        report = exporter.monthly_report(data.get("month") or request.args.get("month"))
+        result = exporter.export_to_sheets(
+            report,
+            data.get("spreadsheet_id") or request.args.get("spreadsheet_id"),
+            data.get("sheet_title") or request.args.get("sheet_title"),
+        )
+        return jsonify(result), 200 if result.get("ok") else 400
 
     @app.get("/api/accounting-workspace")
     @api_error
@@ -1571,6 +1835,10 @@ INDEX_HTML = r"""<!doctype html>
       </section>
 
       <section class="view" id="reports">
+        <div class="card">
+          <div class="toolbar"><h3>Xuất báo cáo tháng</h3><div class="actions"><input class="search" id="reportMonth" type="month"><button class="secondary" type="button" id="csvExportBtn">CSV</button><button class="primary" type="button" id="sheetsExportBtn">Google Sheets</button></div></div>
+          <div class="tablewrap"><table><thead><tr><th>Chỉ tiêu</th><th>Giá trị</th></tr></thead><tbody id="monthlyExportRows"></tbody></table></div>
+        </div>
         <div class="grid two">
           <div class="card"><h3>Chi phí theo tháng</h3><div class="bars" id="monthlyBars"></div></div>
           <div class="card"><h3>Chi phí theo dự án</h3><div class="bars" id="projectBars"></div></div>
@@ -1769,7 +2037,7 @@ INDEX_HTML = r"""<!doctype html>
     async function loadConstruction(){const [workItems,diaries]=await Promise.all([api('/api/construction/work-items'),api('/api/construction/diaries')]);state.workItems=workItems;state.diaries=diaries;renderConstruction()}
     async function loadDocuments(){state.documents=await api('/api/documents');renderDocuments()}
     async function loadForms(){state.forms=await api('/api/forms');renderForms()}
-    async function loadReports(){state.reports=await api('/api/reports/summary');renderReports()}
+    async function loadReports(){state.reports=await api('/api/reports/summary');state.monthlyExport=await api(`/api/export/monthly-report?month=${encodeURIComponent(reportMonth.value||new Date().toISOString().slice(0,7))}`);renderReports()}
     async function loadAccounting(){state.accounting=await api('/api/accounting-workspace');renderAccounting()}
     async function loadFinance(){state.finance=await api('/api/finance-center');renderFinance()}
     async function loadSettings(){state.settings=await api('/api/settings');renderSettings()}
@@ -1787,7 +2055,7 @@ INDEX_HTML = r"""<!doctype html>
     function renderDocuments(){const q=(documentSearch.value||'').toLowerCase();const rows=state.documents.filter(d=>JSON.stringify(d).toLowerCase().includes(q));documentRows.innerHTML=rows.map(d=>`<tr><td>${esc(d.doc_date)}</td><td>${esc(d.doc_type)}</td><td>${esc(d.doc_number)}</td><td>${esc(d.supplier_name)}</td><td class="num">${money(d.amount)}</td><td>${esc(d.project_name)}</td><td><span class="status">${esc(d.status)}</span></td></tr>`).join('')||'<tr><td colspan="7" class="empty">Chưa có chứng từ.</td></tr>'}
     function renderForms(){const q=(formSearch.value||'').toLowerCase();const rows=state.forms.filter(f=>JSON.stringify(f).toLowerCase().includes(q));formRows.innerHTML=rows.map(f=>`<tr><td>${esc(f.form_code)}</td><td>${esc(f.form_name)}</td><td>${esc(f.scope)}</td><td>${esc(f.file_path)}</td></tr>`).join('')||'<tr><td colspan="4" class="empty">Chưa có biểu mẫu.</td></tr>'}
     function drawBars(el,rows,labelKey,valueKey){const max=Math.max(1,...rows.map(r=>Number(r[valueKey]||0)));el.innerHTML=rows.map(r=>`<div class="barrow"><strong>${esc(r[labelKey])}</strong><div class="bar"><div class="fill" style="width:${Math.round(Number(r[valueKey]||0)/max*100)}%"></div></div><span class="num">${money(r[valueKey])}</span></div>`).join('')||'<div class="empty">Chưa có dữ liệu.</div>'}
-    function renderReports(){const r=state.reports||{};drawBars(monthlyBars,r.monthly_expenses||[],'month','total');drawBars(projectBars,r.project_expenses||[],'project','total');stockReportRows.innerHTML=(r.stock||[]).map(x=>`<tr><td>${esc(x.name)}</td><td class="num">${money(x.quantity)}</td><td class="num">${money(x.unit_price)}</td><td class="num">${money(x.total_value)}</td></tr>`).join('')||'<tr><td colspan="4" class="empty">Chưa có dữ liệu tồn kho.</td></tr>'}
+    function renderReports(){const r=state.reports||{},m=state.monthlyExport||{},s=m.summary||{};monthlyExportRows.innerHTML=[['Kỳ báo cáo',m.month||''],['Từ ngày',m.start_date||''],['Đến ngày',m.end_date||''],['Tổng chi phí',money(s.expense_total)],['Số dòng chi phí',money(s.expense_count)],['Số danh mục',money(s.category_count)],['Số dự án',money(s.project_count)]].map(x=>`<tr><td>${esc(x[0])}</td><td class="num">${esc(x[1])}</td></tr>`).join('');drawBars(monthlyBars,r.monthly_expenses||[],'month','total');drawBars(projectBars,r.project_expenses||[],'project','total');stockReportRows.innerHTML=(r.stock||[]).map(x=>`<tr><td>${esc(x.name)}</td><td class="num">${money(x.quantity)}</td><td class="num">${money(x.unit_price)}</td><td class="num">${money(x.total_value)}</td></tr>`).join('')||'<tr><td colspan="4" class="empty">Chưa có dữ liệu tồn kho.</td></tr>'}
     function renderAccounting(){const a=state.accounting||{},k=a.kpis||{},bs=a.balance_sheet||{},tot=bs.totals||{};aAccounts.textContent=k.account_count||0;aJournals.textContent=k.journal_count||0;aDebit.textContent=money(k.trial_debit);aCredit.textContent=money(k.trial_credit);aOpenDebt.textContent=money(k.open_ar_ap);const aq=(accountSearch.value||'').toLowerCase();const accounts=(a.accounts||[]).filter(x=>JSON.stringify(x).toLowerCase().includes(aq));accountRows.innerHTML=accounts.map(x=>`<tr><td><strong>${esc(x.account_code)}</strong></td><td>${esc(x.account_name)}</td><td>${esc(x.account_type)}</td><td class="num">${money(x.debit)}</td><td class="num">${money(x.credit)}</td><td class="num">${money(x.balance)}</td></tr>`).join('')||'<tr><td colspan="6" class="empty">Chưa có tài khoản.</td></tr>';accountSummaryRows.innerHTML=(a.account_summary||[]).map(x=>`<tr><td>${esc(x.account_type)}</td><td class="num">${money(x.account_count)}</td><td class="num">${money(x.active_count)}</td></tr>`).join('')||'<tr><td colspan="3" class="empty">Chưa có nhóm tài khoản.</td></tr>';trialRows.innerHTML=(a.trial_balance||[]).map(x=>`<tr><td>${esc(x.account_code)}</td><td>${esc(x.account_name)}</td><td class="num">${money(x.debit)}</td><td class="num">${money(x.credit)}</td><td class="num">${money(x.balance)}</td></tr>`).join('')||'<tr><td colspan="5" class="empty">Chưa có phát sinh.</td></tr>';balanceRows.innerHTML=(bs.rows||[]).map(x=>`<tr><td>${esc(x.group)}</td><td>${esc(x.account_code)}</td><td>${esc(x.account_name)}</td><td class="num">${money(x.balance)}</td></tr>`).join('')+`<tr><td><strong>Lệch</strong></td><td></td><td>Tài sản - Nguồn vốn</td><td class="num"><strong>${money(tot.difference)}</strong></td></tr>`;const jq=(journalSearch.value||'').toLowerCase();const journals=(a.journal_entries||[]).filter(x=>JSON.stringify(x).toLowerCase().includes(jq));journalRows.innerHTML=journals.map(x=>`<tr><td>${esc(x.entry_date)}</td><td>${esc(x.entry_number||x.id)}</td><td><strong>${esc(x.description)}</strong><br><span class="muted">${esc(x.project_code)} ${esc(x.project_name)}</span></td><td>${esc(x.debit_account)} / ${esc(x.credit_account)}</td><td class="num">${money(x.amount)}</td></tr>`).join('')||'<tr><td colspan="5" class="empty">Chưa có bút toán.</td></tr>';arApRows.innerHTML=(a.ar_ap_items||[]).map(x=>`<tr><td>${esc(x.partner_name)}<br><span class="muted">${esc(x.partner_type||'')}</span></td><td>${esc(x.project_code)} ${esc(x.project_name)}</td><td>${esc(x.due_date||'')}</td><td class="num">${money(x.amount)}</td><td class="num">${money(x.remaining_amount)}</td><td><span class="status ${x.status==='open'?'low':''}">${esc(x.status)}</span></td></tr>`).join('')||'<tr><td colspan="6" class="empty">Chưa có công nợ.</td></tr>';costCollectRows.innerHTML=(a.project_cost_collection||[]).map(x=>`<tr><td>${esc(x.project_code)} ${esc(x.project_name)}</td><td>${esc(x.category_name)}</td><td class="num">${money(x.line_count)}</td><td class="num">${money(x.amount)}</td></tr>`).join('')||'<tr><td colspan="4" class="empty">Chưa có chi phí công trình.</td></tr>';fiscalStatusRows.innerHTML=(a.fiscal_status||[]).map(x=>`<tr><td>${esc(x.fiscal_year)}</td><td class="num">${money(x.period_count)}</td><td class="num">${money(x.locked_count)}</td><td class="num">${money(x.closed_count)}</td></tr>`).join('')||'<tr><td colspan="4" class="empty">Chưa có kỳ kế toán.</td></tr>'}
     function renderFinance(){const f=state.finance||{},bank=f.bank||{},vat=f.vat||{},pay=f.payroll||{},payCurrent=pay.current||{};fAlerts.textContent=(f.alert_counts||{}).total||0;fUnreconciled.textContent=(bank.summary||{}).unreconciled_count||0;fOutputVat.textContent=money(vat.output_vat);fVatPayable.textContent=money(vat.vat_payable);fPayrollNet.textContent=money(payCurrent.net_amount);const q=(financeSearch.value||'').toLowerCase();const alerts=(f.alerts||[]).filter(a=>JSON.stringify(a).toLowerCase().includes(q));alertRows.innerHTML=alerts.map(a=>`<tr><td>${esc(a.source)}</td><td><span class="status ${a.priority==='critical'?'low':''}">${esc(a.priority)}</span></td><td><strong>${esc(a.title)}</strong><br><span class="muted">${esc(a.message)}</span></td><td>${esc(a.due_date||'')}</td></tr>`).join('')||'<tr><td colspan="4" class="empty">Không có cảnh báo.</td></tr>';thresholdRows.innerHTML=(f.approval_thresholds||[]).map(t=>`<tr><td>${esc(t.role)}</td><td class="num">${money(t.max_amount)}</td><td>${Number(t.can_final_approve)?'Có':'Không'}</td><td><span class="status">${Number(t.active)?'active':'inactive'}</span></td></tr>`).join('')||'<tr><td colspan="4" class="empty">Chưa có hạn mức.</td></tr>';periodRows.innerHTML=(f.fiscal_periods||[]).slice(0,18).map(p=>`<tr><td>${esc(p.fiscal_period)}</td><td>${esc(p.period_start)}</td><td>${esc(p.period_end)}</td><td><span class="status ${Number(p.is_locked)?'low':''}">${Number(p.is_locked)?'locked':'open'}</span></td><td><button class="secondary" type="button" data-lock-period="${esc(p.fiscal_period)}" data-lock-value="${Number(p.is_locked)?0:1}">${Number(p.is_locked)?'Mở':'Khóa'}</button></td></tr>`).join('')||'<tr><td colspan="5" class="empty">Chưa có kỳ kế toán.</td></tr>';bankRows.innerHTML=(bank.unreconciled||[]).map(b=>`<tr><td>${esc(b.transaction_date)}</td><td>${esc(b.description)}</td><td class="num">${money(b.amount)}</td><td><span class="status">open</span></td></tr>`).join('')||'<tr><td colspan="4" class="empty">Không có giao dịch chưa đối soát.</td></tr>';vatRows.innerHTML=[['Kỳ',vat.period||''],['Doanh thu chịu thuế',money(vat.output_taxable)],['VAT đầu ra',money(vat.output_vat)],['Chi phí chịu thuế',money(vat.input_taxable)],['VAT đầu vào',money(vat.input_vat)],['Phải nộp',money(vat.vat_payable)],['Còn khấu trừ',money(vat.vat_credit)]].map(x=>`<tr><td>${esc(x[0])}</td><td class="num">${esc(x[1])}</td></tr>`).join('');auditRows.innerHTML=(f.audit_log||[]).map(a=>`<tr><td>${esc(a.created_at)}</td><td>${esc(a.action)}</td><td>${esc(a.entity_type)}</td><td>${esc(String(a.detail||'').slice(0,120))}</td></tr>`).join('')||'<tr><td colspan="4" class="empty">Chưa có audit log.</td></tr>';document.querySelectorAll('[data-lock-period]').forEach(btn=>btn.addEventListener('click',async()=>{try{await api('/api/fiscal-locks',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({fiscal_period:btn.dataset.lockPeriod,locked:btn.dataset.lockValue})});await loadFinance();toast('Đã cập nhật khóa kỳ')}catch(err){toast(err.message)}}))}
     function renderUsers(error){if(error){userRows.innerHTML=`<tr><td colspan="6" class="empty">${esc(error)}</td></tr>`;return}userRows.innerHTML=(state.users||[]).map(u=>`<tr><td>${esc(u.username)}</td><td>${esc(u.full_name||'')}</td><td>${esc(u.email||'')}</td><td><span class="status">${esc(u.role)}</span></td><td>${Number(u.active)?'active':'inactive'}</td><td>${esc(u.created_at||'')}</td></tr>`).join('')||'<tr><td colspan="6" class="empty">Chưa có người dùng.</td></tr>'}
@@ -1799,6 +2067,7 @@ INDEX_HTML = r"""<!doctype html>
     logoutBtn.addEventListener('click',async()=>{try{await api('/api/auth/logout',{method:'POST'});}catch(err){}localStorage.removeItem('fastrack_auth_token');state.auth=null;userChip.textContent='Chưa đăng nhập';showLogin()});
     reloadUsersBtn.addEventListener('click',()=>loadUsers());
     offlineSearch.addEventListener('input',renderOfflineData);offlineReloadBtn.addEventListener('click',()=>loadOfflineData());
+    reportMonth.value=new Date().toISOString().slice(0,7);reportMonth.addEventListener('change',()=>loadReports());csvExportBtn.addEventListener('click',()=>{window.location.href=`/api/export/monthly-report.csv?month=${encodeURIComponent(reportMonth.value)}`});sheetsExportBtn.addEventListener('click',async()=>{try{const r=await api('/api/export/sheets',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({month:reportMonth.value})});toast(r.url?'Đã xuất Google Sheets':'Đã gửi yêu cầu xuất')}catch(err){toast(err.message)}});
     expenseSearch.addEventListener('input',renderExpenses);inventorySearch.addEventListener('input',renderInventory);contractSearch.addEventListener('input',renderProjectAccounting);documentSearch.addEventListener('input',renderDocuments);formSearch.addEventListener('input',renderForms);accountSearch.addEventListener('input',renderAccounting);journalSearch.addEventListener('input',renderAccounting);financeSearch.addEventListener('input',renderFinance);
     expenseForm.expense_date.value=new Date().toISOString().slice(0,10);
     diaryForm.diary_date.value=new Date().toISOString().slice(0,10);
