@@ -366,6 +366,234 @@ class WebFinanceCenter:
         }
 
 
+class WebAccountingWorkspace:
+    """Core accounting books and statements for the web workspace."""
+
+    def __init__(self):
+        self.conn = get_connection()
+
+    def account_balances_as_of(self, as_of_date=None):
+        as_of_date = as_of_date or date.today().isoformat()
+        cursor = self.conn.cursor()
+        cursor.execute(
+            """
+            SELECT account_code,
+                   SUM(debit_amount) AS debit,
+                   SUM(credit_amount) AS credit
+            FROM (
+                SELECT debit_account AS account_code, amount AS debit_amount, 0 AS credit_amount
+                FROM journal_entries
+                WHERE COALESCE(debit_account, '') <> ''
+                  AND entry_date <= ?
+                  AND COALESCE(is_reversed, 0) = 0
+                UNION ALL
+                SELECT credit_account AS account_code, 0 AS debit_amount, amount AS credit_amount
+                FROM journal_entries
+                WHERE COALESCE(credit_account, '') <> ''
+                  AND entry_date <= ?
+                  AND COALESCE(is_reversed, 0) = 0
+                UNION ALL
+                SELECT l.account_code, l.debit_amount, l.credit_amount
+                FROM journal_entry_lines l
+                JOIN journal_entries j ON j.id = l.journal_entry_id
+                WHERE j.entry_date <= ?
+                  AND COALESCE(j.is_reversed, 0) = 0
+            )
+            GROUP BY account_code
+            """,
+            (as_of_date, as_of_date, as_of_date),
+        )
+        balances = {
+            row["account_code"]: {
+                "account_code": row["account_code"],
+                "debit": float(row["debit"] or 0),
+                "credit": float(row["credit"] or 0),
+            }
+            for row in cursor.fetchall()
+        }
+
+        cursor.execute(
+            """
+            SELECT account_code, account_name, account_type, account_level,
+                   parent_code, COALESCE(account_class, '') AS account_class,
+                   COALESCE(normal_balance, '') AS normal_balance,
+                   COALESCE(is_cost_account, 0) AS is_cost_account,
+                   COALESCE(active, 1) AS active
+            FROM accounts
+            ORDER BY account_code
+            """
+        )
+        accounts = []
+        for row in cursor.fetchall():
+            debit = balances.get(row["account_code"], {}).get("debit", 0)
+            credit = balances.get(row["account_code"], {}).get("credit", 0)
+            normal_balance = (row["normal_balance"] or "").lower()
+            if not normal_balance:
+                normal_balance = "credit" if str(row["account_code"])[:1] in ("3", "4", "5", "7") else "debit"
+            balance = credit - debit if normal_balance == "credit" else debit - credit
+            accounts.append(
+                {
+                    **row_to_dict(row),
+                    "debit": debit,
+                    "credit": credit,
+                    "balance": balance,
+                }
+            )
+        return accounts
+
+    def trial_balance(self, as_of_date=None):
+        return [row for row in self.account_balances_as_of(as_of_date) if row["debit"] or row["credit"] or row["balance"]]
+
+    def balance_sheet(self, as_of_date=None):
+        rows = []
+        for account in self.account_balances_as_of(as_of_date):
+            code = str(account.get("account_code") or "")
+            acc_type = (account.get("account_type") or account.get("account_class") or "").lower()
+            if code[:1] in ("1", "2") or "tai san" in acc_type or "tài sản" in acc_type:
+                group = "Tai san"
+            elif code[:1] in ("3", "4") or "no phai tra" in acc_type or "nợ phải trả" in acc_type or "von" in acc_type or "vốn" in acc_type:
+                group = "Nguon von"
+            else:
+                continue
+            if account["balance"] == 0:
+                continue
+            rows.append({**account, "group": group})
+        totals = {
+            "assets": sum(row["balance"] for row in rows if row["group"] == "Tai san"),
+            "capital": sum(row["balance"] for row in rows if row["group"] == "Nguon von"),
+        }
+        totals["difference"] = totals["assets"] - totals["capital"]
+        return {"as_of_date": as_of_date or date.today().isoformat(), "rows": rows, "totals": totals}
+
+    def account_summary(self):
+        cursor = self.conn.cursor()
+        cursor.execute(
+            """
+            SELECT COALESCE(account_type, 'Khac') AS account_type,
+                   COUNT(*) AS account_count,
+                   SUM(CASE WHEN COALESCE(active, 1) = 1 THEN 1 ELSE 0 END) AS active_count
+            FROM accounts
+            GROUP BY COALESCE(account_type, 'Khac')
+            ORDER BY account_type
+            """
+        )
+        return [row_to_dict(row) for row in cursor.fetchall()]
+
+    def journal_entries(self):
+        cursor = self.conn.cursor()
+        cursor.execute(
+            """
+            SELECT j.id, j.entry_date, j.entry_number, j.description,
+                   j.debit_account, da.account_name AS debit_name,
+                   j.credit_account, ca.account_name AS credit_name,
+                   COALESCE(j.amount, 0) AS amount,
+                   COALESCE(p.code, '') AS project_code,
+                   COALESCE(p.name, '') AS project_name,
+                   j.reference_type, j.fiscal_period, j.created_at
+            FROM journal_entries j
+            LEFT JOIN accounts da ON da.account_code = j.debit_account
+            LEFT JOIN accounts ca ON ca.account_code = j.credit_account
+            LEFT JOIN projects p ON p.id = j.project_id
+            WHERE COALESCE(j.is_reversed, 0) = 0
+            ORDER BY j.entry_date DESC, j.id DESC
+            LIMIT 120
+            """
+        )
+        return [row_to_dict(row) for row in cursor.fetchall()]
+
+    def ar_ap_items(self):
+        cursor = self.conn.cursor()
+        cursor.execute(
+            """
+            SELECT a.id, a.partner_type, a.partner_name,
+                   COALESCE(p.code, '') AS project_code,
+                   COALESCE(p.name, '') AS project_name,
+                   a.due_date, COALESCE(a.amount, 0) AS amount,
+                   COALESCE(a.paid_amount, 0) AS paid_amount,
+                   COALESCE(a.amount, 0) - COALESCE(a.paid_amount, 0) AS remaining_amount,
+                   a.status, a.source_type, a.created_at
+            FROM ar_ap_items a
+            LEFT JOIN projects p ON p.id = a.project_id
+            ORDER BY CASE WHEN a.status = 'open' THEN 0 ELSE 1 END, a.due_date, a.id DESC
+            LIMIT 120
+            """
+        )
+        return [row_to_dict(row) for row in cursor.fetchall()]
+
+    def ar_ap_summary(self):
+        rows = self.ar_ap_items()
+        open_rows = [row for row in rows if row.get("status") == "open"]
+        return {
+            "item_count": len(rows),
+            "open_count": len(open_rows),
+            "total_amount": sum(float(row.get("amount") or 0) for row in rows),
+            "open_amount": sum(float(row.get("remaining_amount") or 0) for row in open_rows),
+        }
+
+    def project_cost_collection(self):
+        cursor = self.conn.cursor()
+        cursor.execute(
+            """
+            SELECT COALESCE(p.code, '') AS project_code,
+                   COALESCE(p.name, 'Khong gan du an') AS project_name,
+                   COALESCE(ec.name, 'Khac') AS category_name,
+                   COUNT(e.id) AS line_count,
+                   COALESCE(SUM(e.amount), 0) AS amount
+            FROM expenses e
+            LEFT JOIN projects p ON p.id = e.project_id
+            LEFT JOIN expense_categories ec ON ec.id = e.category_id
+            GROUP BY e.project_id, e.category_id
+            ORDER BY amount DESC
+            LIMIT 80
+            """
+        )
+        return [row_to_dict(row) for row in cursor.fetchall()]
+
+    def fiscal_status(self):
+        cursor = self.conn.cursor()
+        cursor.execute(
+            """
+            SELECT fiscal_year,
+                   COUNT(*) AS period_count,
+                   SUM(CASE WHEN COALESCE(is_locked, 0) = 1 THEN 1 ELSE 0 END) AS locked_count,
+                   SUM(CASE WHEN COALESCE(is_closed, 0) = 1 THEN 1 ELSE 0 END) AS closed_count
+            FROM fiscal_calendar
+            GROUP BY fiscal_year
+            ORDER BY fiscal_year DESC
+            LIMIT 5
+            """
+        )
+        return [row_to_dict(row) for row in cursor.fetchall()]
+
+    def snapshot(self, as_of_date=None):
+        as_of_date = as_of_date or date.today().isoformat()
+        accounts = self.account_balances_as_of(as_of_date)
+        trial = [row for row in accounts if row["debit"] or row["credit"] or row["balance"]]
+        journals = self.journal_entries()
+        ar_ap = self.ar_ap_items()
+        return {
+            "as_of_date": as_of_date,
+            "kpis": {
+                "account_count": len(accounts),
+                "active_account_count": sum(1 for row in accounts if row.get("active")),
+                "journal_count": len(journals),
+                "journal_amount": sum(float(row.get("amount") or 0) for row in journals),
+                "trial_debit": sum(float(row.get("debit") or 0) for row in trial),
+                "trial_credit": sum(float(row.get("credit") or 0) for row in trial),
+                "open_ar_ap": sum(float(row.get("remaining_amount") or 0) for row in ar_ap if row.get("status") == "open"),
+            },
+            "accounts": accounts,
+            "account_summary": self.account_summary(),
+            "trial_balance": trial,
+            "balance_sheet": self.balance_sheet(as_of_date),
+            "journal_entries": journals,
+            "ar_ap_items": ar_ap,
+            "ar_ap_summary": self.ar_ap_summary(),
+            "project_cost_collection": self.project_cost_collection(),
+            "fiscal_status": self.fiscal_status(),
+        }
+
+
 def api_error(handler):
     @wraps(handler)
     def wrapper(*args, **kwargs):
@@ -787,6 +1015,11 @@ def create_app():
             }
         )
 
+    @app.get("/api/accounting-workspace")
+    @api_error
+    def accounting_workspace():
+        return jsonify(WebAccountingWorkspace().snapshot(request.args.get("as_of_date")))
+
     @app.get("/api/forms")
     @api_error
     def forms():
@@ -1113,6 +1346,7 @@ INDEX_HTML = r"""<!doctype html>
         <button class="navbtn" data-view="documents">Chứng từ</button>
         <button class="navbtn" data-view="forms">Biểu mẫu</button>
         <button class="navbtn" data-view="reports">Báo cáo</button>
+        <button class="navbtn" data-view="accounting">Sổ sách</button>
         <button class="navbtn" data-view="finance">Kiểm soát & tài chính</button>
         <button class="navbtn" data-view="security">Bảo mật</button>
         <button class="navbtn" data-view="settings">Cài đặt</button>
@@ -1347,6 +1581,50 @@ INDEX_HTML = r"""<!doctype html>
         </div>
       </section>
 
+      <section class="view" id="accounting">
+        <div class="grid kpis">
+          <div class="card kpi"><div class="label">Tài khoản</div><div class="value" id="aAccounts">0</div></div>
+          <div class="card kpi"><div class="label">Bút toán gần đây</div><div class="value" id="aJournals">0</div></div>
+          <div class="card kpi"><div class="label">Phát sinh nợ</div><div class="value" id="aDebit">0</div></div>
+          <div class="card kpi"><div class="label">Phát sinh có</div><div class="value" id="aCredit">0</div></div>
+          <div class="card kpi"><div class="label">Công nợ mở</div><div class="value" id="aOpenDebt">0</div></div>
+        </div>
+        <div class="grid two">
+          <div class="card">
+            <div class="toolbar"><h3>Hệ thống tài khoản</h3><input class="search" id="accountSearch" placeholder="Tìm tài khoản"></div>
+            <div class="tablewrap"><table><thead><tr><th>TK</th><th>Tên tài khoản</th><th>Loại</th><th>Nợ</th><th>Có</th><th>Số dư</th></tr></thead><tbody id="accountRows"></tbody></table></div>
+          </div>
+          <div class="card">
+            <h3>Nhóm tài khoản</h3>
+            <div class="tablewrap"><table><thead><tr><th>Loại</th><th>Tổng TK</th><th>Đang dùng</th></tr></thead><tbody id="accountSummaryRows"></tbody></table></div>
+          </div>
+        </div>
+        <div class="grid two">
+          <div class="card">
+            <h3>Cân đối phát sinh</h3>
+            <div class="tablewrap"><table><thead><tr><th>TK</th><th>Tên tài khoản</th><th>Nợ</th><th>Có</th><th>Số dư</th></tr></thead><tbody id="trialRows"></tbody></table></div>
+          </div>
+          <div class="card">
+            <h3>Bảng cân đối kế toán</h3>
+            <div class="tablewrap"><table><thead><tr><th>Nhóm</th><th>TK</th><th>Tên tài khoản</th><th>Số dư</th></tr></thead><tbody id="balanceRows"></tbody></table></div>
+          </div>
+        </div>
+        <div class="grid two">
+          <div class="card">
+            <div class="toolbar"><h3>Nhật ký bút toán</h3><input class="search" id="journalSearch" placeholder="Tìm bút toán"></div>
+            <div class="tablewrap"><table><thead><tr><th>Ngày</th><th>Số CT</th><th>Diễn giải</th><th>Nợ/Có</th><th>Số tiền</th></tr></thead><tbody id="journalRows"></tbody></table></div>
+          </div>
+          <div class="card">
+            <h3>Công nợ phải thu/phải trả</h3>
+            <div class="tablewrap"><table><thead><tr><th>Đối tác</th><th>Dự án</th><th>Hạn</th><th>Số tiền</th><th>Còn lại</th><th>TT</th></tr></thead><tbody id="arApRows"></tbody></table></div>
+          </div>
+        </div>
+        <div class="grid two">
+          <div class="card"><h3>Tập hợp chi phí công trình</h3><div class="tablewrap"><table><thead><tr><th>Dự án</th><th>Danh mục</th><th>Số dòng</th><th>Số tiền</th></tr></thead><tbody id="costCollectRows"></tbody></table></div></div>
+          <div class="card"><h3>Trạng thái kỳ kế toán</h3><div class="tablewrap"><table><thead><tr><th>Năm</th><th>Số kỳ</th><th>Đã khóa</th><th>Đã đóng</th></tr></thead><tbody id="fiscalStatusRows"></tbody></table></div></div>
+        </div>
+      </section>
+
       <section class="view" id="finance">
         <div class="grid kpis">
           <div class="card kpi"><div class="label">Cảnh báo</div><div class="value" id="fAlerts">0</div></div>
@@ -1470,16 +1748,16 @@ INDEX_HTML = r"""<!doctype html>
   <div class="toast" id="toast"></div>
 
   <script>
-    const state={auth:null,users:[],offlineData:null,offlineTable:null,dashboard:null,expenses:[],inventory:[],history:[],projects:[],categories:[],projectAccounting:null,workItems:[],diaries:[],documents:[],forms:[],reports:null,finance:null,settings:null};
+    const state={auth:null,users:[],offlineData:null,offlineTable:null,dashboard:null,expenses:[],inventory:[],history:[],projects:[],categories:[],projectAccounting:null,workItems:[],diaries:[],documents:[],forms:[],reports:null,accounting:null,finance:null,settings:null};
     const money=v=>new Intl.NumberFormat('vi-VN',{maximumFractionDigits:0}).format(Number(v||0));
     const esc=v=>String(v??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
     const toast=t=>{const el=document.getElementById('toast');el.textContent=t;el.style.display='block';setTimeout(()=>el.style.display='none',2800)};
     async function api(url,options={}){const token=localStorage.getItem('fastrack_auth_token');options={...options,headers:{...(options.headers||{})}};if(token)options.headers.Authorization=`Bearer ${token}`;const r=await fetch(url,options);const data=await r.json();if(r.status===401){localStorage.removeItem('fastrack_auth_token');showLogin();throw new Error(data.error||'Cần đăng nhập')}if(!r.ok)throw new Error(data.error||'Có lỗi xảy ra');return data}
     function showLogin(){authGate.classList.remove('hidden')}
     function hideLogin(){authGate.classList.add('hidden')}
-    function switchView(id){document.querySelectorAll('.view').forEach(v=>v.classList.toggle('active',v.id===id));document.querySelectorAll('.navbtn').forEach(b=>b.classList.toggle('active',b.dataset.view===id));document.getElementById('pageTitle').textContent={dashboard:'Tổng quan',offlineData:'Dữ liệu offline',expenses:'Chi phí',inventory:'Vật tư kho',projects:'Dự án',projectAccounting:'Kế toán công trình',construction:'Công trường',documents:'Chứng từ',forms:'Biểu mẫu',reports:'Báo cáo',finance:'Kiểm soát & tài chính',security:'Bảo mật',settings:'Cài đặt',deploy:'Tên miền'}[id]||'FasTrack ERP';document.getElementById('side').classList.remove('open')}
+    function switchView(id){document.querySelectorAll('.view').forEach(v=>v.classList.toggle('active',v.id===id));document.querySelectorAll('.navbtn').forEach(b=>b.classList.toggle('active',b.dataset.view===id));document.getElementById('pageTitle').textContent={dashboard:'Tổng quan',offlineData:'Dữ liệu offline',expenses:'Chi phí',inventory:'Vật tư kho',projects:'Dự án',projectAccounting:'Kế toán công trình',construction:'Công trường',documents:'Chứng từ',forms:'Biểu mẫu',reports:'Báo cáo',accounting:'Sổ sách kế toán',finance:'Kiểm soát & tài chính',security:'Bảo mật',settings:'Cài đặt',deploy:'Tên miền'}[id]||'FasTrack ERP';document.getElementById('side').classList.remove('open')}
     async function boot(){const me=await api('/api/auth/me');state.auth=me.user||null;if(!me.authenticated){showLogin();return}hideLogin();userChip.textContent=`${state.auth.full_name||state.auth.username} · ${state.auth.role}`;await loadAll()}
-    async function loadAll(){await Promise.all([loadDashboard(),loadOfflineData(),loadCatalogs(),loadExpenses(),loadInventory(),loadProjects(),loadProjectAccounting(),loadConstruction(),loadDocuments(),loadForms(),loadReports(),loadFinance(),loadSettings(),loadUsers()])}
+    async function loadAll(){await Promise.all([loadDashboard(),loadOfflineData(),loadCatalogs(),loadExpenses(),loadInventory(),loadProjects(),loadProjectAccounting(),loadConstruction(),loadDocuments(),loadForms(),loadReports(),loadAccounting(),loadFinance(),loadSettings(),loadUsers()])}
     async function loadDashboard(){state.dashboard=await api('/api/dashboard');renderDashboard()}
     async function loadOfflineData(){state.offlineData=await api('/api/offline-data');renderOfflineData()}
     async function loadOfflineTable(name){state.offlineTable=await api(`/api/offline-data/${encodeURIComponent(name)}?limit=100`);renderOfflinePreview()}
@@ -1492,6 +1770,7 @@ INDEX_HTML = r"""<!doctype html>
     async function loadDocuments(){state.documents=await api('/api/documents');renderDocuments()}
     async function loadForms(){state.forms=await api('/api/forms');renderForms()}
     async function loadReports(){state.reports=await api('/api/reports/summary');renderReports()}
+    async function loadAccounting(){state.accounting=await api('/api/accounting-workspace');renderAccounting()}
     async function loadFinance(){state.finance=await api('/api/finance-center');renderFinance()}
     async function loadSettings(){state.settings=await api('/api/settings');renderSettings()}
     async function loadUsers(){try{state.users=await api('/api/users');renderUsers()}catch(err){state.users=[];renderUsers(err.message)}}
@@ -1509,6 +1788,7 @@ INDEX_HTML = r"""<!doctype html>
     function renderForms(){const q=(formSearch.value||'').toLowerCase();const rows=state.forms.filter(f=>JSON.stringify(f).toLowerCase().includes(q));formRows.innerHTML=rows.map(f=>`<tr><td>${esc(f.form_code)}</td><td>${esc(f.form_name)}</td><td>${esc(f.scope)}</td><td>${esc(f.file_path)}</td></tr>`).join('')||'<tr><td colspan="4" class="empty">Chưa có biểu mẫu.</td></tr>'}
     function drawBars(el,rows,labelKey,valueKey){const max=Math.max(1,...rows.map(r=>Number(r[valueKey]||0)));el.innerHTML=rows.map(r=>`<div class="barrow"><strong>${esc(r[labelKey])}</strong><div class="bar"><div class="fill" style="width:${Math.round(Number(r[valueKey]||0)/max*100)}%"></div></div><span class="num">${money(r[valueKey])}</span></div>`).join('')||'<div class="empty">Chưa có dữ liệu.</div>'}
     function renderReports(){const r=state.reports||{};drawBars(monthlyBars,r.monthly_expenses||[],'month','total');drawBars(projectBars,r.project_expenses||[],'project','total');stockReportRows.innerHTML=(r.stock||[]).map(x=>`<tr><td>${esc(x.name)}</td><td class="num">${money(x.quantity)}</td><td class="num">${money(x.unit_price)}</td><td class="num">${money(x.total_value)}</td></tr>`).join('')||'<tr><td colspan="4" class="empty">Chưa có dữ liệu tồn kho.</td></tr>'}
+    function renderAccounting(){const a=state.accounting||{},k=a.kpis||{},bs=a.balance_sheet||{},tot=bs.totals||{};aAccounts.textContent=k.account_count||0;aJournals.textContent=k.journal_count||0;aDebit.textContent=money(k.trial_debit);aCredit.textContent=money(k.trial_credit);aOpenDebt.textContent=money(k.open_ar_ap);const aq=(accountSearch.value||'').toLowerCase();const accounts=(a.accounts||[]).filter(x=>JSON.stringify(x).toLowerCase().includes(aq));accountRows.innerHTML=accounts.map(x=>`<tr><td><strong>${esc(x.account_code)}</strong></td><td>${esc(x.account_name)}</td><td>${esc(x.account_type)}</td><td class="num">${money(x.debit)}</td><td class="num">${money(x.credit)}</td><td class="num">${money(x.balance)}</td></tr>`).join('')||'<tr><td colspan="6" class="empty">Chưa có tài khoản.</td></tr>';accountSummaryRows.innerHTML=(a.account_summary||[]).map(x=>`<tr><td>${esc(x.account_type)}</td><td class="num">${money(x.account_count)}</td><td class="num">${money(x.active_count)}</td></tr>`).join('')||'<tr><td colspan="3" class="empty">Chưa có nhóm tài khoản.</td></tr>';trialRows.innerHTML=(a.trial_balance||[]).map(x=>`<tr><td>${esc(x.account_code)}</td><td>${esc(x.account_name)}</td><td class="num">${money(x.debit)}</td><td class="num">${money(x.credit)}</td><td class="num">${money(x.balance)}</td></tr>`).join('')||'<tr><td colspan="5" class="empty">Chưa có phát sinh.</td></tr>';balanceRows.innerHTML=(bs.rows||[]).map(x=>`<tr><td>${esc(x.group)}</td><td>${esc(x.account_code)}</td><td>${esc(x.account_name)}</td><td class="num">${money(x.balance)}</td></tr>`).join('')+`<tr><td><strong>Lệch</strong></td><td></td><td>Tài sản - Nguồn vốn</td><td class="num"><strong>${money(tot.difference)}</strong></td></tr>`;const jq=(journalSearch.value||'').toLowerCase();const journals=(a.journal_entries||[]).filter(x=>JSON.stringify(x).toLowerCase().includes(jq));journalRows.innerHTML=journals.map(x=>`<tr><td>${esc(x.entry_date)}</td><td>${esc(x.entry_number||x.id)}</td><td><strong>${esc(x.description)}</strong><br><span class="muted">${esc(x.project_code)} ${esc(x.project_name)}</span></td><td>${esc(x.debit_account)} / ${esc(x.credit_account)}</td><td class="num">${money(x.amount)}</td></tr>`).join('')||'<tr><td colspan="5" class="empty">Chưa có bút toán.</td></tr>';arApRows.innerHTML=(a.ar_ap_items||[]).map(x=>`<tr><td>${esc(x.partner_name)}<br><span class="muted">${esc(x.partner_type||'')}</span></td><td>${esc(x.project_code)} ${esc(x.project_name)}</td><td>${esc(x.due_date||'')}</td><td class="num">${money(x.amount)}</td><td class="num">${money(x.remaining_amount)}</td><td><span class="status ${x.status==='open'?'low':''}">${esc(x.status)}</span></td></tr>`).join('')||'<tr><td colspan="6" class="empty">Chưa có công nợ.</td></tr>';costCollectRows.innerHTML=(a.project_cost_collection||[]).map(x=>`<tr><td>${esc(x.project_code)} ${esc(x.project_name)}</td><td>${esc(x.category_name)}</td><td class="num">${money(x.line_count)}</td><td class="num">${money(x.amount)}</td></tr>`).join('')||'<tr><td colspan="4" class="empty">Chưa có chi phí công trình.</td></tr>';fiscalStatusRows.innerHTML=(a.fiscal_status||[]).map(x=>`<tr><td>${esc(x.fiscal_year)}</td><td class="num">${money(x.period_count)}</td><td class="num">${money(x.locked_count)}</td><td class="num">${money(x.closed_count)}</td></tr>`).join('')||'<tr><td colspan="4" class="empty">Chưa có kỳ kế toán.</td></tr>'}
     function renderFinance(){const f=state.finance||{},bank=f.bank||{},vat=f.vat||{},pay=f.payroll||{},payCurrent=pay.current||{};fAlerts.textContent=(f.alert_counts||{}).total||0;fUnreconciled.textContent=(bank.summary||{}).unreconciled_count||0;fOutputVat.textContent=money(vat.output_vat);fVatPayable.textContent=money(vat.vat_payable);fPayrollNet.textContent=money(payCurrent.net_amount);const q=(financeSearch.value||'').toLowerCase();const alerts=(f.alerts||[]).filter(a=>JSON.stringify(a).toLowerCase().includes(q));alertRows.innerHTML=alerts.map(a=>`<tr><td>${esc(a.source)}</td><td><span class="status ${a.priority==='critical'?'low':''}">${esc(a.priority)}</span></td><td><strong>${esc(a.title)}</strong><br><span class="muted">${esc(a.message)}</span></td><td>${esc(a.due_date||'')}</td></tr>`).join('')||'<tr><td colspan="4" class="empty">Không có cảnh báo.</td></tr>';thresholdRows.innerHTML=(f.approval_thresholds||[]).map(t=>`<tr><td>${esc(t.role)}</td><td class="num">${money(t.max_amount)}</td><td>${Number(t.can_final_approve)?'Có':'Không'}</td><td><span class="status">${Number(t.active)?'active':'inactive'}</span></td></tr>`).join('')||'<tr><td colspan="4" class="empty">Chưa có hạn mức.</td></tr>';periodRows.innerHTML=(f.fiscal_periods||[]).slice(0,18).map(p=>`<tr><td>${esc(p.fiscal_period)}</td><td>${esc(p.period_start)}</td><td>${esc(p.period_end)}</td><td><span class="status ${Number(p.is_locked)?'low':''}">${Number(p.is_locked)?'locked':'open'}</span></td><td><button class="secondary" type="button" data-lock-period="${esc(p.fiscal_period)}" data-lock-value="${Number(p.is_locked)?0:1}">${Number(p.is_locked)?'Mở':'Khóa'}</button></td></tr>`).join('')||'<tr><td colspan="5" class="empty">Chưa có kỳ kế toán.</td></tr>';bankRows.innerHTML=(bank.unreconciled||[]).map(b=>`<tr><td>${esc(b.transaction_date)}</td><td>${esc(b.description)}</td><td class="num">${money(b.amount)}</td><td><span class="status">open</span></td></tr>`).join('')||'<tr><td colspan="4" class="empty">Không có giao dịch chưa đối soát.</td></tr>';vatRows.innerHTML=[['Kỳ',vat.period||''],['Doanh thu chịu thuế',money(vat.output_taxable)],['VAT đầu ra',money(vat.output_vat)],['Chi phí chịu thuế',money(vat.input_taxable)],['VAT đầu vào',money(vat.input_vat)],['Phải nộp',money(vat.vat_payable)],['Còn khấu trừ',money(vat.vat_credit)]].map(x=>`<tr><td>${esc(x[0])}</td><td class="num">${esc(x[1])}</td></tr>`).join('');auditRows.innerHTML=(f.audit_log||[]).map(a=>`<tr><td>${esc(a.created_at)}</td><td>${esc(a.action)}</td><td>${esc(a.entity_type)}</td><td>${esc(String(a.detail||'').slice(0,120))}</td></tr>`).join('')||'<tr><td colspan="4" class="empty">Chưa có audit log.</td></tr>';document.querySelectorAll('[data-lock-period]').forEach(btn=>btn.addEventListener('click',async()=>{try{await api('/api/fiscal-locks',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({fiscal_period:btn.dataset.lockPeriod,locked:btn.dataset.lockValue})});await loadFinance();toast('Đã cập nhật khóa kỳ')}catch(err){toast(err.message)}}))}
     function renderUsers(error){if(error){userRows.innerHTML=`<tr><td colspan="6" class="empty">${esc(error)}</td></tr>`;return}userRows.innerHTML=(state.users||[]).map(u=>`<tr><td>${esc(u.username)}</td><td>${esc(u.full_name||'')}</td><td>${esc(u.email||'')}</td><td><span class="status">${esc(u.role)}</span></td><td>${Number(u.active)?'active':'inactive'}</td><td>${esc(u.created_at||'')}</td></tr>`).join('')||'<tr><td colspan="6" class="empty">Chưa có người dùng.</td></tr>'}
     function renderSettings(){const s=state.settings||{},settings=s.settings||{};['company_name','company_tax_code','company_representative','company_short_name'].forEach(k=>{if(settingsForm[k])settingsForm[k].value=settings[k]||''});backupHealth.textContent=s.backup_health||'';linkageRows.innerHTML=(s.linkage_checks||[]).map(x=>`<tr><td>${esc(x.group)}</td><td>${esc(x.issue)}</td><td><span class="status">${esc(x.status)}</span></td><td class="num">${money(x.count)}</td></tr>`).join('')||'<tr><td colspan="4" class="empty">Không có cảnh báo.</td></tr>';databaseRows.innerHTML=Object.entries(s.database||{}).map(([k,v])=>`<tr><td>${esc(k)}</td><td class="num">${money(v)}</td></tr>`).join('');backupRows.innerHTML=(s.backups||[]).map(b=>`<tr><td>${esc(b.name)}</td><td>${esc(b.size)}</td><td>${esc(b.date)}</td></tr>`).join('')||'<tr><td colspan="3" class="empty">Chưa có bản sao lưu.</td></tr>'}
@@ -1519,7 +1799,7 @@ INDEX_HTML = r"""<!doctype html>
     logoutBtn.addEventListener('click',async()=>{try{await api('/api/auth/logout',{method:'POST'});}catch(err){}localStorage.removeItem('fastrack_auth_token');state.auth=null;userChip.textContent='Chưa đăng nhập';showLogin()});
     reloadUsersBtn.addEventListener('click',()=>loadUsers());
     offlineSearch.addEventListener('input',renderOfflineData);offlineReloadBtn.addEventListener('click',()=>loadOfflineData());
-    expenseSearch.addEventListener('input',renderExpenses);inventorySearch.addEventListener('input',renderInventory);contractSearch.addEventListener('input',renderProjectAccounting);documentSearch.addEventListener('input',renderDocuments);formSearch.addEventListener('input',renderForms);financeSearch.addEventListener('input',renderFinance);
+    expenseSearch.addEventListener('input',renderExpenses);inventorySearch.addEventListener('input',renderInventory);contractSearch.addEventListener('input',renderProjectAccounting);documentSearch.addEventListener('input',renderDocuments);formSearch.addEventListener('input',renderForms);accountSearch.addEventListener('input',renderAccounting);journalSearch.addEventListener('input',renderAccounting);financeSearch.addEventListener('input',renderFinance);
     expenseForm.expense_date.value=new Date().toISOString().slice(0,10);
     diaryForm.diary_date.value=new Date().toISOString().slice(0,10);
     documentForm.doc_date.value=new Date().toISOString().slice(0,10);
