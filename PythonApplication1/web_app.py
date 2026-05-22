@@ -80,7 +80,7 @@ def ensure_web_admin():
     hashed = AuthManager.hash_password(password)
     cursor.execute(
         """
-        INSERT INTO users (username, password, full_name, email, role, active, password_changed_at, must_change_password)
+        INSERT OR IGNORE INTO users (username, password, full_name, email, role, active, password_changed_at, must_change_password)
         VALUES (?, ?, ?, ?, 'admin', 1, CURRENT_TIMESTAMP, 1)
         """,
         (username, hashed, full_name, email),
