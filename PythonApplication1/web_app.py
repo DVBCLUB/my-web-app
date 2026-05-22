@@ -51,6 +51,74 @@ def row_to_named_dict(row: Any, keys: list[str] | tuple[str, ...]) -> dict[str, 
     return {key: row[index] if index < len(row) else None for index, key in enumerate(keys)}
 
 
+OFFLINE_DATA_TABLES = {
+    "accounts": "He thong tai khoan",
+    "projects": "Du an",
+    "expense_categories": "Danh muc chi phi",
+    "expenses": "Chi phi",
+    "documents": "Chung tu",
+    "materials": "Vat tu",
+    "project_contracts": "Hop dong cong trinh",
+    "contract_billings": "Nghiem thu / billing",
+    "project_revenues": "Doanh thu cong trinh",
+    "project_cost_plans": "Du toan chi phi",
+    "journal_entries": "But toan",
+    "ar_ap_items": "Cong no phai thu/phai tra",
+    "fiscal_calendar": "Ky ke toan",
+    "approval_thresholds": "Han muc phe duyet",
+    "approval_logs": "Lich su phe duyet",
+    "audit_log": "Audit log",
+    "form_templates": "Thu vien bieu mau",
+    "form_template_fields": "Truong bieu mau",
+    "form_field_mappings": "Mapping bieu mau",
+    "document_requirements": "Yeu cau chung tu",
+    "compliance_rules": "Quy tac tuan thu",
+    "category_account_mappings": "Mapping tai khoan",
+    "policy_limits": "Han muc chinh sach",
+    "process_steps": "Quy trinh",
+    "recurring_tasks": "Tac vu dinh ky",
+    "simple_catalogs": "Danh muc dung chung",
+    "app_settings": "Cau hinh cong ty",
+    "powerbi_sync_log": "Log PowerBI",
+}
+
+
+def offline_table_rows(table_name: str, limit: int = 50) -> list[dict[str, Any]]:
+    if table_name not in OFFLINE_DATA_TABLES:
+        raise ValueError("Bang du lieu khong duoc phep truy cap")
+    limit = max(1, min(int(limit or 50), 300))
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(f'SELECT * FROM "{table_name}" LIMIT ?', (limit,))
+    return [row_to_dict(row) for row in cursor.fetchall()]
+
+
+def offline_data_snapshot() -> dict[str, Any]:
+    conn = get_connection()
+    cursor = conn.cursor()
+    tables = []
+    for table_name, label in OFFLINE_DATA_TABLES.items():
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name = ?", (table_name,))
+        if not cursor.fetchone():
+            tables.append({"name": table_name, "label": label, "count": 0, "columns": [], "sample": []})
+            continue
+        cursor.execute(f'SELECT COUNT(*) FROM "{table_name}"')
+        count = int(cursor.fetchone()[0] or 0)
+        cursor.execute(f'PRAGMA table_info("{table_name}")')
+        columns = [row["name"] for row in cursor.fetchall()]
+        sample = offline_table_rows(table_name, 5) if count else []
+        tables.append({"name": table_name, "label": label, "count": count, "columns": columns, "sample": sample})
+    active_tables = [table for table in tables if table["count"]]
+    return {
+        "summary": {
+            "table_count": len(tables),
+            "active_table_count": len(active_tables),
+            "record_count": sum(table["count"] for table in tables),
+        },
+        "tables": tables,
+    }
+
+
 def public_user(user: dict[str, Any] | None) -> dict[str, Any]:
     if not user:
         return {}
@@ -742,6 +810,22 @@ def create_app():
             }
         )
 
+    @app.get("/api/offline-data")
+    @api_error
+    def offline_data():
+        return jsonify(offline_data_snapshot())
+
+    @app.get("/api/offline-data/<table_name>")
+    @api_error
+    def offline_data_table(table_name):
+        return jsonify(
+            {
+                "name": table_name,
+                "label": OFFLINE_DATA_TABLES.get(table_name, table_name),
+                "rows": offline_table_rows(table_name, int(request.args.get("limit") or 100)),
+            }
+        )
+
     @app.post("/api/settings")
     @api_error
     def save_settings():
@@ -1020,6 +1104,7 @@ INDEX_HTML = r"""<!doctype html>
       <div class="brand"><span class="mark">FT</span><span>FasTrack ERP</span></div>
       <nav>
         <button class="navbtn active" data-view="dashboard">Tổng quan</button>
+        <button class="navbtn" data-view="offlineData">Dữ liệu offline</button>
         <button class="navbtn" data-view="expenses">Chi phí</button>
         <button class="navbtn" data-view="inventory">Vật tư kho</button>
         <button class="navbtn" data-view="projects">Dự án</button>
@@ -1051,6 +1136,26 @@ INDEX_HTML = r"""<!doctype html>
         <div class="grid two">
           <div class="card"><h3>Chi phí theo danh mục</h3><div class="bars" id="categoryBars"></div></div>
           <div class="card"><h3>Cảnh báo tồn kho</h3><div class="tablewrap"><table><thead><tr><th>Mã</th><th>Vật tư</th><th>Tồn</th><th>Min</th></tr></thead><tbody id="lowStockRows"></tbody></table></div></div>
+        </div>
+      </section>
+
+      <section class="view" id="offlineData">
+        <div class="grid kpis">
+          <div class="card kpi"><div class="label">Nhóm dữ liệu</div><div class="value" id="odTables">0</div></div>
+          <div class="card kpi"><div class="label">Nhóm có dữ liệu</div><div class="value" id="odActiveTables">0</div></div>
+          <div class="card kpi"><div class="label">Tổng dòng dữ liệu</div><div class="value" id="odRecords">0</div></div>
+          <div class="card kpi"><div class="label">Bảng đang xem</div><div class="value" id="odCurrent">-</div></div>
+          <div class="card kpi"><div class="label">Dòng preview</div><div class="value" id="odPreviewCount">0</div></div>
+        </div>
+        <div class="grid two">
+          <div class="card">
+            <div class="toolbar"><h3>Kho dữ liệu đã đưa lên web</h3><input class="search" id="offlineSearch" placeholder="Tìm nhóm dữ liệu"></div>
+            <div class="tablewrap"><table><thead><tr><th>Nhóm</th><th>Bảng</th><th>Số dòng</th><th>Xem</th></tr></thead><tbody id="offlineTableRows"></tbody></table></div>
+          </div>
+          <div class="card">
+            <div class="toolbar"><h3 id="offlinePreviewTitle">Preview dữ liệu</h3><button class="secondary" type="button" id="offlineReloadBtn">Tải lại</button></div>
+            <div class="tablewrap"><table id="offlinePreviewTable"><thead id="offlinePreviewHead"></thead><tbody id="offlinePreviewRows"></tbody></table></div>
+          </div>
         </div>
       </section>
 
@@ -1365,17 +1470,19 @@ INDEX_HTML = r"""<!doctype html>
   <div class="toast" id="toast"></div>
 
   <script>
-    const state={auth:null,users:[],dashboard:null,expenses:[],inventory:[],history:[],projects:[],categories:[],projectAccounting:null,workItems:[],diaries:[],documents:[],forms:[],reports:null,finance:null,settings:null};
+    const state={auth:null,users:[],offlineData:null,offlineTable:null,dashboard:null,expenses:[],inventory:[],history:[],projects:[],categories:[],projectAccounting:null,workItems:[],diaries:[],documents:[],forms:[],reports:null,finance:null,settings:null};
     const money=v=>new Intl.NumberFormat('vi-VN',{maximumFractionDigits:0}).format(Number(v||0));
     const esc=v=>String(v??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
     const toast=t=>{const el=document.getElementById('toast');el.textContent=t;el.style.display='block';setTimeout(()=>el.style.display='none',2800)};
     async function api(url,options={}){const token=localStorage.getItem('fastrack_auth_token');options={...options,headers:{...(options.headers||{})}};if(token)options.headers.Authorization=`Bearer ${token}`;const r=await fetch(url,options);const data=await r.json();if(r.status===401){localStorage.removeItem('fastrack_auth_token');showLogin();throw new Error(data.error||'Cần đăng nhập')}if(!r.ok)throw new Error(data.error||'Có lỗi xảy ra');return data}
     function showLogin(){authGate.classList.remove('hidden')}
     function hideLogin(){authGate.classList.add('hidden')}
-    function switchView(id){document.querySelectorAll('.view').forEach(v=>v.classList.toggle('active',v.id===id));document.querySelectorAll('.navbtn').forEach(b=>b.classList.toggle('active',b.dataset.view===id));document.getElementById('pageTitle').textContent={dashboard:'Tổng quan',expenses:'Chi phí',inventory:'Vật tư kho',projects:'Dự án',projectAccounting:'Kế toán công trình',construction:'Công trường',documents:'Chứng từ',forms:'Biểu mẫu',reports:'Báo cáo',finance:'Kiểm soát & tài chính',security:'Bảo mật',settings:'Cài đặt',deploy:'Tên miền'}[id]||'FasTrack ERP';document.getElementById('side').classList.remove('open')}
+    function switchView(id){document.querySelectorAll('.view').forEach(v=>v.classList.toggle('active',v.id===id));document.querySelectorAll('.navbtn').forEach(b=>b.classList.toggle('active',b.dataset.view===id));document.getElementById('pageTitle').textContent={dashboard:'Tổng quan',offlineData:'Dữ liệu offline',expenses:'Chi phí',inventory:'Vật tư kho',projects:'Dự án',projectAccounting:'Kế toán công trình',construction:'Công trường',documents:'Chứng từ',forms:'Biểu mẫu',reports:'Báo cáo',finance:'Kiểm soát & tài chính',security:'Bảo mật',settings:'Cài đặt',deploy:'Tên miền'}[id]||'FasTrack ERP';document.getElementById('side').classList.remove('open')}
     async function boot(){const me=await api('/api/auth/me');state.auth=me.user||null;if(!me.authenticated){showLogin();return}hideLogin();userChip.textContent=`${state.auth.full_name||state.auth.username} · ${state.auth.role}`;await loadAll()}
-    async function loadAll(){await Promise.all([loadDashboard(),loadCatalogs(),loadExpenses(),loadInventory(),loadProjects(),loadProjectAccounting(),loadConstruction(),loadDocuments(),loadForms(),loadReports(),loadFinance(),loadSettings(),loadUsers()])}
+    async function loadAll(){await Promise.all([loadDashboard(),loadOfflineData(),loadCatalogs(),loadExpenses(),loadInventory(),loadProjects(),loadProjectAccounting(),loadConstruction(),loadDocuments(),loadForms(),loadReports(),loadFinance(),loadSettings(),loadUsers()])}
     async function loadDashboard(){state.dashboard=await api('/api/dashboard');renderDashboard()}
+    async function loadOfflineData(){state.offlineData=await api('/api/offline-data');renderOfflineData()}
+    async function loadOfflineTable(name){state.offlineTable=await api(`/api/offline-data/${encodeURIComponent(name)}?limit=100`);renderOfflinePreview()}
     async function loadCatalogs(){const [projects,categories]=await Promise.all([api('/api/projects'),api('/api/categories')]);state.projects=projects;state.categories=categories;fillSelects();renderProjects()}
     async function loadExpenses(){state.expenses=await api('/api/expenses');renderExpenses()}
     async function loadInventory(){const [items,history]=await Promise.all([api('/api/inventory'),api('/api/inventory/history')]);state.inventory=items;state.history=history;renderInventory()}
@@ -1390,6 +1497,8 @@ INDEX_HTML = r"""<!doctype html>
     async function loadUsers(){try{state.users=await api('/api/users');renderUsers()}catch(err){state.users=[];renderUsers(err.message)}}
     function fillSelects(){const projectOptions='<option value="">Không gắn dự án</option>'+state.projects.map(p=>`<option value="${p.id}">${esc(p.code)} - ${esc(p.name)}</option>`).join('');const requiredProjectOptions=state.projects.map(p=>`<option value="${p.id}">${esc(p.code)} - ${esc(p.name)}</option>`).join('');const categoryOptions=state.categories.map(c=>`<option value="${c.id}">${esc(c.code)} - ${esc(c.name)}</option>`).join('');expenseProject.innerHTML=projectOptions;diaryProject.innerHTML=projectOptions;documentProject.innerHTML=projectOptions;contractProject.innerHTML=requiredProjectOptions;costPlanProject.innerHTML=requiredProjectOptions;revenueProject.innerHTML=requiredProjectOptions;expenseCategory.innerHTML=categoryOptions;documentCategory.innerHTML='<option value="">Chọn danh mục</option>'+categoryOptions;costPlanCategory.innerHTML=categoryOptions;fillContractSelects()}
     function fillContractSelects(){const rows=(state.projectAccounting&&state.projectAccounting.contracts)||[];const options='<option value="">Chọn hợp đồng</option>'+rows.map(c=>`<option value="${c.id}">${esc(c.contract_no)} - ${esc(c.partner_name)}</option>`).join('');if(typeof billingContract!=='undefined'){billingContract.innerHTML=options;revenueContract.innerHTML=options}}
+    function renderOfflineData(){const d=state.offlineData||{},s=d.summary||{};odTables.textContent=s.table_count||0;odActiveTables.textContent=s.active_table_count||0;odRecords.textContent=money(s.record_count);const q=(offlineSearch.value||'').toLowerCase();const tables=(d.tables||[]).filter(t=>JSON.stringify(t).toLowerCase().includes(q));offlineTableRows.innerHTML=tables.map(t=>`<tr><td><strong>${esc(t.label)}</strong></td><td>${esc(t.name)}</td><td class="num">${money(t.count)}</td><td><button class="secondary" type="button" data-offline-table="${esc(t.name)}">Xem</button></td></tr>`).join('')||'<tr><td colspan="4" class="empty">Chưa có dữ liệu.</td></tr>';document.querySelectorAll('[data-offline-table]').forEach(btn=>btn.addEventListener('click',()=>loadOfflineTable(btn.dataset.offlineTable)));if(!state.offlineTable&&tables.length){loadOfflineTable(tables.find(t=>t.count)?.name||tables[0].name)}}
+    function renderOfflinePreview(){const t=state.offlineTable||{},rows=t.rows||[],columns=[...new Set(rows.flatMap(r=>Object.keys(r)))].slice(0,10);offlinePreviewTitle.textContent=`Preview: ${t.label||t.name||''}`;odCurrent.textContent=t.name||'-';odPreviewCount.textContent=rows.length||0;offlinePreviewHead.innerHTML=columns.length?`<tr>${columns.map(c=>`<th>${esc(c)}</th>`).join('')}</tr>`:'';offlinePreviewRows.innerHTML=rows.map(r=>`<tr>${columns.map(c=>`<td>${esc(String(r[c]??'').slice(0,90))}</td>`).join('')}</tr>`).join('')||'<tr><td class="empty">Không có dòng dữ liệu.</td></tr>'}
     function renderDashboard(){const d=state.dashboard||{},s=d.stats||{};kTotal.textContent=money(s.total_expenses);kMonth.textContent=money(s.monthly_expenses);kProjects.textContent=s.total_projects||0;kDocs.textContent=s.total_documents||0;kStock.textContent=money(d.stock_value);const max=Math.max(1,...(d.categories||[]).map(x=>x.total||0));categoryBars.innerHTML=(d.categories||[]).map(x=>`<div class="barrow"><strong>${esc(x.name)}</strong><div class="bar"><div class="fill" style="width:${Math.round((x.total||0)/max*100)}%"></div></div><span class="num">${money(x.total)}</span></div>`).join('')||'<div class="empty">Chưa có dữ liệu chi phí.</div>';lowStockRows.innerHTML=(d.low_stock||[]).map(x=>`<tr><td>${esc(x.code)}</td><td>${esc(x.name)}</td><td class="num">${money(x.quantity)} ${esc(x.unit)}</td><td class="num">${money(x.min_quantity)}</td></tr>`).join('')||'<tr><td colspan="4" class="empty">Không có cảnh báo tồn kho.</td></tr>'}
     function renderExpenses(){const q=(expenseSearch.value||'').toLowerCase();const rows=state.expenses.filter(e=>JSON.stringify(e).toLowerCase().includes(q));expenseRows.innerHTML=rows.map(e=>`<tr><td>${esc(e.expense_date)}</td><td>${esc(e.project_name||'')}</td><td>${esc(e.category_name||'')}</td><td>${esc(e.description||'')}</td><td class="num">${money(e.amount)}</td><td><span class="status">${esc(e.status)}</span></td></tr>`).join('')||'<tr><td colspan="6" class="empty">Chưa có chi phí.</td></tr>'}
     function renderInventory(){const q=(inventorySearch.value||'').toLowerCase();const rows=state.inventory.filter(i=>JSON.stringify(i).toLowerCase().includes(q));inventoryRows.innerHTML=rows.map(i=>`<tr><td>${esc(i.code)}</td><td>${esc(i.name)}</td><td>${esc(i.category)}</td><td class="num">${money(i.quantity)} ${esc(i.unit)}</td><td class="num">${money(i.unit_price)}</td><td><span class="status">${esc(i.status)}</span></td></tr>`).join('')||'<tr><td colspan="6" class="empty">Chưa có vật tư.</td></tr>';historyRows.innerHTML=state.history.map(h=>`<tr><td>${esc(h.transaction_date)}</td><td>${esc(h.code)}</td><td>${esc(h.name)}</td><td>${esc(h.transaction_type)}</td><td class="num">${money(h.quantity)}</td><td>${esc(h.notes)}</td></tr>`).join('')||'<tr><td colspan="6" class="empty">Chưa có giao dịch kho.</td></tr>'}
@@ -1409,6 +1518,7 @@ INDEX_HTML = r"""<!doctype html>
     loginForm.addEventListener('submit',async e=>{e.preventDefault();const data=Object.fromEntries(new FormData(loginForm).entries());try{const r=await api('/api/auth/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});if(r.token)localStorage.setItem('fastrack_auth_token',r.token);state.auth=r.user;hideLogin();userChip.textContent=`${state.auth.full_name||state.auth.username} · ${state.auth.role}`;loginForm.reset();await loadAll();toast('Đã đăng nhập')}catch(err){toast(err.message)}});
     logoutBtn.addEventListener('click',async()=>{try{await api('/api/auth/logout',{method:'POST'});}catch(err){}localStorage.removeItem('fastrack_auth_token');state.auth=null;userChip.textContent='Chưa đăng nhập';showLogin()});
     reloadUsersBtn.addEventListener('click',()=>loadUsers());
+    offlineSearch.addEventListener('input',renderOfflineData);offlineReloadBtn.addEventListener('click',()=>loadOfflineData());
     expenseSearch.addEventListener('input',renderExpenses);inventorySearch.addEventListener('input',renderInventory);contractSearch.addEventListener('input',renderProjectAccounting);documentSearch.addEventListener('input',renderDocuments);formSearch.addEventListener('input',renderForms);financeSearch.addEventListener('input',renderFinance);
     expenseForm.expense_date.value=new Date().toISOString().slice(0,10);
     diaryForm.diary_date.value=new Date().toISOString().slice(0,10);
