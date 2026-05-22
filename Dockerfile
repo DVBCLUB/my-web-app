@@ -16,4 +16,4 @@ RUN chmod +x /app/docker-entrypoint.sh
 EXPOSE 8080
 
 ENTRYPOINT ["/app/docker-entrypoint.sh"]
-CMD exec gunicorn --bind :${PORT:-8080} --workers 2 --threads 8 --timeout 120 "web_app:create_app()"
+CMD ["gunicorn", "--bind", ":8080", "--workers", "2", "--threads", "8", "--timeout", "120", "web_app:create_app()"]
