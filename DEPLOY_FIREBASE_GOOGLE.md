@@ -1,64 +1,81 @@
-# Deploy FasTrack ERP Web lên Firebase + Google Cloud Run
+# Deploy FasTrack ERP Web len Firebase + Google Cloud Run
 
-Ứng dụng này là Flask nên Firebase Hosting sẽ làm domain/HTTPS và rewrite toàn bộ request sang Cloud Run.
+Ung dung nay la Flask nen Firebase Hosting lam domain/HTTPS va rewrite toan bo request sang Cloud Run.
 
-## 1. Chuẩn bị
+Project dang dung:
+
+- Google/Firebase project: `fastrackerp-6fd5e`
+- Cloud Run service: `fastrack-erp-web`
+- Region: `asia-southeast1`
+- Firebase Hosting: `https://fastrackerp-6fd5e.web.app`
+- Cloud Run URL: `https://fastrack-erp-web-538927184603.asia-southeast1.run.app`
+
+## 1. Chuan bi local
 
 ```powershell
 gcloud auth login
 firebase login
-gcloud config set project YOUR_PROJECT_ID
-firebase use --add
+gcloud config set project fastrackerp-6fd5e
 ```
 
-Bật các API:
+Bat cac API:
 
 ```powershell
-gcloud services enable run.googleapis.com cloudbuild.googleapis.com artifactregistry.googleapis.com
+gcloud services enable run.googleapis.com cloudbuild.googleapis.com artifactregistry.googleapis.com firebasehosting.googleapis.com
 ```
 
-Tạo Artifact Registry:
+Tao Artifact Registry neu chua co:
 
 ```powershell
 gcloud artifacts repositories create fastrack --repository-format=docker --location=asia-southeast1
 ```
 
-## 2. Build và deploy Cloud Run
+## 2. Build va deploy Cloud Run
 
 ```powershell
-gcloud builds submit --config cloudbuild.yaml
+gcloud builds submit --config cloudbuild.yaml --substitutions _SERVICE=fastrack-erp-web
 ```
 
-## 3. Deploy Firebase Hosting rewrite
+Neu can mo public access:
 
 ```powershell
-firebase deploy --only hosting
+gcloud run services add-iam-policy-binding fastrack-erp-web --region=asia-southeast1 --member=allUsers --role=roles/run.invoker
 ```
 
-Sau khi deploy, Firebase cấp URL miễn phí dạng:
+## 3. Deploy Firebase Hosting
 
-- `https://YOUR_PROJECT_ID.web.app`
-- `https://YOUR_PROJECT_ID.firebaseapp.com`
+```powershell
+firebase deploy --only hosting --project fastrackerp-6fd5e
+```
 
-## 4. Gắn tên miền
+Firebase cap URL mien phi:
 
-Vào Firebase Console -> Hosting -> Add custom domain, rồi làm theo DNS record Firebase đưa ra.
+- `https://fastrackerp-6fd5e.web.app`
+- `https://fastrackerp-6fd5e.firebaseapp.com`
 
-## Lưu ý dữ liệu
+## 4. Gan ten mien rieng
 
-Bản deploy này copy `PythonApplication1/data/accounting.db` từ repo sang `/tmp/fastrack/accounting.db` khi container khởi động. Như vậy web demo có dữ liệu ban đầu từ GitHub.
-
-Dữ liệu ghi mới trên Cloud Run vẫn là tạm thời vì `/tmp` có thể mất khi instance bị thay. Để vận hành kế toán thật cần chuyển persistence sang Cloud SQL hoặc Firestore/Cloud Storage theo nghiệp vụ.
+Vao Firebase Console -> Hosting -> Add custom domain, roi lam theo DNS record Firebase dua ra.
 
 ## 5. GitHub Actions
 
-Workflow `.github/workflows/deploy-google-firebase.yml` sẽ tự deploy khi push vào `main`.
+Workflow `.github/workflows/deploy-google-firebase.yml` se tu deploy khi push vao `main` sau khi repository co cac secrets:
 
-Tạo các GitHub repository secrets:
-
-- `GCP_PROJECT_ID`
-- `FIREBASE_PROJECT_ID`
+- `GCP_PROJECT_ID`: `fastrackerp-6fd5e`
+- `FIREBASE_PROJECT_ID`: `fastrackerp-6fd5e`
 - `GCP_WORKLOAD_IDENTITY_PROVIDER`
 - `GCP_SERVICE_ACCOUNT`
 
-Service account cần quyền tối thiểu cho Cloud Build, Cloud Run, Artifact Registry và Firebase Hosting deploy.
+Service account can quyen toi thieu:
+
+- `roles/cloudbuild.builds.editor`
+- `roles/run.admin`
+- `roles/artifactregistry.admin`
+- `roles/firebasehosting.admin`
+- `roles/iam.serviceAccountUser`
+
+## 6. Luu y du lieu
+
+Ban deploy hien tai copy `PythonApplication1/data/accounting.db` tu repo sang `/tmp/fastrack/accounting.db` khi container khoi dong, phu hop de demo va dung ban dau.
+
+Du lieu ghi moi tren Cloud Run van la tam thoi vi `/tmp` co the mat khi instance bi thay. De van hanh ke toan that, nen chuyen persistence sang Cloud SQL hoac Firestore/Cloud Storage theo nghiep vu.
