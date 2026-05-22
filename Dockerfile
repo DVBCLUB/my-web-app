@@ -10,10 +10,7 @@ COPY PythonApplication1/requirements.txt /app/PythonApplication1/requirements.tx
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY PythonApplication1 /app/PythonApplication1
-COPY docker-entrypoint.sh /app/docker-entrypoint.sh
-RUN chmod +x /app/docker-entrypoint.sh
 
 EXPOSE 8080
 
-ENTRYPOINT ["/app/docker-entrypoint.sh"]
-CMD ["gunicorn", "--bind", ":8080", "--workers", "2", "--threads", "8", "--timeout", "120", "web_app:create_app()"]
+CMD ["/bin/sh", "-c", "mkdir -p /tmp/fastrack && if [ ! -f \"$ACCOUNTING_DB_PATH\" ] && [ -f /app/PythonApplication1/data/accounting.db ]; then cp /app/PythonApplication1/data/accounting.db \"$ACCOUNTING_DB_PATH\"; fi && exec gunicorn --bind :8080 --workers 2 --threads 8 --timeout 120 'web_app:create_app()'"]
