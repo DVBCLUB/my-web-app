@@ -28,6 +28,7 @@ from modules.fiscal_lock import FiscalPeriodLockManager
 from modules.invoices import DocumentManager
 from modules.materials import MaterialManager
 from modules.notification_center import NotificationCenter
+from modules.project_accounting import ProjectAccountingManager
 from modules.template_renderer import TemplateRenderer
 from modules.utilities import UtilityManager
 
@@ -41,6 +42,10 @@ def row_to_dict(row: Any, keys: list[str] | tuple[str, ...] | None = None) -> di
     if keys:
         return {key: row[index] if index < len(row) else None for index, key in enumerate(keys)}
     return {str(index): value for index, value in enumerate(row)}
+
+
+def row_to_named_dict(row: Any, keys: list[str] | tuple[str, ...]) -> dict[str, Any]:
+    return {key: row[index] if index < len(row) else None for index, key in enumerate(keys)}
 
 
 class WebReportGenerator:
@@ -668,6 +673,137 @@ def create_app():
         matched = BankReconciliationManager().auto_match_bank_transactions()
         return jsonify({"matched": matched})
 
+    @app.get("/api/project-accounting")
+    @api_error
+    def project_accounting():
+        mgr = ProjectAccountingManager()
+        project_id = request.args.get("project_id") or None
+        return jsonify(
+            {
+                "dashboard": mgr.get_global_dashboard(),
+                "contracts": [
+                    row_to_named_dict(
+                        row,
+                        (
+                            "id",
+                            "project_code",
+                            "project_name",
+                            "contract_type",
+                            "contract_no",
+                            "partner_name",
+                            "signed_date",
+                            "contract_value",
+                            "vat_rate",
+                            "retention_rate",
+                            "advance_received",
+                            "advance_paid",
+                            "start_date",
+                            "end_date",
+                            "status",
+                            "notes",
+                            "billed",
+                        ),
+                    )
+                    for row in mgr.get_contracts(project_id=project_id)
+                ],
+                "billings": [
+                    row_to_named_dict(
+                        row,
+                        (
+                            "id",
+                            "contract_no",
+                            "partner_name",
+                            "contract_type",
+                            "billing_date",
+                            "milestone_name",
+                            "quantity_or_percent",
+                            "amount_before_vat",
+                            "vat_amount",
+                            "retention_amount",
+                            "net_amount",
+                            "status",
+                            "notes",
+                            "project_code",
+                            "project_name",
+                        ),
+                    )
+                    for row in mgr.get_billings(project_id=project_id)
+                ],
+                "revenues": [
+                    row_to_named_dict(
+                        row,
+                        ("id", "project_code", "project_name", "contract_no", "revenue_date", "amount", "vat_amount", "description"),
+                    )
+                    for row in mgr.get_revenues(project_id=project_id)
+                ],
+                "cost_plan_actual": [
+                    row_to_named_dict(row, ("project_code", "project_name", "category", "planned", "actual"))
+                    for row in mgr.get_cost_plan_vs_actual_report(project_id=project_id)
+                ],
+                "project_pl": mgr.get_project_pl_report(project_id=project_id),
+                "contract_progress": [
+                    row_to_named_dict(
+                        row,
+                        ("project_code", "project_name", "contract_no", "partner_name", "contract_type", "contract_value", "billed", "remaining"),
+                    )
+                    for row in mgr.get_contract_progress_report(project_id=project_id)
+                ],
+                "subcontracts": [
+                    row_to_named_dict(
+                        row,
+                        (
+                            "project_code",
+                            "project_name",
+                            "contract_id",
+                            "contract_no",
+                            "partner_name",
+                            "contract_value",
+                            "performed_value",
+                            "remaining",
+                            "active_bonds",
+                            "active_warranties",
+                        ),
+                    )
+                    for row in mgr.get_subcontract_control_report(project_id=project_id)
+                ],
+                "wip": mgr.get_wip_summary(project_id=project_id),
+            }
+        )
+
+    @app.post("/api/project-accounting/contracts")
+    @api_error
+    def save_project_contract():
+        data = request.get_json(force=True)
+        contract_id = ProjectAccountingManager().save_contract(data)
+        return jsonify({"id": contract_id, "status": "saved"})
+
+    @app.post("/api/project-accounting/billings")
+    @api_error
+    def save_project_billing():
+        data = request.get_json(force=True)
+        create_revenue = bool(int(data.pop("create_revenue", 0) or 0))
+        billing_id = ProjectAccountingManager().save_billing(data, create_revenue=create_revenue)
+        return jsonify({"id": billing_id, "status": "saved"})
+
+    @app.post("/api/project-accounting/revenues")
+    @api_error
+    def save_project_revenue():
+        data = request.get_json(force=True)
+        revenue_id = ProjectAccountingManager().save_revenue(data)
+        return jsonify({"id": revenue_id, "status": "saved"})
+
+    @app.post("/api/project-accounting/cost-plans")
+    @api_error
+    def save_project_cost_plan():
+        data = request.get_json(force=True)
+        plan_id = ProjectAccountingManager().save_cost_plan(
+            data["project_id"],
+            data["category_id"],
+            float(data.get("planned_amount") or 0),
+            data.get("notes", ""),
+        )
+        return jsonify({"id": plan_id, "status": "saved"})
+
     @app.get("/api/advances/pending")
     @api_error
     def pending_advances():
@@ -704,6 +840,7 @@ INDEX_HTML = r"""<!doctype html>
         <button class="navbtn" data-view="expenses">Chi phí</button>
         <button class="navbtn" data-view="inventory">Vật tư kho</button>
         <button class="navbtn" data-view="projects">Dự án</button>
+        <button class="navbtn" data-view="projectAccounting">Kế toán công trình</button>
         <button class="navbtn" data-view="construction">Công trường</button>
         <button class="navbtn" data-view="documents">Chứng từ</button>
         <button class="navbtn" data-view="forms">Biểu mẫu</button>
@@ -777,6 +914,84 @@ INDEX_HTML = r"""<!doctype html>
           </form>
         </div>
         <div class="card"><h3>Danh sách dự án</h3><div class="tablewrap"><table><thead><tr><th>Mã</th><th>Tên dự án</th><th>Địa điểm</th><th>Ngân sách</th><th>TT</th></tr></thead><tbody id="projectRows"></tbody></table></div></div>
+      </section>
+
+      <section class="view" id="projectAccounting">
+        <div class="grid kpis">
+          <div class="card kpi"><div class="label">Dự án active</div><div class="value" id="paActive">0</div></div>
+          <div class="card kpi"><div class="label">Dự toán</div><div class="value" id="paPlanned">0</div></div>
+          <div class="card kpi"><div class="label">Chi phí thực tế</div><div class="value" id="paSpent">0</div></div>
+          <div class="card kpi"><div class="label">Doanh thu</div><div class="value" id="paRevenue">0</div></div>
+          <div class="card kpi"><div class="label">Lãi/lỗ</div><div class="value" id="paProfit">0</div></div>
+        </div>
+        <div class="grid two">
+          <div class="card">
+            <h3>Hợp đồng công trình</h3>
+            <form class="form" id="contractForm">
+              <label>Dự án<select name="project_id" id="contractProject"></select></label>
+              <label>Loại<select name="contract_type"><option value="customer">Chủ đầu tư</option><option value="subcontract">Thầu phụ</option><option value="supplier">Nhà cung cấp</option></select></label>
+              <label>Số hợp đồng<input name="contract_no" required></label>
+              <label>Đối tác<input name="partner_name" required></label>
+              <label>Ngày ký<input name="signed_date" type="date"></label>
+              <label>Giá trị<input name="contract_value" type="number" min="0" step="1000000"></label>
+              <label>VAT %<input name="vat_rate" type="number" min="0" step="1" value="10"></label>
+              <label>Giữ lại %<input name="retention_rate" type="number" min="0" step="1" value="5"></label>
+              <label>Trạng thái<select name="status"><option value="active">active</option><option value="completed">completed</option><option value="paused">paused</option></select></label>
+              <label class="wide">Ghi chú<textarea name="notes"></textarea></label>
+              <div class="wide actions"><button class="primary" type="submit">Lưu hợp đồng</button></div>
+            </form>
+          </div>
+          <div class="card">
+            <h3>Dự toán chi phí</h3>
+            <form class="form" id="costPlanForm">
+              <label>Dự án<select name="project_id" id="costPlanProject"></select></label>
+              <label>Danh mục<select name="category_id" id="costPlanCategory"></select></label>
+              <label>Ngân sách<input name="planned_amount" type="number" min="0" step="1000000"></label>
+              <label class="wide">Ghi chú<textarea name="notes"></textarea></label>
+              <div class="wide actions"><button class="primary" type="submit">Lưu dự toán</button></div>
+            </form>
+          </div>
+        </div>
+        <div class="grid two">
+          <div class="card">
+            <h3>Nghiệm thu / billing</h3>
+            <form class="form" id="billingForm">
+              <label>Hợp đồng<select name="contract_id" id="billingContract"></select></label>
+              <label>Ngày nghiệm thu<input name="billing_date" type="date"></label>
+              <label>Mốc nghiệm thu<input name="milestone_name"></label>
+              <label>Giá trị trước VAT<input name="amount_before_vat" type="number" min="0" step="1000000"></label>
+              <label>VAT %<input name="vat_rate" type="number" min="0" step="1" value="10"></label>
+              <label>Giữ lại %<input name="retention_rate" type="number" min="0" step="1" value="5"></label>
+              <label>Trạng thái<select name="status"><option value="draft">draft</option><option value="approved">approved</option><option value="paid">paid</option></select></label>
+              <label>Tạo doanh thu<select name="create_revenue"><option value="0">Không</option><option value="1">Có</option></select></label>
+              <div class="wide actions"><button class="primary" type="submit">Lưu nghiệm thu</button></div>
+            </form>
+          </div>
+          <div class="card">
+            <h3>Ghi nhận doanh thu</h3>
+            <form class="form" id="revenueForm">
+              <label>Dự án<select name="project_id" id="revenueProject"></select></label>
+              <label>Hợp đồng<select name="contract_id" id="revenueContract"></select></label>
+              <label>Ngày doanh thu<input name="revenue_date" type="date"></label>
+              <label>Doanh thu<input name="amount" type="number" min="0" step="1000000"></label>
+              <label>VAT<input name="vat_amount" type="number" min="0" step="100000"></label>
+              <label class="wide">Diễn giải<textarea name="description"></textarea></label>
+              <div class="wide actions"><button class="primary" type="submit">Lưu doanh thu</button></div>
+            </form>
+          </div>
+        </div>
+        <div class="card">
+          <div class="toolbar"><h3>Danh sách hợp đồng</h3><input class="search" id="contractSearch" placeholder="Tìm hợp đồng"></div>
+          <div class="tablewrap"><table><thead><tr><th>Dự án</th><th>Loại</th><th>Số HĐ</th><th>Đối tác</th><th>Giá trị</th><th>Đã nghiệm thu</th><th>TT</th></tr></thead><tbody id="contractRows"></tbody></table></div>
+        </div>
+        <div class="grid two">
+          <div class="card"><h3>Nghiệm thu gần đây</h3><div class="tablewrap"><table><thead><tr><th>Ngày</th><th>HĐ</th><th>Mốc</th><th>Net</th><th>TT</th></tr></thead><tbody id="billingRows"></tbody></table></div></div>
+          <div class="card"><h3>Doanh thu dự án</h3><div class="tablewrap"><table><thead><tr><th>Ngày</th><th>Dự án</th><th>HĐ</th><th>Doanh thu</th><th>VAT</th></tr></thead><tbody id="revenueRows"></tbody></table></div></div>
+        </div>
+        <div class="grid two">
+          <div class="card"><h3>Dự toán vs thực tế</h3><div class="tablewrap"><table><thead><tr><th>Dự án</th><th>Danh mục</th><th>Dự toán</th><th>Thực tế</th><th>Chênh lệch</th></tr></thead><tbody id="costPlanRows"></tbody></table></div></div>
+          <div class="card"><h3>P/L công trình</h3><div class="tablewrap"><table><thead><tr><th>Dự án</th><th>Doanh thu</th><th>Chi phí</th><th>Lãi/lỗ</th></tr></thead><tbody id="projectPlRows"></tbody></table></div></div>
+        </div>
       </section>
 
       <section class="view" id="construction">
@@ -937,29 +1152,32 @@ INDEX_HTML = r"""<!doctype html>
   <div class="toast" id="toast"></div>
 
   <script>
-    const state={dashboard:null,expenses:[],inventory:[],history:[],projects:[],categories:[],workItems:[],diaries:[],documents:[],forms:[],reports:null,finance:null,settings:null};
+    const state={dashboard:null,expenses:[],inventory:[],history:[],projects:[],categories:[],projectAccounting:null,workItems:[],diaries:[],documents:[],forms:[],reports:null,finance:null,settings:null};
     const money=v=>new Intl.NumberFormat('vi-VN',{maximumFractionDigits:0}).format(Number(v||0));
     const esc=v=>String(v??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
     const toast=t=>{const el=document.getElementById('toast');el.textContent=t;el.style.display='block';setTimeout(()=>el.style.display='none',2800)};
     async function api(url,options){const r=await fetch(url,options);const data=await r.json();if(!r.ok)throw new Error(data.error||'Có lỗi xảy ra');return data}
-    function switchView(id){document.querySelectorAll('.view').forEach(v=>v.classList.toggle('active',v.id===id));document.querySelectorAll('.navbtn').forEach(b=>b.classList.toggle('active',b.dataset.view===id));document.getElementById('pageTitle').textContent={dashboard:'Tổng quan',expenses:'Chi phí',inventory:'Vật tư kho',projects:'Dự án',construction:'Công trường',documents:'Chứng từ',forms:'Biểu mẫu',reports:'Báo cáo',finance:'Kiểm soát & tài chính',settings:'Cài đặt',deploy:'Tên miền'}[id]||'FasTrack ERP';document.getElementById('side').classList.remove('open')}
-    async function loadAll(){await Promise.all([loadDashboard(),loadCatalogs(),loadExpenses(),loadInventory(),loadProjects(),loadConstruction(),loadDocuments(),loadForms(),loadReports(),loadFinance(),loadSettings()])}
+    function switchView(id){document.querySelectorAll('.view').forEach(v=>v.classList.toggle('active',v.id===id));document.querySelectorAll('.navbtn').forEach(b=>b.classList.toggle('active',b.dataset.view===id));document.getElementById('pageTitle').textContent={dashboard:'Tổng quan',expenses:'Chi phí',inventory:'Vật tư kho',projects:'Dự án',projectAccounting:'Kế toán công trình',construction:'Công trường',documents:'Chứng từ',forms:'Biểu mẫu',reports:'Báo cáo',finance:'Kiểm soát & tài chính',settings:'Cài đặt',deploy:'Tên miền'}[id]||'FasTrack ERP';document.getElementById('side').classList.remove('open')}
+    async function loadAll(){await Promise.all([loadDashboard(),loadCatalogs(),loadExpenses(),loadInventory(),loadProjects(),loadProjectAccounting(),loadConstruction(),loadDocuments(),loadForms(),loadReports(),loadFinance(),loadSettings()])}
     async function loadDashboard(){state.dashboard=await api('/api/dashboard');renderDashboard()}
     async function loadCatalogs(){const [projects,categories]=await Promise.all([api('/api/projects'),api('/api/categories')]);state.projects=projects;state.categories=categories;fillSelects();renderProjects()}
     async function loadExpenses(){state.expenses=await api('/api/expenses');renderExpenses()}
     async function loadInventory(){const [items,history]=await Promise.all([api('/api/inventory'),api('/api/inventory/history')]);state.inventory=items;state.history=history;renderInventory()}
     async function loadProjects(){state.projects=await api('/api/projects');fillSelects();renderProjects()}
+    async function loadProjectAccounting(){state.projectAccounting=await api('/api/project-accounting');renderProjectAccounting()}
     async function loadConstruction(){const [workItems,diaries]=await Promise.all([api('/api/construction/work-items'),api('/api/construction/diaries')]);state.workItems=workItems;state.diaries=diaries;renderConstruction()}
     async function loadDocuments(){state.documents=await api('/api/documents');renderDocuments()}
     async function loadForms(){state.forms=await api('/api/forms');renderForms()}
     async function loadReports(){state.reports=await api('/api/reports/summary');renderReports()}
     async function loadFinance(){state.finance=await api('/api/finance-center');renderFinance()}
     async function loadSettings(){state.settings=await api('/api/settings');renderSettings()}
-    function fillSelects(){const projectOptions='<option value="">Không gắn dự án</option>'+state.projects.map(p=>`<option value="${p.id}">${esc(p.code)} - ${esc(p.name)}</option>`).join('');const categoryOptions=state.categories.map(c=>`<option value="${c.id}">${esc(c.code)} - ${esc(c.name)}</option>`).join('');expenseProject.innerHTML=projectOptions;diaryProject.innerHTML=projectOptions;documentProject.innerHTML=projectOptions;expenseCategory.innerHTML=categoryOptions;documentCategory.innerHTML='<option value="">Chọn danh mục</option>'+categoryOptions}
+    function fillSelects(){const projectOptions='<option value="">Không gắn dự án</option>'+state.projects.map(p=>`<option value="${p.id}">${esc(p.code)} - ${esc(p.name)}</option>`).join('');const requiredProjectOptions=state.projects.map(p=>`<option value="${p.id}">${esc(p.code)} - ${esc(p.name)}</option>`).join('');const categoryOptions=state.categories.map(c=>`<option value="${c.id}">${esc(c.code)} - ${esc(c.name)}</option>`).join('');expenseProject.innerHTML=projectOptions;diaryProject.innerHTML=projectOptions;documentProject.innerHTML=projectOptions;contractProject.innerHTML=requiredProjectOptions;costPlanProject.innerHTML=requiredProjectOptions;revenueProject.innerHTML=requiredProjectOptions;expenseCategory.innerHTML=categoryOptions;documentCategory.innerHTML='<option value="">Chọn danh mục</option>'+categoryOptions;costPlanCategory.innerHTML=categoryOptions;fillContractSelects()}
+    function fillContractSelects(){const rows=(state.projectAccounting&&state.projectAccounting.contracts)||[];const options='<option value="">Chọn hợp đồng</option>'+rows.map(c=>`<option value="${c.id}">${esc(c.contract_no)} - ${esc(c.partner_name)}</option>`).join('');if(typeof billingContract!=='undefined'){billingContract.innerHTML=options;revenueContract.innerHTML=options}}
     function renderDashboard(){const d=state.dashboard||{},s=d.stats||{};kTotal.textContent=money(s.total_expenses);kMonth.textContent=money(s.monthly_expenses);kProjects.textContent=s.total_projects||0;kDocs.textContent=s.total_documents||0;kStock.textContent=money(d.stock_value);const max=Math.max(1,...(d.categories||[]).map(x=>x.total||0));categoryBars.innerHTML=(d.categories||[]).map(x=>`<div class="barrow"><strong>${esc(x.name)}</strong><div class="bar"><div class="fill" style="width:${Math.round((x.total||0)/max*100)}%"></div></div><span class="num">${money(x.total)}</span></div>`).join('')||'<div class="empty">Chưa có dữ liệu chi phí.</div>';lowStockRows.innerHTML=(d.low_stock||[]).map(x=>`<tr><td>${esc(x.code)}</td><td>${esc(x.name)}</td><td class="num">${money(x.quantity)} ${esc(x.unit)}</td><td class="num">${money(x.min_quantity)}</td></tr>`).join('')||'<tr><td colspan="4" class="empty">Không có cảnh báo tồn kho.</td></tr>'}
     function renderExpenses(){const q=(expenseSearch.value||'').toLowerCase();const rows=state.expenses.filter(e=>JSON.stringify(e).toLowerCase().includes(q));expenseRows.innerHTML=rows.map(e=>`<tr><td>${esc(e.expense_date)}</td><td>${esc(e.project_name||'')}</td><td>${esc(e.category_name||'')}</td><td>${esc(e.description||'')}</td><td class="num">${money(e.amount)}</td><td><span class="status">${esc(e.status)}</span></td></tr>`).join('')||'<tr><td colspan="6" class="empty">Chưa có chi phí.</td></tr>'}
     function renderInventory(){const q=(inventorySearch.value||'').toLowerCase();const rows=state.inventory.filter(i=>JSON.stringify(i).toLowerCase().includes(q));inventoryRows.innerHTML=rows.map(i=>`<tr><td>${esc(i.code)}</td><td>${esc(i.name)}</td><td>${esc(i.category)}</td><td class="num">${money(i.quantity)} ${esc(i.unit)}</td><td class="num">${money(i.unit_price)}</td><td><span class="status">${esc(i.status)}</span></td></tr>`).join('')||'<tr><td colspan="6" class="empty">Chưa có vật tư.</td></tr>';historyRows.innerHTML=state.history.map(h=>`<tr><td>${esc(h.transaction_date)}</td><td>${esc(h.code)}</td><td>${esc(h.name)}</td><td>${esc(h.transaction_type)}</td><td class="num">${money(h.quantity)}</td><td>${esc(h.notes)}</td></tr>`).join('')||'<tr><td colspan="6" class="empty">Chưa có giao dịch kho.</td></tr>'}
     function renderProjects(){projectRows.innerHTML=state.projects.map(p=>`<tr><td>${esc(p.code)}</td><td>${esc(p.name)}</td><td>${esc(p.location)}</td><td class="num">${money(p.budget)}</td><td><span class="status">${esc(p.status)}</span></td></tr>`).join('')||'<tr><td colspan="5" class="empty">Chưa có dự án.</td></tr>'}
+    function renderProjectAccounting(){const pa=state.projectAccounting||{},d=pa.dashboard||{};paActive.textContent=d.active_projects||0;paPlanned.textContent=money(d.total_planned);paSpent.textContent=money(d.total_spent);paRevenue.textContent=money(d.total_revenue);paProfit.textContent=money(d.profit);fillContractSelects();const q=(contractSearch.value||'').toLowerCase();const contracts=(pa.contracts||[]).filter(c=>JSON.stringify(c).toLowerCase().includes(q));contractRows.innerHTML=contracts.map(c=>`<tr><td>${esc(c.project_code)} ${esc(c.project_name)}</td><td>${esc(c.contract_type)}</td><td>${esc(c.contract_no)}</td><td>${esc(c.partner_name)}</td><td class="num">${money(c.contract_value)}</td><td class="num">${money(c.billed)}</td><td><span class="status">${esc(c.status)}</span></td></tr>`).join('')||'<tr><td colspan="7" class="empty">Chưa có hợp đồng.</td></tr>';billingRows.innerHTML=(pa.billings||[]).map(b=>`<tr><td>${esc(b.billing_date)}</td><td>${esc(b.contract_no)}</td><td>${esc(b.milestone_name)}</td><td class="num">${money(b.net_amount)}</td><td><span class="status">${esc(b.status)}</span></td></tr>`).join('')||'<tr><td colspan="5" class="empty">Chưa có nghiệm thu.</td></tr>';revenueRows.innerHTML=(pa.revenues||[]).map(r=>`<tr><td>${esc(r.revenue_date)}</td><td>${esc(r.project_code)} ${esc(r.project_name)}</td><td>${esc(r.contract_no)}</td><td class="num">${money(r.amount)}</td><td class="num">${money(r.vat_amount)}</td></tr>`).join('')||'<tr><td colspan="5" class="empty">Chưa có doanh thu.</td></tr>';costPlanRows.innerHTML=(pa.cost_plan_actual||[]).map(x=>{const diff=Number(x.planned||0)-Number(x.actual||0);return `<tr><td>${esc(x.project_code)} ${esc(x.project_name)}</td><td>${esc(x.category)}</td><td class="num">${money(x.planned)}</td><td class="num">${money(x.actual)}</td><td class="num">${money(diff)}</td></tr>`}).join('')||'<tr><td colspan="5" class="empty">Chưa có dự toán.</td></tr>';projectPlRows.innerHTML=(pa.project_pl||[]).map(x=>`<tr><td>${esc(x.code)} ${esc(x.name)}</td><td class="num">${money(x.revenue)}</td><td class="num">${money(x.cost)}</td><td class="num">${money(x.profit)}</td></tr>`).join('')||'<tr><td colspan="4" class="empty">Chưa có P/L công trình.</td></tr>'}
     function renderConstruction(){workRows.innerHTML=state.workItems.map(w=>`<tr><td>${esc(w.project_code)} ${esc(w.project_name)}</td><td>${esc(w.item_code)}</td><td>${esc(w.item_name)}</td><td class="num">${money(w.planned_quantity)} ${esc(w.unit)}</td><td class="num">${money(w.percent_complete)}%</td><td class="num">${money(w.actual_expense)}</td><td><span class="status">${esc(w.status)}</span></td></tr>`).join('')||'<tr><td colspan="7" class="empty">Chưa có hạng mục.</td></tr>';diaryRows.innerHTML=state.diaries.map(d=>`<tr><td>${esc(d.diary_date)}</td><td>${esc(d.project_code)} ${esc(d.project_name)}</td><td>${esc(d.weather)}</td><td>${esc(d.work_content)}</td><td>${esc(d.reporter)}</td></tr>`).join('')||'<tr><td colspan="5" class="empty">Chưa có nhật ký.</td></tr>'}
     function renderDocuments(){const q=(documentSearch.value||'').toLowerCase();const rows=state.documents.filter(d=>JSON.stringify(d).toLowerCase().includes(q));documentRows.innerHTML=rows.map(d=>`<tr><td>${esc(d.doc_date)}</td><td>${esc(d.doc_type)}</td><td>${esc(d.doc_number)}</td><td>${esc(d.supplier_name)}</td><td class="num">${money(d.amount)}</td><td>${esc(d.project_name)}</td><td><span class="status">${esc(d.status)}</span></td></tr>`).join('')||'<tr><td colspan="7" class="empty">Chưa có chứng từ.</td></tr>'}
     function renderForms(){const q=(formSearch.value||'').toLowerCase();const rows=state.forms.filter(f=>JSON.stringify(f).toLowerCase().includes(q));formRows.innerHTML=rows.map(f=>`<tr><td>${esc(f.form_code)}</td><td>${esc(f.form_name)}</td><td>${esc(f.scope)}</td><td>${esc(f.file_path)}</td></tr>`).join('')||'<tr><td colspan="4" class="empty">Chưa có biểu mẫu.</td></tr>'}
@@ -970,13 +1188,20 @@ INDEX_HTML = r"""<!doctype html>
     document.querySelectorAll('[data-view]').forEach(b=>b.addEventListener('click',()=>switchView(b.dataset.view)));
     document.querySelectorAll('[data-view-jump]').forEach(b=>b.addEventListener('click',()=>switchView(b.dataset.viewJump)));
     menuBtn.addEventListener('click',()=>side.classList.toggle('open'));refreshBtn.addEventListener('click',()=>loadAll().then(()=>toast('Đã tải lại dữ liệu')));
-    expenseSearch.addEventListener('input',renderExpenses);inventorySearch.addEventListener('input',renderInventory);documentSearch.addEventListener('input',renderDocuments);formSearch.addEventListener('input',renderForms);financeSearch.addEventListener('input',renderFinance);
+    expenseSearch.addEventListener('input',renderExpenses);inventorySearch.addEventListener('input',renderInventory);contractSearch.addEventListener('input',renderProjectAccounting);documentSearch.addEventListener('input',renderDocuments);formSearch.addEventListener('input',renderForms);financeSearch.addEventListener('input',renderFinance);
     expenseForm.expense_date.value=new Date().toISOString().slice(0,10);
     diaryForm.diary_date.value=new Date().toISOString().slice(0,10);
     documentForm.doc_date.value=new Date().toISOString().slice(0,10);
+    contractForm.signed_date.value=new Date().toISOString().slice(0,10);
+    billingForm.billing_date.value=new Date().toISOString().slice(0,10);
+    revenueForm.revenue_date.value=new Date().toISOString().slice(0,10);
     bankForm.transaction_date.value=new Date().toISOString().slice(0,10);
     expenseForm.addEventListener('submit',async e=>{e.preventDefault();const data=Object.fromEntries(new FormData(expenseForm).entries());try{await api('/api/expenses',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});expenseForm.reset();expenseForm.expense_date.value=new Date().toISOString().slice(0,10);await Promise.all([loadDashboard(),loadExpenses()]);toast('Đã lưu chi phí')}catch(err){toast(err.message)}});
     projectForm.addEventListener('submit',async e=>{e.preventDefault();const data=Object.fromEntries(new FormData(projectForm).entries());try{await api('/api/projects',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});projectForm.reset();await Promise.all([loadCatalogs(),loadDashboard()]);toast('Đã lưu dự án')}catch(err){toast(err.message)}});
+    contractForm.addEventListener('submit',async e=>{e.preventDefault();const data=Object.fromEntries(new FormData(contractForm).entries());try{await api('/api/project-accounting/contracts',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});contractForm.reset();contractForm.vat_rate.value='10';contractForm.retention_rate.value='5';contractForm.signed_date.value=new Date().toISOString().slice(0,10);await loadProjectAccounting();toast('Đã lưu hợp đồng')}catch(err){toast(err.message)}});
+    costPlanForm.addEventListener('submit',async e=>{e.preventDefault();const data=Object.fromEntries(new FormData(costPlanForm).entries());try{await api('/api/project-accounting/cost-plans',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});costPlanForm.reset();await loadProjectAccounting();toast('Đã lưu dự toán')}catch(err){toast(err.message)}});
+    billingForm.addEventListener('submit',async e=>{e.preventDefault();const data=Object.fromEntries(new FormData(billingForm).entries());try{await api('/api/project-accounting/billings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});billingForm.reset();billingForm.vat_rate.value='10';billingForm.retention_rate.value='5';billingForm.billing_date.value=new Date().toISOString().slice(0,10);await Promise.all([loadProjectAccounting(),loadFinance()]);toast('Đã lưu nghiệm thu')}catch(err){toast(err.message)}});
+    revenueForm.addEventListener('submit',async e=>{e.preventDefault();const data=Object.fromEntries(new FormData(revenueForm).entries());try{await api('/api/project-accounting/revenues',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});revenueForm.reset();revenueForm.revenue_date.value=new Date().toISOString().slice(0,10);await Promise.all([loadProjectAccounting(),loadFinance()]);toast('Đã lưu doanh thu')}catch(err){toast(err.message)}});
     diaryForm.addEventListener('submit',async e=>{e.preventDefault();const data=Object.fromEntries(new FormData(diaryForm).entries());try{await api('/api/construction/diaries',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});diaryForm.reset();diaryForm.diary_date.value=new Date().toISOString().slice(0,10);await loadConstruction();toast('Đã lưu nhật ký')}catch(err){toast(err.message)}});
     documentForm.addEventListener('submit',async e=>{e.preventDefault();const data=Object.fromEntries(new FormData(documentForm).entries());try{await api('/api/documents',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});documentForm.reset();documentForm.doc_type.value='Hóa đơn';documentForm.vat_rate.value='10';documentForm.doc_date.value=new Date().toISOString().slice(0,10);await Promise.all([loadDashboard(),loadDocuments()]);toast('Đã lưu chứng từ')}catch(err){toast(err.message)}});
     thresholdForm.addEventListener('submit',async e=>{e.preventDefault();const data=Object.fromEntries(new FormData(thresholdForm).entries());try{await api('/api/approval-thresholds',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});thresholdForm.reset();await loadFinance();toast('Đã lưu hạn mức')}catch(err){toast(err.message)}});
@@ -992,7 +1217,7 @@ INDEX_HTML = r"""<!doctype html>
 
 
 SERVICE_WORKER = """self.addEventListener('install', event => {
-  event.waitUntil(caches.open('fastrack-web-v3').then(cache => cache.addAll(['/', '/manifest.json'])));
+  event.waitUntil(caches.open('fastrack-web-v4').then(cache => cache.addAll(['/', '/manifest.json'])));
 });
 self.addEventListener('fetch', event => {
   if (event.request.method !== 'GET') return;
