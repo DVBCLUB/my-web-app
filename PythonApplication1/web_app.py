@@ -8,7 +8,7 @@ Then open:
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, timedelta
 from functools import wraps
 from typing import Any
 
@@ -21,9 +21,13 @@ from database import get_connection, init_database
 from modules.accounting import ExpenseManager
 from modules.advance_workflow import AdvanceWorkflowManager
 from modules.backup import BackupManager
+from modules.bank_reconciliation import BankReconciliationManager
 from modules.construction import ConstructionManager
+from modules.controls import ApprovalThresholdManager, AuditLogManager
+from modules.fiscal_lock import FiscalPeriodLockManager
 from modules.invoices import DocumentManager
 from modules.materials import MaterialManager
+from modules.notification_center import NotificationCenter
 from modules.template_renderer import TemplateRenderer
 from modules.utilities import UtilityManager
 
@@ -97,6 +101,135 @@ class WebReportGenerator:
             """
         )
         return cursor.fetchall()
+
+
+class WebFinanceCenter:
+    """Finance-control queries that are safe to run in the web container."""
+
+    def __init__(self):
+        self.conn = get_connection()
+
+    def month_range(self):
+        today = date.today()
+        start = today.replace(day=1)
+        next_month = (start.replace(year=start.year + 1, month=1) if start.month == 12 else start.replace(month=start.month + 1))
+        return start.isoformat(), (next_month - timedelta(days=1)).isoformat()
+
+    def vat_declaration(self, start_date=None, end_date=None):
+        start_date, end_date = start_date or self.month_range()[0], end_date or self.month_range()[1]
+        input_rows = self._input_vat_rows(start_date, end_date)
+        output_rows = self._output_vat_rows(start_date, end_date)
+        input_vat = sum(row["vat_amount"] for row in input_rows)
+        output_vat = sum(row["vat_amount"] for row in output_rows)
+        return {
+            "period": f"{start_date} - {end_date}",
+            "input_rows": input_rows,
+            "output_rows": output_rows,
+            "input_taxable": sum(row["taxable_amount"] for row in input_rows),
+            "input_vat": input_vat,
+            "output_taxable": sum(row["taxable_amount"] for row in output_rows),
+            "output_vat": output_vat,
+            "vat_payable": max(output_vat - input_vat, 0),
+            "vat_credit": max(input_vat - output_vat, 0),
+        }
+
+    def _input_vat_rows(self, start_date, end_date):
+        cursor = self.conn.cursor()
+        cursor.execute(
+            """
+            SELECT d.doc_date, d.doc_number, d.supplier_name,
+                   COALESCE(s.tax_code, '') AS tax_code,
+                   COALESCE(d.amount, 0) AS total_amount,
+                   COALESCE(d.vat_rate, 10) AS vat_rate
+            FROM documents d
+            LEFT JOIN suppliers s ON s.id = d.supplier_id
+            WHERE d.doc_date BETWEEN ? AND ?
+              AND COALESCE(d.amount, 0) > 0
+            ORDER BY d.doc_date DESC, d.id DESC
+            LIMIT 100
+            """,
+            (start_date, end_date),
+        )
+        rows = []
+        for row in cursor.fetchall():
+            total = float(row["total_amount"] or 0)
+            rate = max(float(row["vat_rate"] or 10), 0) / 100
+            taxable = total / (1 + rate) if rate else total
+            rows.append(
+                {
+                    "invoice_date": row["doc_date"],
+                    "invoice_number": row["doc_number"],
+                    "partner_name": row["supplier_name"],
+                    "tax_code": row["tax_code"],
+                    "taxable_amount": taxable,
+                    "vat_amount": total - taxable,
+                    "total_amount": total,
+                }
+            )
+        return rows
+
+    def _output_vat_rows(self, start_date, end_date):
+        cursor = self.conn.cursor()
+        cursor.execute(
+            """
+            SELECT r.revenue_date, COALESCE(c.contract_no, '') AS contract_no,
+                   COALESCE(c.partner_name, '') AS partner_name,
+                   COALESCE(r.amount, 0) AS amount,
+                   COALESCE(r.vat_amount, 0) AS vat_amount,
+                   COALESCE(r.description, '') AS description
+            FROM project_revenues r
+            LEFT JOIN project_contracts c ON c.id = r.contract_id
+            WHERE r.revenue_date BETWEEN ? AND ?
+            ORDER BY r.revenue_date DESC, r.id DESC
+            LIMIT 100
+            """,
+            (start_date, end_date),
+        )
+        return [
+            {
+                "invoice_date": row["revenue_date"],
+                "invoice_number": row["contract_no"],
+                "partner_name": row["partner_name"],
+                "tax_code": "",
+                "taxable_amount": float(row["amount"] or 0),
+                "vat_amount": float(row["vat_amount"] or 0),
+                "total_amount": float(row["amount"] or 0) + float(row["vat_amount"] or 0),
+                "description": row["description"],
+            }
+            for row in cursor.fetchall()
+        ]
+
+    def payroll_summary(self, period=None):
+        period = period or date.today().strftime("%Y-%m")
+        cursor = self.conn.cursor()
+        cursor.execute(
+            """
+            SELECT pp.period, pp.gross_amount, pp.insurance_amount, pp.pit_amount,
+                   pp.net_amount, pp.status, COUNT(pl.id) AS line_count
+            FROM payroll_periods pp
+            LEFT JOIN payroll_lines pl ON pl.payroll_period_id = pp.id
+            WHERE pp.period = ?
+            GROUP BY pp.id
+            """,
+            (period,),
+        )
+        current = cursor.fetchone()
+        cursor.execute(
+            """
+            SELECT pp.period, pp.gross_amount, pp.pit_amount, pp.net_amount,
+                   pp.status, COUNT(pl.id) AS line_count
+            FROM payroll_periods pp
+            LEFT JOIN payroll_lines pl ON pl.payroll_period_id = pp.id
+            GROUP BY pp.id
+            ORDER BY pp.period DESC
+            LIMIT 12
+            """
+        )
+        return {
+            "period": period,
+            "current": row_to_dict(current) if current else {},
+            "recent": [row_to_dict(row) for row in cursor.fetchall()],
+        }
 
 
 def api_error(handler):
@@ -448,6 +581,93 @@ def create_app():
             UtilityManager().mark_backup_now()
         return jsonify({"ok": ok, "message": message})
 
+    @app.get("/api/finance-center")
+    @api_error
+    def finance_center():
+        bank = BankReconciliationManager()
+        finance = WebFinanceCenter()
+        start_date = request.args.get("start_date")
+        end_date = request.args.get("end_date")
+        fiscal_year = request.args.get("year") or date.today().year
+        alerts = NotificationCenter().get_all_alerts()[:30]
+        suggestions = bank.get_match_suggestions(limit=30)
+        return jsonify(
+            {
+                "alerts": alerts,
+                "alert_counts": NotificationCenter().get_badge_counts(),
+                "approval_thresholds": [
+                    row_to_dict(row, ("role", "max_amount", "can_final_approve", "active"))
+                    for row in ApprovalThresholdManager().list_thresholds()
+                ],
+                "fiscal_periods": [
+                    row_to_dict(row)
+                    for row in FiscalPeriodLockManager().list_periods(int(fiscal_year))
+                ],
+                "audit_log": [
+                    row_to_dict(row)
+                    for row in AuditLogManager().read_report(limit=80)
+                ],
+                "bank": {
+                    "summary": bank.get_bank_summary(),
+                    "unreconciled": [row_to_dict(row) for row in bank.get_unreconciled()[:80]],
+                    "matches": [row_to_dict(row) for row in bank.get_matches()[:80]],
+                    "suggestions": [
+                        {
+                            "bank_row": row_to_dict(item.get("bank_row")),
+                            "expense": row_to_dict(item.get("expense")),
+                            "confidence": item.get("confidence"),
+                        }
+                        for item in suggestions
+                    ],
+                },
+                "vat": finance.vat_declaration(start_date, end_date),
+                "payroll": finance.payroll_summary(request.args.get("payroll_period")),
+            }
+        )
+
+    @app.post("/api/approval-thresholds")
+    @api_error
+    def save_approval_threshold():
+        data = request.get_json(force=True)
+        ApprovalThresholdManager().save_threshold(
+            data["role"],
+            float(data.get("max_amount") or 0),
+            int(data.get("can_final_approve") or 0),
+            int(data.get("active", 1)),
+        )
+        return jsonify({"status": "saved"})
+
+    @app.post("/api/fiscal-locks")
+    @api_error
+    def set_fiscal_lock():
+        data = request.get_json(force=True)
+        updated = FiscalPeriodLockManager().set_locked(
+            data["fiscal_period"],
+            bool(int(data.get("locked", 1))),
+            data.get("user_id") or 1,
+        )
+        return jsonify({"status": "saved", "updated": updated})
+
+    @app.post("/api/bank/transactions")
+    @api_error
+    def add_bank_transaction():
+        data = request.get_json(force=True)
+        bank_account_id = data.get("bank_account_id") or None
+        txn_id = BankReconciliationManager().add_bank_transaction(
+            bank_account_id,
+            data.get("transaction_date") or date.today().isoformat(),
+            float(data.get("amount") or 0),
+            data.get("description", ""),
+            data.get("reference_no", ""),
+        )
+        return jsonify({"id": txn_id, "status": "created"})
+
+    @app.post("/api/bank/auto-match")
+    @api_error
+    def bank_auto_match():
+        matched = BankReconciliationManager().auto_match_bank_transactions()
+        return jsonify({"matched": matched})
+
     @app.get("/api/advances/pending")
     @api_error
     def pending_advances():
@@ -488,6 +708,7 @@ INDEX_HTML = r"""<!doctype html>
         <button class="navbtn" data-view="documents">Chứng từ</button>
         <button class="navbtn" data-view="forms">Biểu mẫu</button>
         <button class="navbtn" data-view="reports">Báo cáo</button>
+        <button class="navbtn" data-view="finance">Kiểm soát & tài chính</button>
         <button class="navbtn" data-view="settings">Cài đặt</button>
         <button class="navbtn" data-view="deploy">Tên miền</button>
       </nav>
@@ -622,6 +843,61 @@ INDEX_HTML = r"""<!doctype html>
         </div>
       </section>
 
+      <section class="view" id="finance">
+        <div class="grid kpis">
+          <div class="card kpi"><div class="label">Cảnh báo</div><div class="value" id="fAlerts">0</div></div>
+          <div class="card kpi"><div class="label">Chưa đối soát</div><div class="value" id="fUnreconciled">0</div></div>
+          <div class="card kpi"><div class="label">VAT đầu ra</div><div class="value" id="fOutputVat">0</div></div>
+          <div class="card kpi"><div class="label">VAT phải nộp</div><div class="value" id="fVatPayable">0</div></div>
+          <div class="card kpi"><div class="label">Lương net</div><div class="value" id="fPayrollNet">0</div></div>
+        </div>
+        <div class="grid two">
+          <div class="card">
+            <div class="toolbar"><h3>Cảnh báo nghiệp vụ</h3><input class="search" id="financeSearch" placeholder="Tìm cảnh báo"></div>
+            <div class="tablewrap"><table><thead><tr><th>Nguồn</th><th>Mức</th><th>Nội dung</th><th>Hạn</th></tr></thead><tbody id="alertRows"></tbody></table></div>
+          </div>
+          <div class="card">
+            <h3>Hạn mức phê duyệt</h3>
+            <form class="form" id="thresholdForm">
+              <label>Vai trò<input name="role" required></label>
+              <label>Hạn mức<input name="max_amount" type="number" min="0" step="100000" required></label>
+              <label>Duyệt cuối<select name="can_final_approve"><option value="0">Không</option><option value="1">Có</option></select></label>
+              <label>Trạng thái<select name="active"><option value="1">active</option><option value="0">inactive</option></select></label>
+              <div class="wide actions"><button class="primary" type="submit">Lưu hạn mức</button></div>
+            </form>
+            <div class="tablewrap"><table><thead><tr><th>Vai trò</th><th>Hạn mức</th><th>Duyệt cuối</th><th>TT</th></tr></thead><tbody id="thresholdRows"></tbody></table></div>
+          </div>
+        </div>
+        <div class="grid two">
+          <div class="card">
+            <h3>Khóa kỳ kế toán</h3>
+            <div class="tablewrap"><table><thead><tr><th>Kỳ</th><th>Từ ngày</th><th>Đến ngày</th><th>TT</th><th>Thao tác</th></tr></thead><tbody id="periodRows"></tbody></table></div>
+          </div>
+          <div class="card">
+            <h3>Đối soát ngân hàng</h3>
+            <form class="form" id="bankForm">
+              <label>Ngày giao dịch<input name="transaction_date" type="date"></label>
+              <label>Số tiền<input name="amount" type="number" step="1000" required></label>
+              <label>Số tham chiếu<input name="reference_no"></label>
+              <label>Tài khoản ID<input name="bank_account_id" type="number" min="1"></label>
+              <label class="wide">Diễn giải<textarea name="description"></textarea></label>
+              <div class="wide actions"><button class="primary" type="submit">Thêm giao dịch</button><button class="secondary" type="button" id="autoMatchBtn">Tự khớp</button></div>
+            </form>
+            <div class="tablewrap"><table><thead><tr><th>Ngày</th><th>Diễn giải</th><th>Số tiền</th><th>TT</th></tr></thead><tbody id="bankRows"></tbody></table></div>
+          </div>
+        </div>
+        <div class="grid two">
+          <div class="card">
+            <h3>Tờ khai VAT</h3>
+            <div class="tablewrap"><table><thead><tr><th>Chỉ tiêu</th><th>Giá trị</th></tr></thead><tbody id="vatRows"></tbody></table></div>
+          </div>
+          <div class="card">
+            <h3>Audit log</h3>
+            <div class="tablewrap"><table><thead><tr><th>Thời điểm</th><th>Hành động</th><th>Bảng</th><th>Chi tiết</th></tr></thead><tbody id="auditRows"></tbody></table></div>
+          </div>
+        </div>
+      </section>
+
       <section class="view" id="settings">
         <div class="card">
           <h3>Thông tin công ty</h3>
@@ -661,13 +937,13 @@ INDEX_HTML = r"""<!doctype html>
   <div class="toast" id="toast"></div>
 
   <script>
-    const state={dashboard:null,expenses:[],inventory:[],history:[],projects:[],categories:[],workItems:[],diaries:[],documents:[],forms:[],reports:null,settings:null};
+    const state={dashboard:null,expenses:[],inventory:[],history:[],projects:[],categories:[],workItems:[],diaries:[],documents:[],forms:[],reports:null,finance:null,settings:null};
     const money=v=>new Intl.NumberFormat('vi-VN',{maximumFractionDigits:0}).format(Number(v||0));
     const esc=v=>String(v??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
     const toast=t=>{const el=document.getElementById('toast');el.textContent=t;el.style.display='block';setTimeout(()=>el.style.display='none',2800)};
     async function api(url,options){const r=await fetch(url,options);const data=await r.json();if(!r.ok)throw new Error(data.error||'Có lỗi xảy ra');return data}
-    function switchView(id){document.querySelectorAll('.view').forEach(v=>v.classList.toggle('active',v.id===id));document.querySelectorAll('.navbtn').forEach(b=>b.classList.toggle('active',b.dataset.view===id));document.getElementById('pageTitle').textContent={dashboard:'Tổng quan',expenses:'Chi phí',inventory:'Vật tư kho',projects:'Dự án',construction:'Công trường',documents:'Chứng từ',forms:'Biểu mẫu',reports:'Báo cáo',settings:'Cài đặt',deploy:'Tên miền'}[id]||'FasTrack ERP';document.getElementById('side').classList.remove('open')}
-    async function loadAll(){await Promise.all([loadDashboard(),loadCatalogs(),loadExpenses(),loadInventory(),loadProjects(),loadConstruction(),loadDocuments(),loadForms(),loadReports(),loadSettings()])}
+    function switchView(id){document.querySelectorAll('.view').forEach(v=>v.classList.toggle('active',v.id===id));document.querySelectorAll('.navbtn').forEach(b=>b.classList.toggle('active',b.dataset.view===id));document.getElementById('pageTitle').textContent={dashboard:'Tổng quan',expenses:'Chi phí',inventory:'Vật tư kho',projects:'Dự án',construction:'Công trường',documents:'Chứng từ',forms:'Biểu mẫu',reports:'Báo cáo',finance:'Kiểm soát & tài chính',settings:'Cài đặt',deploy:'Tên miền'}[id]||'FasTrack ERP';document.getElementById('side').classList.remove('open')}
+    async function loadAll(){await Promise.all([loadDashboard(),loadCatalogs(),loadExpenses(),loadInventory(),loadProjects(),loadConstruction(),loadDocuments(),loadForms(),loadReports(),loadFinance(),loadSettings()])}
     async function loadDashboard(){state.dashboard=await api('/api/dashboard');renderDashboard()}
     async function loadCatalogs(){const [projects,categories]=await Promise.all([api('/api/projects'),api('/api/categories')]);state.projects=projects;state.categories=categories;fillSelects();renderProjects()}
     async function loadExpenses(){state.expenses=await api('/api/expenses');renderExpenses()}
@@ -677,6 +953,7 @@ INDEX_HTML = r"""<!doctype html>
     async function loadDocuments(){state.documents=await api('/api/documents');renderDocuments()}
     async function loadForms(){state.forms=await api('/api/forms');renderForms()}
     async function loadReports(){state.reports=await api('/api/reports/summary');renderReports()}
+    async function loadFinance(){state.finance=await api('/api/finance-center');renderFinance()}
     async function loadSettings(){state.settings=await api('/api/settings');renderSettings()}
     function fillSelects(){const projectOptions='<option value="">Không gắn dự án</option>'+state.projects.map(p=>`<option value="${p.id}">${esc(p.code)} - ${esc(p.name)}</option>`).join('');const categoryOptions=state.categories.map(c=>`<option value="${c.id}">${esc(c.code)} - ${esc(c.name)}</option>`).join('');expenseProject.innerHTML=projectOptions;diaryProject.innerHTML=projectOptions;documentProject.innerHTML=projectOptions;expenseCategory.innerHTML=categoryOptions;documentCategory.innerHTML='<option value="">Chọn danh mục</option>'+categoryOptions}
     function renderDashboard(){const d=state.dashboard||{},s=d.stats||{};kTotal.textContent=money(s.total_expenses);kMonth.textContent=money(s.monthly_expenses);kProjects.textContent=s.total_projects||0;kDocs.textContent=s.total_documents||0;kStock.textContent=money(d.stock_value);const max=Math.max(1,...(d.categories||[]).map(x=>x.total||0));categoryBars.innerHTML=(d.categories||[]).map(x=>`<div class="barrow"><strong>${esc(x.name)}</strong><div class="bar"><div class="fill" style="width:${Math.round((x.total||0)/max*100)}%"></div></div><span class="num">${money(x.total)}</span></div>`).join('')||'<div class="empty">Chưa có dữ liệu chi phí.</div>';lowStockRows.innerHTML=(d.low_stock||[]).map(x=>`<tr><td>${esc(x.code)}</td><td>${esc(x.name)}</td><td class="num">${money(x.quantity)} ${esc(x.unit)}</td><td class="num">${money(x.min_quantity)}</td></tr>`).join('')||'<tr><td colspan="4" class="empty">Không có cảnh báo tồn kho.</td></tr>'}
@@ -688,18 +965,23 @@ INDEX_HTML = r"""<!doctype html>
     function renderForms(){const q=(formSearch.value||'').toLowerCase();const rows=state.forms.filter(f=>JSON.stringify(f).toLowerCase().includes(q));formRows.innerHTML=rows.map(f=>`<tr><td>${esc(f.form_code)}</td><td>${esc(f.form_name)}</td><td>${esc(f.scope)}</td><td>${esc(f.file_path)}</td></tr>`).join('')||'<tr><td colspan="4" class="empty">Chưa có biểu mẫu.</td></tr>'}
     function drawBars(el,rows,labelKey,valueKey){const max=Math.max(1,...rows.map(r=>Number(r[valueKey]||0)));el.innerHTML=rows.map(r=>`<div class="barrow"><strong>${esc(r[labelKey])}</strong><div class="bar"><div class="fill" style="width:${Math.round(Number(r[valueKey]||0)/max*100)}%"></div></div><span class="num">${money(r[valueKey])}</span></div>`).join('')||'<div class="empty">Chưa có dữ liệu.</div>'}
     function renderReports(){const r=state.reports||{};drawBars(monthlyBars,r.monthly_expenses||[],'month','total');drawBars(projectBars,r.project_expenses||[],'project','total');stockReportRows.innerHTML=(r.stock||[]).map(x=>`<tr><td>${esc(x.name)}</td><td class="num">${money(x.quantity)}</td><td class="num">${money(x.unit_price)}</td><td class="num">${money(x.total_value)}</td></tr>`).join('')||'<tr><td colspan="4" class="empty">Chưa có dữ liệu tồn kho.</td></tr>'}
+    function renderFinance(){const f=state.finance||{},bank=f.bank||{},vat=f.vat||{},pay=f.payroll||{},payCurrent=pay.current||{};fAlerts.textContent=(f.alert_counts||{}).total||0;fUnreconciled.textContent=(bank.summary||{}).unreconciled_count||0;fOutputVat.textContent=money(vat.output_vat);fVatPayable.textContent=money(vat.vat_payable);fPayrollNet.textContent=money(payCurrent.net_amount);const q=(financeSearch.value||'').toLowerCase();const alerts=(f.alerts||[]).filter(a=>JSON.stringify(a).toLowerCase().includes(q));alertRows.innerHTML=alerts.map(a=>`<tr><td>${esc(a.source)}</td><td><span class="status ${a.priority==='critical'?'low':''}">${esc(a.priority)}</span></td><td><strong>${esc(a.title)}</strong><br><span class="muted">${esc(a.message)}</span></td><td>${esc(a.due_date||'')}</td></tr>`).join('')||'<tr><td colspan="4" class="empty">Không có cảnh báo.</td></tr>';thresholdRows.innerHTML=(f.approval_thresholds||[]).map(t=>`<tr><td>${esc(t.role)}</td><td class="num">${money(t.max_amount)}</td><td>${Number(t.can_final_approve)?'Có':'Không'}</td><td><span class="status">${Number(t.active)?'active':'inactive'}</span></td></tr>`).join('')||'<tr><td colspan="4" class="empty">Chưa có hạn mức.</td></tr>';periodRows.innerHTML=(f.fiscal_periods||[]).slice(0,18).map(p=>`<tr><td>${esc(p.fiscal_period)}</td><td>${esc(p.period_start)}</td><td>${esc(p.period_end)}</td><td><span class="status ${Number(p.is_locked)?'low':''}">${Number(p.is_locked)?'locked':'open'}</span></td><td><button class="secondary" type="button" data-lock-period="${esc(p.fiscal_period)}" data-lock-value="${Number(p.is_locked)?0:1}">${Number(p.is_locked)?'Mở':'Khóa'}</button></td></tr>`).join('')||'<tr><td colspan="5" class="empty">Chưa có kỳ kế toán.</td></tr>';bankRows.innerHTML=(bank.unreconciled||[]).map(b=>`<tr><td>${esc(b.transaction_date)}</td><td>${esc(b.description)}</td><td class="num">${money(b.amount)}</td><td><span class="status">open</span></td></tr>`).join('')||'<tr><td colspan="4" class="empty">Không có giao dịch chưa đối soát.</td></tr>';vatRows.innerHTML=[['Kỳ',vat.period||''],['Doanh thu chịu thuế',money(vat.output_taxable)],['VAT đầu ra',money(vat.output_vat)],['Chi phí chịu thuế',money(vat.input_taxable)],['VAT đầu vào',money(vat.input_vat)],['Phải nộp',money(vat.vat_payable)],['Còn khấu trừ',money(vat.vat_credit)]].map(x=>`<tr><td>${esc(x[0])}</td><td class="num">${esc(x[1])}</td></tr>`).join('');auditRows.innerHTML=(f.audit_log||[]).map(a=>`<tr><td>${esc(a.created_at)}</td><td>${esc(a.action)}</td><td>${esc(a.entity_type)}</td><td>${esc(String(a.detail||'').slice(0,120))}</td></tr>`).join('')||'<tr><td colspan="4" class="empty">Chưa có audit log.</td></tr>';document.querySelectorAll('[data-lock-period]').forEach(btn=>btn.addEventListener('click',async()=>{try{await api('/api/fiscal-locks',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({fiscal_period:btn.dataset.lockPeriod,locked:btn.dataset.lockValue})});await loadFinance();toast('Đã cập nhật khóa kỳ')}catch(err){toast(err.message)}}))}
     function renderSettings(){const s=state.settings||{},settings=s.settings||{};['company_name','company_tax_code','company_representative','company_short_name'].forEach(k=>{if(settingsForm[k])settingsForm[k].value=settings[k]||''});backupHealth.textContent=s.backup_health||'';linkageRows.innerHTML=(s.linkage_checks||[]).map(x=>`<tr><td>${esc(x.group)}</td><td>${esc(x.issue)}</td><td><span class="status">${esc(x.status)}</span></td><td class="num">${money(x.count)}</td></tr>`).join('')||'<tr><td colspan="4" class="empty">Không có cảnh báo.</td></tr>';databaseRows.innerHTML=Object.entries(s.database||{}).map(([k,v])=>`<tr><td>${esc(k)}</td><td class="num">${money(v)}</td></tr>`).join('');backupRows.innerHTML=(s.backups||[]).map(b=>`<tr><td>${esc(b.name)}</td><td>${esc(b.size)}</td><td>${esc(b.date)}</td></tr>`).join('')||'<tr><td colspan="3" class="empty">Chưa có bản sao lưu.</td></tr>'}
     document.querySelectorAll('[data-view]').forEach(b=>b.addEventListener('click',()=>switchView(b.dataset.view)));
     document.querySelectorAll('[data-view-jump]').forEach(b=>b.addEventListener('click',()=>switchView(b.dataset.viewJump)));
     menuBtn.addEventListener('click',()=>side.classList.toggle('open'));refreshBtn.addEventListener('click',()=>loadAll().then(()=>toast('Đã tải lại dữ liệu')));
-    expenseSearch.addEventListener('input',renderExpenses);inventorySearch.addEventListener('input',renderInventory);documentSearch.addEventListener('input',renderDocuments);formSearch.addEventListener('input',renderForms);
+    expenseSearch.addEventListener('input',renderExpenses);inventorySearch.addEventListener('input',renderInventory);documentSearch.addEventListener('input',renderDocuments);formSearch.addEventListener('input',renderForms);financeSearch.addEventListener('input',renderFinance);
     expenseForm.expense_date.value=new Date().toISOString().slice(0,10);
     diaryForm.diary_date.value=new Date().toISOString().slice(0,10);
     documentForm.doc_date.value=new Date().toISOString().slice(0,10);
+    bankForm.transaction_date.value=new Date().toISOString().slice(0,10);
     expenseForm.addEventListener('submit',async e=>{e.preventDefault();const data=Object.fromEntries(new FormData(expenseForm).entries());try{await api('/api/expenses',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});expenseForm.reset();expenseForm.expense_date.value=new Date().toISOString().slice(0,10);await Promise.all([loadDashboard(),loadExpenses()]);toast('Đã lưu chi phí')}catch(err){toast(err.message)}});
     projectForm.addEventListener('submit',async e=>{e.preventDefault();const data=Object.fromEntries(new FormData(projectForm).entries());try{await api('/api/projects',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});projectForm.reset();await Promise.all([loadCatalogs(),loadDashboard()]);toast('Đã lưu dự án')}catch(err){toast(err.message)}});
     diaryForm.addEventListener('submit',async e=>{e.preventDefault();const data=Object.fromEntries(new FormData(diaryForm).entries());try{await api('/api/construction/diaries',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});diaryForm.reset();diaryForm.diary_date.value=new Date().toISOString().slice(0,10);await loadConstruction();toast('Đã lưu nhật ký')}catch(err){toast(err.message)}});
     documentForm.addEventListener('submit',async e=>{e.preventDefault();const data=Object.fromEntries(new FormData(documentForm).entries());try{await api('/api/documents',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});documentForm.reset();documentForm.doc_type.value='Hóa đơn';documentForm.vat_rate.value='10';documentForm.doc_date.value=new Date().toISOString().slice(0,10);await Promise.all([loadDashboard(),loadDocuments()]);toast('Đã lưu chứng từ')}catch(err){toast(err.message)}});
+    thresholdForm.addEventListener('submit',async e=>{e.preventDefault();const data=Object.fromEntries(new FormData(thresholdForm).entries());try{await api('/api/approval-thresholds',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});thresholdForm.reset();await loadFinance();toast('Đã lưu hạn mức')}catch(err){toast(err.message)}});
+    bankForm.addEventListener('submit',async e=>{e.preventDefault();const data=Object.fromEntries(new FormData(bankForm).entries());try{await api('/api/bank/transactions',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});bankForm.reset();bankForm.transaction_date.value=new Date().toISOString().slice(0,10);await loadFinance();toast('Đã thêm giao dịch ngân hàng')}catch(err){toast(err.message)}});
+    autoMatchBtn.addEventListener('click',async()=>{try{const r=await api('/api/bank/auto-match',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});await loadFinance();toast(`Đã tự khớp ${r.matched||0} giao dịch`)}catch(err){toast(err.message)}});
     settingsForm.addEventListener('submit',async e=>{e.preventDefault();const data=Object.fromEntries(new FormData(settingsForm).entries());try{await api('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});await loadSettings();toast('Đã lưu cài đặt')}catch(err){toast(err.message)}});
     backupBtn.addEventListener('click',async()=>{try{const r=await api('/api/backups',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});await loadSettings();toast(r.message||'Đã sao lưu')}catch(err){toast(err.message)}});
     navigator.serviceWorker&&navigator.serviceWorker.register('/service-worker.js');
@@ -710,7 +992,7 @@ INDEX_HTML = r"""<!doctype html>
 
 
 SERVICE_WORKER = """self.addEventListener('install', event => {
-  event.waitUntil(caches.open('fastrack-web-v2').then(cache => cache.addAll(['/', '/manifest.json'])));
+  event.waitUntil(caches.open('fastrack-web-v3').then(cache => cache.addAll(['/', '/manifest.json'])));
 });
 self.addEventListener('fetch', event => {
   if (event.request.method !== 'GET') return;
