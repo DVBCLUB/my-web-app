@@ -88,14 +88,33 @@ OFFLINE_DATA_TABLES = {
 }
 
 
-def offline_table_rows(table_name: str, limit: int = 50) -> list[dict[str, Any]]:
+def offline_table_columns(table_name: str) -> list[str]:
     if table_name not in OFFLINE_DATA_TABLES:
         raise ValueError("Bang du lieu khong duoc phep truy cap")
-    limit = max(1, min(int(limit or 50), 300))
     conn = get_connection()
     cursor = conn.cursor()
-    cursor.execute(f'SELECT * FROM "{table_name}" LIMIT ?', (limit,))
-    return [row_to_dict(row) for row in cursor.fetchall()]
+    cursor.execute(f'PRAGMA table_info("{table_name}")')
+    return [row["name"] for row in cursor.fetchall()]
+
+
+def offline_table_rows(table_name: str, limit: int = 50, offset: int = 0, q: str = "") -> dict[str, Any]:
+    if table_name not in OFFLINE_DATA_TABLES:
+        raise ValueError("Bang du lieu khong duoc phep truy cap")
+    limit = max(1, min(int(limit or 50), 1000))
+    offset = max(0, int(offset or 0))
+    conn = get_connection()
+    cursor = conn.cursor()
+    columns = offline_table_columns(table_name)
+    where = ""
+    params: list[Any] = []
+    if q and columns:
+        where = " WHERE " + " OR ".join([f'CAST("{column}" AS TEXT) LIKE ?' for column in columns])
+        params = [f"%{q}%"] * len(columns)
+    cursor.execute(f'SELECT COUNT(*) FROM "{table_name}"{where}', params)
+    total = int(cursor.fetchone()[0] or 0)
+    cursor.execute(f'SELECT * FROM "{table_name}"{where} LIMIT ? OFFSET ?', [*params, limit, offset])
+    rows = [row_to_dict(row) for row in cursor.fetchall()]
+    return {"columns": columns, "rows": rows, "total": total, "limit": limit, "offset": offset, "q": q}
 
 
 def offline_data_snapshot() -> dict[str, Any]:
@@ -111,7 +130,7 @@ def offline_data_snapshot() -> dict[str, Any]:
         count = int(cursor.fetchone()[0] or 0)
         cursor.execute(f'PRAGMA table_info("{table_name}")')
         columns = [row["name"] for row in cursor.fetchall()]
-        sample = offline_table_rows(table_name, 5) if count else []
+        sample = offline_table_rows(table_name, 5)["rows"] if count else []
         tables.append({"name": table_name, "label": label, "count": count, "columns": columns, "sample": sample})
     active_tables = [table for table in tables if table["count"]]
     return {
@@ -122,6 +141,24 @@ def offline_data_snapshot() -> dict[str, Any]:
         },
         "tables": tables,
     }
+
+
+def offline_data_bundle(limit_per_table: int = 1000) -> dict[str, Any]:
+    snapshot = offline_data_snapshot()
+    bundle = {"summary": snapshot["summary"], "tables": []}
+    for table in snapshot["tables"]:
+        rows = offline_table_rows(table["name"], limit_per_table) if table["count"] else {"rows": [], "columns": table["columns"]}
+        bundle["tables"].append({**table, "rows": rows["rows"], "exported_rows": len(rows["rows"])})
+    return bundle
+
+
+def rows_to_csv(rows: list[dict[str, Any]], columns: list[str]) -> str:
+    output = io.StringIO()
+    writer = csv.DictWriter(output, fieldnames=columns, extrasaction="ignore")
+    writer.writeheader()
+    for row in rows:
+        writer.writerow(row)
+    return output.getvalue()
 
 
 def public_user(user: dict[str, Any] | None) -> dict[str, Any]:
@@ -1380,15 +1417,47 @@ def create_app():
     def offline_data():
         return jsonify(offline_data_snapshot())
 
+    @app.get("/api/offline-data/export.json")
+    @api_error
+    def offline_data_export_json():
+        limit = int(request.args.get("limit_per_table") or 1000)
+        payload = json.dumps(offline_data_bundle(limit), ensure_ascii=False, default=str)
+        return Response(
+            payload,
+            mimetype="application/json; charset=utf-8",
+            headers={"Content-Disposition": "attachment; filename=fastrack-offline-data.json"},
+        )
+
     @app.get("/api/offline-data/<table_name>")
     @api_error
     def offline_data_table(table_name):
+        page = max(1, int(request.args.get("page") or 1))
+        limit = int(request.args.get("limit") or 100)
+        offset = (page - 1) * max(1, min(limit, 1000))
+        data = offline_table_rows(table_name, limit, offset, request.args.get("q", ""))
         return jsonify(
             {
                 "name": table_name,
                 "label": OFFLINE_DATA_TABLES.get(table_name, table_name),
-                "rows": offline_table_rows(table_name, int(request.args.get("limit") or 100)),
+                "columns": data["columns"],
+                "rows": data["rows"],
+                "total": data["total"],
+                "page": page,
+                "limit": data["limit"],
+                "offset": data["offset"],
+                "q": data["q"],
             }
+        )
+
+    @app.get("/api/offline-data/<table_name>.csv")
+    @api_error
+    def offline_data_table_csv(table_name):
+        data = offline_table_rows(table_name, int(request.args.get("limit") or 5000), 0, request.args.get("q", ""))
+        csv_text = rows_to_csv(data["rows"], data["columns"])
+        return Response(
+            "\ufeff" + csv_text,
+            mimetype="text/csv; charset=utf-8",
+            headers={"Content-Disposition": f"attachment; filename=fastrack-{table_name}.csv"},
         )
 
     @app.post("/api/settings")
@@ -1724,11 +1793,11 @@ INDEX_HTML = r"""<!doctype html>
         </div>
         <div class="grid two">
           <div class="card">
-            <div class="toolbar"><h3>Kho dữ liệu đã đưa lên web</h3><input class="search" id="offlineSearch" placeholder="Tìm nhóm dữ liệu"></div>
+            <div class="toolbar"><h3>Kho dữ liệu đã đưa lên web</h3><div class="actions"><input class="search" id="offlineSearch" placeholder="Tìm nhóm dữ liệu"><button class="secondary" type="button" id="offlineJsonBtn">JSON đầy đủ</button></div></div>
             <div class="tablewrap"><table><thead><tr><th>Nhóm</th><th>Bảng</th><th>Số dòng</th><th>Xem</th></tr></thead><tbody id="offlineTableRows"></tbody></table></div>
           </div>
           <div class="card">
-            <div class="toolbar"><h3 id="offlinePreviewTitle">Preview dữ liệu</h3><button class="secondary" type="button" id="offlineReloadBtn">Tải lại</button></div>
+            <div class="toolbar"><h3 id="offlinePreviewTitle">Preview dữ liệu</h3><div class="actions"><input class="search" id="offlineTableSearch" placeholder="Tìm trong bảng"><button class="secondary" type="button" id="offlinePrevBtn">Trước</button><button class="secondary" type="button" id="offlineNextBtn">Sau</button><button class="secondary" type="button" id="offlineCsvBtn">CSV</button><button class="secondary" type="button" id="offlineReloadBtn">Tải lại</button></div></div>
             <div class="tablewrap"><table id="offlinePreviewTable"><thead id="offlinePreviewHead"></thead><tbody id="offlinePreviewRows"></tbody></table></div>
           </div>
         </div>
@@ -2112,7 +2181,7 @@ INDEX_HTML = r"""<!doctype html>
     async function loadAll(){await Promise.all([loadDashboard(),loadOfflineData(),loadCatalogs(),loadExpenses(),loadInventory(),loadProjects(),loadProjectAccounting(),loadConstruction(),loadDocuments(),loadForms(),loadReports(),loadAccounting(),loadFinance(),loadSettings(),loadUsers()])}
     async function loadDashboard(){state.dashboard=await api('/api/dashboard');renderDashboard()}
     async function loadOfflineData(){state.offlineData=await api('/api/offline-data');renderOfflineData()}
-    async function loadOfflineTable(name){state.offlineTable=await api(`/api/offline-data/${encodeURIComponent(name)}?limit=100`);renderOfflinePreview()}
+    async function loadOfflineTable(name,page=1){const q=offlineTableSearch.value||'';state.offlineTable=await api(`/api/offline-data/${encodeURIComponent(name)}?limit=100&page=${page}&q=${encodeURIComponent(q)}`);renderOfflinePreview()}
     async function loadCatalogs(){const [projects,categories]=await Promise.all([api('/api/projects'),api('/api/categories')]);state.projects=projects;state.categories=categories;fillSelects();renderProjects()}
     async function loadExpenses(){state.expenses=await api('/api/expenses');renderExpenses()}
     async function loadInventory(){const [items,history]=await Promise.all([api('/api/inventory'),api('/api/inventory/history')]);state.inventory=items;state.history=history;renderInventory()}
@@ -2128,8 +2197,8 @@ INDEX_HTML = r"""<!doctype html>
     async function loadUsers(){try{state.users=await api('/api/users');renderUsers()}catch(err){state.users=[];renderUsers(err.message)}}
     function fillSelects(){const projectOptions='<option value="">Không gắn dự án</option>'+state.projects.map(p=>`<option value="${p.id}">${esc(p.code)} - ${esc(p.name)}</option>`).join('');const requiredProjectOptions=state.projects.map(p=>`<option value="${p.id}">${esc(p.code)} - ${esc(p.name)}</option>`).join('');const categoryOptions=state.categories.map(c=>`<option value="${c.id}">${esc(c.code)} - ${esc(c.name)}</option>`).join('');expenseProject.innerHTML=projectOptions;diaryProject.innerHTML=projectOptions;documentProject.innerHTML=projectOptions;contractProject.innerHTML=requiredProjectOptions;costPlanProject.innerHTML=requiredProjectOptions;revenueProject.innerHTML=requiredProjectOptions;expenseCategory.innerHTML=categoryOptions;documentCategory.innerHTML='<option value="">Chọn danh mục</option>'+categoryOptions;costPlanCategory.innerHTML=categoryOptions;fillContractSelects()}
     function fillContractSelects(){const rows=(state.projectAccounting&&state.projectAccounting.contracts)||[];const options='<option value="">Chọn hợp đồng</option>'+rows.map(c=>`<option value="${c.id}">${esc(c.contract_no)} - ${esc(c.partner_name)}</option>`).join('');if(typeof billingContract!=='undefined'){billingContract.innerHTML=options;revenueContract.innerHTML=options}}
-    function renderOfflineData(){const d=state.offlineData||{},s=d.summary||{};odTables.textContent=s.table_count||0;odActiveTables.textContent=s.active_table_count||0;odRecords.textContent=money(s.record_count);const q=(offlineSearch.value||'').toLowerCase();const tables=(d.tables||[]).filter(t=>JSON.stringify(t).toLowerCase().includes(q));offlineTableRows.innerHTML=tables.map(t=>`<tr><td><strong>${esc(t.label)}</strong></td><td>${esc(t.name)}</td><td class="num">${money(t.count)}</td><td><button class="secondary" type="button" data-offline-table="${esc(t.name)}">Xem</button></td></tr>`).join('')||'<tr><td colspan="4" class="empty">Chưa có dữ liệu.</td></tr>';document.querySelectorAll('[data-offline-table]').forEach(btn=>btn.addEventListener('click',()=>loadOfflineTable(btn.dataset.offlineTable)));if(!state.offlineTable&&tables.length){loadOfflineTable(tables.find(t=>t.count)?.name||tables[0].name)}}
-    function renderOfflinePreview(){const t=state.offlineTable||{},rows=t.rows||[],columns=[...new Set(rows.flatMap(r=>Object.keys(r)))].slice(0,10);offlinePreviewTitle.textContent=`Preview: ${t.label||t.name||''}`;odCurrent.textContent=t.name||'-';odPreviewCount.textContent=rows.length||0;offlinePreviewHead.innerHTML=columns.length?`<tr>${columns.map(c=>`<th>${esc(c)}</th>`).join('')}</tr>`:'';offlinePreviewRows.innerHTML=rows.map(r=>`<tr>${columns.map(c=>`<td>${esc(String(r[c]??'').slice(0,90))}</td>`).join('')}</tr>`).join('')||'<tr><td class="empty">Không có dòng dữ liệu.</td></tr>'}
+    function renderOfflineData(){const d=state.offlineData||{},s=d.summary||{};odTables.textContent=s.table_count||0;odActiveTables.textContent=s.active_table_count||0;odRecords.textContent=money(s.record_count);const q=(offlineSearch.value||'').toLowerCase();const tables=(d.tables||[]).filter(t=>JSON.stringify(t).toLowerCase().includes(q));offlineTableRows.innerHTML=tables.map(t=>`<tr><td><strong>${esc(t.label)}</strong></td><td>${esc(t.name)}</td><td class="num">${money(t.count)}</td><td><button class="secondary" type="button" data-offline-table="${esc(t.name)}">Xem</button></td></tr>`).join('')||'<tr><td colspan="4" class="empty">Chưa có dữ liệu.</td></tr>';document.querySelectorAll('[data-offline-table]').forEach(btn=>btn.addEventListener('click',()=>{offlineTableSearch.value='';loadOfflineTable(btn.dataset.offlineTable)}));if(!state.offlineTable&&tables.length){loadOfflineTable(tables.find(t=>t.count)?.name||tables[0].name)}}
+    function renderOfflinePreview(){const t=state.offlineTable||{},rows=t.rows||[],columns=(t.columns&&t.columns.length?t.columns:[...new Set(rows.flatMap(r=>Object.keys(r)))]).slice(0,14);offlinePreviewTitle.textContent=`${t.label||t.name||''} · ${money(t.total||0)} dòng · trang ${t.page||1}`;odCurrent.textContent=t.name||'-';odPreviewCount.textContent=`${money(rows.length)} / ${money(t.total||0)}`;offlinePrevBtn.disabled=(t.page||1)<=1;offlineNextBtn.disabled=((t.offset||0)+rows.length)>=(t.total||0);offlinePreviewHead.innerHTML=columns.length?`<tr>${columns.map(c=>`<th>${esc(c)}</th>`).join('')}</tr>`:'';offlinePreviewRows.innerHTML=rows.map(r=>`<tr>${columns.map(c=>`<td>${esc(String(r[c]??'').slice(0,120))}</td>`).join('')}</tr>`).join('')||'<tr><td class="empty">Không có dòng dữ liệu.</td></tr>'}
     function renderDashboard(){const d=state.dashboard||{},s=d.stats||{};kTotal.textContent=money(s.total_expenses);kMonth.textContent=money(s.monthly_expenses);kProjects.textContent=s.total_projects||0;kDocs.textContent=s.total_documents||0;kStock.textContent=money(d.stock_value);const max=Math.max(1,...(d.categories||[]).map(x=>x.total||0));categoryBars.innerHTML=(d.categories||[]).map(x=>`<div class="barrow"><strong>${esc(x.name)}</strong><div class="bar"><div class="fill" style="width:${Math.round((x.total||0)/max*100)}%"></div></div><span class="num">${money(x.total)}</span></div>`).join('')||'<div class="empty">Chưa có dữ liệu chi phí.</div>';lowStockRows.innerHTML=(d.low_stock||[]).map(x=>`<tr><td>${esc(x.code)}</td><td>${esc(x.name)}</td><td class="num">${money(x.quantity)} ${esc(x.unit)}</td><td class="num">${money(x.min_quantity)}</td></tr>`).join('')||'<tr><td colspan="4" class="empty">Không có cảnh báo tồn kho.</td></tr>'}
     function renderExpenses(){const q=(expenseSearch.value||'').toLowerCase();const rows=state.expenses.filter(e=>JSON.stringify(e).toLowerCase().includes(q));expenseRows.innerHTML=rows.map(e=>`<tr><td>${esc(e.expense_date)}</td><td>${esc(e.project_name||'')}</td><td>${esc(e.category_name||'')}</td><td>${esc(e.description||'')}</td><td class="num">${money(e.amount)}</td><td><span class="status">${esc(e.status)}</span></td></tr>`).join('')||'<tr><td colspan="6" class="empty">Chưa có chi phí.</td></tr>'}
     function renderInventory(){const q=(inventorySearch.value||'').toLowerCase();const rows=state.inventory.filter(i=>JSON.stringify(i).toLowerCase().includes(q));inventoryRows.innerHTML=rows.map(i=>`<tr><td>${esc(i.code)}</td><td>${esc(i.name)}</td><td>${esc(i.category)}</td><td class="num">${money(i.quantity)} ${esc(i.unit)}</td><td class="num">${money(i.unit_price)}</td><td><span class="status">${esc(i.status)}</span></td></tr>`).join('')||'<tr><td colspan="6" class="empty">Chưa có vật tư.</td></tr>';historyRows.innerHTML=state.history.map(h=>`<tr><td>${esc(h.transaction_date)}</td><td>${esc(h.code)}</td><td>${esc(h.name)}</td><td>${esc(h.transaction_type)}</td><td class="num">${money(h.quantity)}</td><td>${esc(h.notes)}</td></tr>`).join('')||'<tr><td colspan="6" class="empty">Chưa có giao dịch kho.</td></tr>'}
@@ -2150,7 +2219,7 @@ INDEX_HTML = r"""<!doctype html>
     loginForm.addEventListener('submit',async e=>{e.preventDefault();const data=Object.fromEntries(new FormData(loginForm).entries());try{const r=await api('/api/auth/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});if(r.token)localStorage.setItem('fastrack_auth_token',r.token);state.auth=r.user;hideLogin();userChip.textContent=`${state.auth.full_name||state.auth.username} · ${state.auth.role}`;loginForm.reset();await loadAll();toast('Đã đăng nhập')}catch(err){toast(err.message)}});
     logoutBtn.addEventListener('click',async()=>{try{await api('/api/auth/logout',{method:'POST'});}catch(err){}localStorage.removeItem('fastrack_auth_token');state.auth=null;userChip.textContent='Chưa đăng nhập';showLogin()});
     reloadUsersBtn.addEventListener('click',()=>loadUsers());
-    offlineSearch.addEventListener('input',renderOfflineData);offlineReloadBtn.addEventListener('click',()=>loadOfflineData());
+    offlineSearch.addEventListener('input',renderOfflineData);offlineReloadBtn.addEventListener('click',()=>loadOfflineData());offlineJsonBtn.addEventListener('click',()=>{window.location.href='/api/offline-data/export.json?limit_per_table=5000'});offlineCsvBtn.addEventListener('click',()=>{const t=state.offlineTable||{};if(!t.name)return toast('Chưa chọn bảng');window.location.href=`/api/offline-data/${encodeURIComponent(t.name)}.csv?limit=5000&q=${encodeURIComponent(offlineTableSearch.value||'')}`});offlinePrevBtn.addEventListener('click',()=>{const t=state.offlineTable||{};if(t.name&&Number(t.page)>1)loadOfflineTable(t.name,Number(t.page)-1)});offlineNextBtn.addEventListener('click',()=>{const t=state.offlineTable||{};if(t.name)loadOfflineTable(t.name,Number(t.page||1)+1)});offlineTableSearch.addEventListener('change',()=>{const t=state.offlineTable||{};if(t.name)loadOfflineTable(t.name,1)});
     reportMonth.value=new Date().toISOString().slice(0,7);reportMonth.addEventListener('change',()=>loadReports());csvExportBtn.addEventListener('click',()=>{window.location.href=`/api/export/monthly-report.csv?month=${encodeURIComponent(reportMonth.value)}`});sheetsExportBtn.addEventListener('click',async()=>{try{const r=await api('/api/export/sheets',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({month:reportMonth.value})});toast(r.url?'Đã xuất Google Sheets':'Đã gửi yêu cầu xuất')}catch(err){toast(err.message)}});
     expenseSearch.addEventListener('input',renderExpenses);inventorySearch.addEventListener('input',renderInventory);contractSearch.addEventListener('input',renderProjectAccounting);documentSearch.addEventListener('input',renderDocuments);formSearch.addEventListener('input',renderForms);accountSearch.addEventListener('input',renderAccounting);journalSearch.addEventListener('input',renderAccounting);financeSearch.addEventListener('input',renderFinance);
     expenseForm.expense_date.value=new Date().toISOString().slice(0,10);
