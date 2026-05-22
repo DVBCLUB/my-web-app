@@ -14,7 +14,8 @@ from functools import wraps
 from typing import Any
 
 try:
-    from flask import Flask, Response, jsonify, request, session
+    from flask import Flask, Response, current_app, jsonify, request, session
+    from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 except ImportError:  # pragma: no cover - lets the desktop app import safely.
     Flask = None
 
@@ -60,10 +61,30 @@ def public_user(user: dict[str, Any] | None) -> dict[str, Any]:
 
 
 def current_user() -> dict[str, Any] | None:
-    user_id = session.get("user_id")
+    user_id = session.get("user_id") or token_user_id()
     if not user_id:
         return None
     return AuthManager().get_user(user_id)
+
+
+def make_auth_token(user_id: int) -> str:
+    serializer = URLSafeTimedSerializer(current_app.secret_key, salt="fastrack-web-auth")
+    return serializer.dumps({"user_id": int(user_id)})
+
+
+def token_user_id() -> int | None:
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        return None
+    token = auth_header.split(" ", 1)[1].strip()
+    if not token:
+        return None
+    serializer = URLSafeTimedSerializer(current_app.secret_key, salt="fastrack-web-auth")
+    try:
+        payload = serializer.loads(token, max_age=7 * 24 * 3600)
+        return int(payload.get("user_id") or 0) or None
+    except (BadSignature, SignatureExpired, ValueError, TypeError):
+        return None
 
 
 def ensure_web_admin():
@@ -320,7 +341,7 @@ def create_app():
     @app.before_request
     def require_api_session():
         public_paths = ("/api/health", "/api/auth/login", "/api/auth/logout", "/api/auth/me")
-        if request.path.startswith("/api/") and request.path not in public_paths and not session.get("user_id"):
+        if request.path.startswith("/api/") and request.path not in public_paths and not current_user():
             return jsonify({"error": "Can dang nhap"}), 401
 
     @app.get("/")
@@ -365,7 +386,7 @@ def create_app():
         session["user_id"] = user["id"]
         session["role"] = user.get("role")
         AuditLogManager().log("user", user["id"], "login", user["id"], new_value="Dang nhap web")
-        return jsonify({"authenticated": True, "user": public_user(user)})
+        return jsonify({"authenticated": True, "token": make_auth_token(user["id"]), "user": public_user(user)})
 
     @app.post("/api/auth/logout")
     def auth_logout():
@@ -1348,7 +1369,7 @@ INDEX_HTML = r"""<!doctype html>
     const money=v=>new Intl.NumberFormat('vi-VN',{maximumFractionDigits:0}).format(Number(v||0));
     const esc=v=>String(v??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
     const toast=t=>{const el=document.getElementById('toast');el.textContent=t;el.style.display='block';setTimeout(()=>el.style.display='none',2800)};
-    async function api(url,options={}){const r=await fetch(url,options);const data=await r.json();if(r.status===401){showLogin();throw new Error(data.error||'Cần đăng nhập')}if(!r.ok)throw new Error(data.error||'Có lỗi xảy ra');return data}
+    async function api(url,options={}){const token=localStorage.getItem('fastrack_auth_token');options={...options,headers:{...(options.headers||{})}};if(token)options.headers.Authorization=`Bearer ${token}`;const r=await fetch(url,options);const data=await r.json();if(r.status===401){localStorage.removeItem('fastrack_auth_token');showLogin();throw new Error(data.error||'Cần đăng nhập')}if(!r.ok)throw new Error(data.error||'Có lỗi xảy ra');return data}
     function showLogin(){authGate.classList.remove('hidden')}
     function hideLogin(){authGate.classList.add('hidden')}
     function switchView(id){document.querySelectorAll('.view').forEach(v=>v.classList.toggle('active',v.id===id));document.querySelectorAll('.navbtn').forEach(b=>b.classList.toggle('active',b.dataset.view===id));document.getElementById('pageTitle').textContent={dashboard:'Tổng quan',expenses:'Chi phí',inventory:'Vật tư kho',projects:'Dự án',projectAccounting:'Kế toán công trình',construction:'Công trường',documents:'Chứng từ',forms:'Biểu mẫu',reports:'Báo cáo',finance:'Kiểm soát & tài chính',security:'Bảo mật',settings:'Cài đặt',deploy:'Tên miền'}[id]||'FasTrack ERP';document.getElementById('side').classList.remove('open')}
@@ -1385,8 +1406,8 @@ INDEX_HTML = r"""<!doctype html>
     document.querySelectorAll('[data-view]').forEach(b=>b.addEventListener('click',()=>switchView(b.dataset.view)));
     document.querySelectorAll('[data-view-jump]').forEach(b=>b.addEventListener('click',()=>switchView(b.dataset.viewJump)));
     menuBtn.addEventListener('click',()=>side.classList.toggle('open'));refreshBtn.addEventListener('click',()=>loadAll().then(()=>toast('Đã tải lại dữ liệu')));
-    loginForm.addEventListener('submit',async e=>{e.preventDefault();const data=Object.fromEntries(new FormData(loginForm).entries());try{const r=await api('/api/auth/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});state.auth=r.user;hideLogin();userChip.textContent=`${state.auth.full_name||state.auth.username} · ${state.auth.role}`;loginForm.reset();await loadAll();toast('Đã đăng nhập')}catch(err){toast(err.message)}});
-    logoutBtn.addEventListener('click',async()=>{try{await api('/api/auth/logout',{method:'POST'});}catch(err){}state.auth=null;userChip.textContent='Chưa đăng nhập';showLogin()});
+    loginForm.addEventListener('submit',async e=>{e.preventDefault();const data=Object.fromEntries(new FormData(loginForm).entries());try{const r=await api('/api/auth/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});if(r.token)localStorage.setItem('fastrack_auth_token',r.token);state.auth=r.user;hideLogin();userChip.textContent=`${state.auth.full_name||state.auth.username} · ${state.auth.role}`;loginForm.reset();await loadAll();toast('Đã đăng nhập')}catch(err){toast(err.message)}});
+    logoutBtn.addEventListener('click',async()=>{try{await api('/api/auth/logout',{method:'POST'});}catch(err){}localStorage.removeItem('fastrack_auth_token');state.auth=null;userChip.textContent='Chưa đăng nhập';showLogin()});
     reloadUsersBtn.addEventListener('click',()=>loadUsers());
     expenseSearch.addEventListener('input',renderExpenses);inventorySearch.addEventListener('input',renderInventory);contractSearch.addEventListener('input',renderProjectAccounting);documentSearch.addEventListener('input',renderDocuments);formSearch.addEventListener('input',renderForms);financeSearch.addEventListener('input',renderFinance);
     expenseForm.expense_date.value=new Date().toISOString().slice(0,10);
