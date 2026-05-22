@@ -1,0 +1,11 @@
+.git
+.venv
+.vs
+.vscode
+**/__pycache__/
+**/*.pyc
+PythonApplication1/logs/
+PythonApplication1/backups/
+PythonApplication1/reports/
+PythonApplication1/documents/generated_forms/
+FasTrack ERP.lnk

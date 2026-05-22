@@ -7,12 +7,12 @@ steps:
     args:
       - build
       - -t
-      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/fastrack/${_SERVICE}:$SHORT_SHA
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/fastrack/${_SERVICE}:$BUILD_ID
       - .
   - name: gcr.io/cloud-builders/docker
     args:
       - push
-      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/fastrack/${_SERVICE}:$SHORT_SHA
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/fastrack/${_SERVICE}:$BUILD_ID
   - name: gcr.io/google.com/cloudsdktool/cloud-sdk
     entrypoint: gcloud
     args:
@@ -20,7 +20,7 @@ steps:
       - deploy
       - ${_SERVICE}
       - --image
-      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/fastrack/${_SERVICE}:$SHORT_SHA
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/fastrack/${_SERVICE}:$BUILD_ID
       - --region
       - ${_REGION}
       - --platform
@@ -32,4 +32,4 @@ steps:
       - "1"
 
 images:
-  - ${_REGION}-docker.pkg.dev/$PROJECT_ID/fastrack/${_SERVICE}:$SHORT_SHA
+  - ${_REGION}-docker.pkg.dev/$PROJECT_ID/fastrack/${_SERVICE}:$BUILD_ID
