@@ -17,14 +17,13 @@ try:
 except ImportError:  # pragma: no cover - lets the desktop app import safely.
     Flask = None
 
-from database import init_database
+from database import get_connection, init_database
 from modules.accounting import ExpenseManager
 from modules.advance_workflow import AdvanceWorkflowManager
 from modules.backup import BackupManager
 from modules.construction import ConstructionManager
 from modules.invoices import DocumentManager
 from modules.materials import MaterialManager
-from modules.reports import ReportGenerator
 from modules.template_renderer import TemplateRenderer
 from modules.utilities import UtilityManager
 
@@ -38,6 +37,66 @@ def row_to_dict(row: Any, keys: list[str] | tuple[str, ...] | None = None) -> di
     if keys:
         return {key: row[index] if index < len(row) else None for index, key in enumerate(keys)}
     return {str(index): value for index, value in enumerate(row)}
+
+
+class WebReportGenerator:
+    """Report queries for the web runtime without importing desktop Tk widgets."""
+
+    def __init__(self):
+        self.conn = get_connection()
+
+    def get_expense_summary(self, start_date=None, end_date=None):
+        cursor = self.conn.cursor()
+        query = """
+            SELECT ec.name, SUM(e.amount) as total, COUNT(e.id) as count
+            FROM expenses e
+            JOIN expense_categories ec ON e.category_id = ec.id
+        """
+        params = []
+        if start_date and end_date:
+            query += " WHERE e.expense_date BETWEEN ? AND ?"
+            params = [start_date, end_date]
+        query += " GROUP BY e.category_id ORDER BY total DESC"
+        cursor.execute(query, params)
+        return cursor.fetchall()
+
+    def get_project_expense_summary(self):
+        cursor = self.conn.cursor()
+        cursor.execute(
+            """
+            SELECT p.name, SUM(e.amount) as total, COUNT(e.id) as count
+            FROM expenses e
+            LEFT JOIN projects p ON e.project_id = p.id
+            GROUP BY e.project_id
+            ORDER BY total DESC
+            """
+        )
+        return cursor.fetchall()
+
+    def get_monthly_expense_summary(self):
+        cursor = self.conn.cursor()
+        cursor.execute(
+            """
+            SELECT strftime('%Y-%m', expense_date) AS month, SUM(amount) AS total
+            FROM expenses
+            GROUP BY strftime('%Y-%m', expense_date)
+            ORDER BY month
+            """
+        )
+        return cursor.fetchall()
+
+    def get_material_stock_summary(self):
+        cursor = self.conn.cursor()
+        cursor.execute(
+            """
+            SELECT name, quantity, unit_price, quantity * COALESCE(unit_price, 0) AS total_value
+            FROM materials
+            WHERE status = 'active'
+            ORDER BY total_value DESC
+            LIMIT 12
+            """
+        )
+        return cursor.fetchall()
 
 
 def api_error(handler):
@@ -91,7 +150,7 @@ def create_app():
         expenses = ExpenseManager()
         materials = MaterialManager()
         construction = ConstructionManager()
-        report = ReportGenerator()
+        report = WebReportGenerator()
         stats = expenses.get_statistics()
         categories = [
             {"name": row[0] or "Chưa phân loại", "total": row[1] or 0}
@@ -323,14 +382,14 @@ def create_app():
         return jsonify(
             [
                 {"month": row[0] or "N/A", "total": row[1] or 0}
-                for row in ReportGenerator().get_monthly_expense_summary()
+                for row in WebReportGenerator().get_monthly_expense_summary()
             ]
         )
 
     @app.get("/api/reports/summary")
     @api_error
     def report_summary():
-        report = ReportGenerator()
+        report = WebReportGenerator()
         return jsonify(
             {
                 "expense_summary": [
