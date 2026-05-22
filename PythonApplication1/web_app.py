@@ -827,6 +827,74 @@ class WebGoogleExportCenter:
             raise
 
 
+class WebGoogleDriveBackup:
+    """Create a verified SQLite backup and upload it to Google Drive."""
+
+    def create_and_upload(self, folder_id: str | None = None):
+        folder_id = folder_id or os.environ.get("GOOGLE_DRIVE_BACKUP_FOLDER_ID")
+        if not folder_id:
+            return {
+                "ok": False,
+                "setup_needed": True,
+                "message": "Can folder_id hoac bien moi truong GOOGLE_DRIVE_BACKUP_FOLDER_ID.",
+            }
+        manager = BackupManager()
+        backup_name = f"fastrack_backup_{date.today().isoformat()}.db"
+        ok, message = manager.create_backup(backup_name)
+        if not ok:
+            return {"ok": False, "message": message}
+        backup_path = os.path.join(manager.backup_dir, backup_name)
+        return self.upload_file(backup_path, folder_id, message)
+
+    def upload_file(self, path: str, folder_id: str, backup_message: str = ""):
+        if not os.path.exists(path):
+            return {"ok": False, "message": "File backup khong ton tai."}
+        try:
+            import google.auth
+            from google.auth.transport.requests import Request
+        except ImportError as exc:
+            return {"ok": False, "setup_needed": True, "message": f"Thieu google-auth: {exc}"}
+
+        credentials, _ = google.auth.default(scopes=["https://www.googleapis.com/auth/drive.file"])
+        credentials.refresh(Request())
+        token = credentials.token
+        metadata = {
+            "name": os.path.basename(path),
+            "parents": [folder_id],
+            "description": "FasTrack ERP SQLite verified backup",
+        }
+        boundary = "fastrack-drive-backup"
+        with open(path, "rb") as handle:
+            file_bytes = handle.read()
+        body = b"\r\n".join(
+            [
+                f"--{boundary}".encode(),
+                b"Content-Type: application/json; charset=UTF-8",
+                b"",
+                json.dumps(metadata).encode("utf-8"),
+                f"--{boundary}".encode(),
+                b"Content-Type: application/x-sqlite3",
+                b"",
+                file_bytes,
+                f"--{boundary}--".encode(),
+            ]
+        )
+        req = url_request.Request(
+            "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,name,webViewLink,size",
+            data=body,
+            headers={"Authorization": f"Bearer {token}", "Content-Type": f"multipart/related; boundary={boundary}"},
+            method="POST",
+        )
+        with url_request.urlopen(req, timeout=60) as response:
+            result = json.loads(response.read().decode("utf-8"))
+        return {
+            "ok": True,
+            "message": backup_message,
+            "file": result,
+            "local_backup": path,
+        }
+
+
 def api_error(handler):
     @wraps(handler)
     def wrapper(*args, **kwargs):
@@ -1336,6 +1404,15 @@ def create_app():
         if ok:
             UtilityManager().mark_backup_now()
         return jsonify({"ok": ok, "message": message})
+
+    @app.post("/api/backups/drive")
+    @api_error
+    def create_drive_backup():
+        data = request.get_json(silent=True) or {}
+        result = WebGoogleDriveBackup().create_and_upload(data.get("folder_id") or request.args.get("folder_id"))
+        if result.get("ok"):
+            UtilityManager().mark_backup_now()
+        return jsonify(result), 200 if result.get("ok") else 400
 
     @app.get("/api/finance-center")
     @api_error
@@ -1985,9 +2062,16 @@ INDEX_HTML = r"""<!doctype html>
             <label>Mã số thuế<input name="company_tax_code"></label>
             <label>Người đại diện<input name="company_representative"></label>
             <label>Tên viết tắt<input name="company_short_name"></label>
-            <div class="wide actions"><button class="primary" type="submit">Lưu cài đặt</button><button class="secondary" type="button" id="backupBtn">Sao lưu ngay</button></div>
+            <div class="wide actions"><button class="primary" type="submit">Lưu cài đặt</button><button class="secondary" type="button" id="backupBtn">Sao lưu ngay</button><button class="secondary" type="button" id="driveBackupBtn">Drive backup</button></div>
           </form>
           <p class="muted" id="backupHealth"></p>
+        </div>
+        <div class="card">
+          <h3>Google Drive backup</h3>
+          <form class="form" id="driveBackupForm">
+            <label class="wide">Drive folder ID<input name="folder_id" placeholder="Lấy trong URL thư mục Google Drive hoặc cấu hình GOOGLE_DRIVE_BACKUP_FOLDER_ID"></label>
+          </form>
+          <p class="muted" id="driveBackupStatus">Chưa chạy sao lưu Drive.</p>
         </div>
         <div class="grid two">
           <div class="card"><h3>Kiểm tra liên kết dữ liệu</h3><div class="tablewrap"><table><thead><tr><th>Nhóm</th><th>Vấn đề</th><th>TT</th><th>Số dòng</th></tr></thead><tbody id="linkageRows"></tbody></table></div></div>
@@ -2091,6 +2175,7 @@ INDEX_HTML = r"""<!doctype html>
     userForm.addEventListener('submit',async e=>{e.preventDefault();const data=Object.fromEntries(new FormData(userForm).entries());try{await api('/api/users',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});userForm.reset();await loadUsers();toast('Đã tạo người dùng')}catch(err){toast(err.message)}});
     passwordForm.addEventListener('submit',async e=>{e.preventDefault();const data=Object.fromEntries(new FormData(passwordForm).entries());try{await api('/api/auth/change-password',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});passwordForm.reset();toast('Đã đổi mật khẩu')}catch(err){toast(err.message)}});
     backupBtn.addEventListener('click',async()=>{try{const r=await api('/api/backups',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});await loadSettings();toast(r.message||'Đã sao lưu')}catch(err){toast(err.message)}});
+    driveBackupBtn.addEventListener('click',async()=>{const data=Object.fromEntries(new FormData(driveBackupForm).entries());try{driveBackupStatus.textContent='Đang tạo backup và upload Drive...';const r=await api('/api/backups/drive',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});driveBackupStatus.innerHTML=r.file&&r.file.webViewLink?`Đã sao lưu Drive: <a href="${esc(r.file.webViewLink)}" target="_blank" rel="noopener">${esc(r.file.name)}</a>`:(r.message||'Đã sao lưu Drive');await loadSettings();toast('Đã sao lưu lên Google Drive')}catch(err){driveBackupStatus.textContent=err.message;toast(err.message)}});
     navigator.serviceWorker&&navigator.serviceWorker.register('/service-worker.js');
     boot().catch(err=>toast(err.message));
   </script>
