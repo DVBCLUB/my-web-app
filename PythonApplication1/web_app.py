@@ -8,18 +8,20 @@ Then open:
 
 from __future__ import annotations
 
+import os
 from datetime import date, timedelta
 from functools import wraps
 from typing import Any
 
 try:
-    from flask import Flask, Response, jsonify, request
+    from flask import Flask, Response, jsonify, request, session
 except ImportError:  # pragma: no cover - lets the desktop app import safely.
     Flask = None
 
 from database import get_connection, init_database
 from modules.accounting import ExpenseManager
 from modules.advance_workflow import AdvanceWorkflowManager
+from modules.auth import AuthManager, PermissionManager
 from modules.backup import BackupManager
 from modules.bank_reconciliation import BankReconciliationManager
 from modules.construction import ConstructionManager
@@ -46,6 +48,44 @@ def row_to_dict(row: Any, keys: list[str] | tuple[str, ...] | None = None) -> di
 
 def row_to_named_dict(row: Any, keys: list[str] | tuple[str, ...]) -> dict[str, Any]:
     return {key: row[index] if index < len(row) else None for index, key in enumerate(keys)}
+
+
+def public_user(user: dict[str, Any] | None) -> dict[str, Any]:
+    if not user:
+        return {}
+    clean = dict(user)
+    clean.pop("password", None)
+    clean["permissions"] = PermissionManager.get_role_permissions(clean.get("role"))
+    return clean
+
+
+def current_user() -> dict[str, Any] | None:
+    user_id = session.get("user_id")
+    if not user_id:
+        return None
+    return AuthManager().get_user(user_id)
+
+
+def ensure_web_admin():
+    """Create a first admin account for web deployments when the DB is empty."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT COUNT(*) FROM users")
+    if int(cursor.fetchone()[0] or 0):
+        return
+    username = os.environ.get("FASTRACK_BOOTSTRAP_USER", "admin")
+    password = os.environ.get("FASTRACK_BOOTSTRAP_PASSWORD", "Admin@2026!")
+    full_name = os.environ.get("FASTRACK_BOOTSTRAP_NAME", "Quan tri he thong")
+    email = os.environ.get("FASTRACK_BOOTSTRAP_EMAIL", "admin@fastrack.local")
+    hashed = AuthManager.hash_password(password)
+    cursor.execute(
+        """
+        INSERT INTO users (username, password, full_name, email, role, active, password_changed_at, must_change_password)
+        VALUES (?, ?, ?, ?, 'admin', 1, CURRENT_TIMESTAMP, 1)
+        """,
+        (username, hashed, full_name, email),
+    )
+    conn.commit()
 
 
 class WebReportGenerator:
@@ -248,13 +288,40 @@ def api_error(handler):
     return wrapper
 
 
+def require_permission(permission: str):
+    def decorator(handler):
+        @wraps(handler)
+        def wrapper(*args, **kwargs):
+            user = current_user()
+            if not user:
+                return jsonify({"error": "Can dang nhap"}), 401
+            if not PermissionManager.has_permission(user.get("role"), permission):
+                return jsonify({"error": "Khong du quyen"}), 403
+            return handler(*args, **kwargs)
+
+        return wrapper
+
+    return decorator
+
+
 def create_app():
     if Flask is None:
         raise RuntimeError("Cần cài Flask để chạy bản web: pip install flask")
 
     init_database()
+    ensure_web_admin()
     app = Flask(__name__)
+    app.secret_key = os.environ.get("FLASK_SECRET_KEY", "fastrack-dev-session-key-change-me")
     app.config["JSON_AS_ASCII"] = False
+    app.config["SESSION_COOKIE_HTTPONLY"] = True
+    app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+    app.config["SESSION_COOKIE_SECURE"] = os.environ.get("FLASK_COOKIE_SECURE", "0") in ("1", "true", "yes")
+
+    @app.before_request
+    def require_api_session():
+        public_paths = ("/api/health", "/api/auth/login", "/api/auth/logout", "/api/auth/me")
+        if request.path.startswith("/api/") and request.path not in public_paths and not session.get("user_id"):
+            return jsonify({"error": "Can dang nhap"}), 401
 
     @app.get("/")
     def index():
@@ -281,6 +348,88 @@ def create_app():
     @app.get("/api/health")
     def health():
         return jsonify({"status": "ok", "date": date.today().isoformat()})
+
+    @app.get("/api/auth/me")
+    def auth_me():
+        user = current_user()
+        return jsonify({"authenticated": bool(user), "user": public_user(user)})
+
+    @app.post("/api/auth/login")
+    @api_error
+    def auth_login():
+        data = request.get_json(force=True)
+        ok, user = AuthManager().authenticate(data.get("username", ""), data.get("password", ""))
+        if not ok:
+            return jsonify({"error": "Sai tai khoan hoac mat khau"}), 401
+        session.clear()
+        session["user_id"] = user["id"]
+        session["role"] = user.get("role")
+        AuditLogManager().log("user", user["id"], "login", user["id"], new_value="Dang nhap web")
+        return jsonify({"authenticated": True, "user": public_user(user)})
+
+    @app.post("/api/auth/logout")
+    def auth_logout():
+        user_id = session.get("user_id")
+        if user_id:
+            try:
+                AuditLogManager().log("user", user_id, "logout", user_id, new_value="Dang xuat web")
+            except Exception:
+                pass
+        session.clear()
+        return jsonify({"authenticated": False})
+
+    @app.post("/api/auth/change-password")
+    @api_error
+    def change_password():
+        user = current_user()
+        if not user:
+            return jsonify({"error": "Can dang nhap"}), 401
+        data = request.get_json(force=True)
+        ok, message = AuthManager().change_password(user["id"], data.get("old_password", ""), data.get("new_password", ""))
+        if not ok:
+            return jsonify({"error": message}), 400
+        AuditLogManager().log("user", user["id"], "change_password", user["id"], new_value="Doi mat khau web")
+        return jsonify({"status": "saved", "message": message})
+
+    @app.get("/api/users")
+    @require_permission("manage_users")
+    @api_error
+    def users():
+        return jsonify([public_user(row_to_dict(row)) for row in AuthManager().get_all_users()])
+
+    @app.post("/api/users")
+    @require_permission("manage_users")
+    @api_error
+    def create_user():
+        data = request.get_json(force=True)
+        ok, message = AuthManager().create_user(
+            data["username"],
+            data["password"],
+            data.get("full_name", ""),
+            data.get("email", ""),
+            data.get("role", "employee"),
+        )
+        if not ok:
+            return jsonify({"error": message}), 400
+        AuditLogManager().log("user", None, "create_user", session.get("user_id"), new_value=data["username"])
+        return jsonify({"status": "created", "message": message})
+
+    @app.post("/api/users/<int:user_id>")
+    @require_permission("manage_users")
+    @api_error
+    def update_user(user_id):
+        data = request.get_json(force=True)
+        ok, message = AuthManager().update_user(
+            user_id,
+            full_name=data.get("full_name", ""),
+            email=data.get("email", ""),
+            role=data.get("role", "employee"),
+            active=int(data.get("active", 1)),
+        )
+        if not ok:
+            return jsonify({"error": message}), 400
+        AuditLogManager().log("user", user_id, "update_user", session.get("user_id"), new_value=data)
+        return jsonify({"status": "saved", "message": message})
 
     @app.get("/api/dashboard")
     @api_error
@@ -374,7 +523,7 @@ def create_app():
             data.get("paid_by", ""),
             data.get("payment_method", "Tiền mặt"),
             data.get("notes", ""),
-            int(data.get("created_by") or 1),
+            int(data.get("created_by") or session.get("user_id") or 1),
         )
         return jsonify({"id": expense_id, "status": "created"})
 
@@ -400,7 +549,7 @@ def create_app():
             float(data.get("quantity") or 0),
             data.get("project_id") or None,
             data.get("notes", ""),
-            int(data.get("created_by") or 1),
+            int(data.get("created_by") or session.get("user_id") or 1),
         )
         return jsonify({"id": transaction_id, "status": "created"})
 
@@ -451,7 +600,7 @@ def create_app():
             data.get("project_id") or None,
             data.get("category_id") or None,
             data.get("file_path", ""),
-            int(data.get("created_by") or 1),
+            int(data.get("created_by") or session.get("user_id") or 1),
             expense_id=data.get("expense_id") or None,
             status=data.get("status", "draft"),
             vat_rate=float(data.get("vat_rate") or 10),
@@ -649,7 +798,7 @@ def create_app():
         updated = FiscalPeriodLockManager().set_locked(
             data["fiscal_period"],
             bool(int(data.get("locked", 1))),
-            data.get("user_id") or 1,
+            data.get("user_id") or session.get("user_id") or 1,
         )
         return jsonify({"status": "saved", "updated": updated})
 
@@ -824,6 +973,7 @@ INDEX_HTML = r"""<!doctype html>
   <style>
     :root{--bg:#f4f6f8;--panel:#fff;--ink:#172033;--muted:#667085;--line:#dde3ea;--brand:#1e3a5f;--accent:#0f766e;--warn:#b45309;--danger:#b42318}
     *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font-family:Segoe UI,Arial,sans-serif}button,input,select,textarea{font:inherit}
+    .authgate{position:fixed;inset:0;background:#10243d;display:grid;place-items:center;z-index:20;padding:18px}.loginbox{width:min(420px,100%);background:#fff;border-radius:8px;padding:22px;border:1px solid var(--line);box-shadow:0 20px 50px #0005}.loginbox h2{margin:0 0 6px}.loginbox form{display:grid;gap:12px;margin-top:18px}.loginbox .primary{width:100%}.userchip{display:flex;align-items:center;gap:8px;border:1px solid var(--line);border-radius:7px;padding:8px 10px;background:#fff;color:var(--muted);font-size:13px}.hidden{display:none!important}
     .shell{display:grid;grid-template-columns:248px 1fr;min-height:100vh}.side{background:#10243d;color:#fff;padding:18px 14px;position:sticky;top:0;height:100vh;overflow:auto}.brand{display:flex;align-items:center;gap:10px;font-weight:800;font-size:18px;margin-bottom:18px}.mark{width:34px;height:34px;border-radius:8px;background:#c9a227;display:grid;place-items:center;color:#10243d}
     nav{display:grid;gap:6px}.navbtn{width:100%;border:0;background:transparent;color:#dbe7f3;text-align:left;padding:11px 12px;border-radius:7px;cursor:pointer}.navbtn.active,.navbtn:hover{background:#1e3a5f;color:#fff}.main{padding:20px;min-width:0}.topbar{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:16px}.topbar h1{font-size:24px;margin:0}.muted{color:var(--muted)}.grid{display:grid;gap:14px}.kpis{grid-template-columns:repeat(5,minmax(140px,1fr))}.card{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:14px}.kpi .label{font-size:13px;color:var(--muted)}.kpi .value{font-size:22px;font-weight:800;margin-top:6px}.two{grid-template-columns:1.1fr .9fr}.actions{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.primary{background:var(--brand);color:#fff;border:0;border-radius:7px;padding:10px 13px;cursor:pointer}.secondary{background:#fff;color:var(--brand);border:1px solid var(--line);border-radius:7px;padding:9px 12px;cursor:pointer}.danger{color:var(--danger)}.toolbar{display:flex;justify-content:space-between;gap:12px;align-items:center;margin-bottom:12px}.search{max-width:320px;width:100%;border:1px solid var(--line);border-radius:7px;padding:10px 12px}
     table{width:100%;border-collapse:collapse;font-size:14px}th,td{border-bottom:1px solid var(--line);padding:10px;text-align:left;vertical-align:top}th{font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em}td.num{text-align:right;font-variant-numeric:tabular-nums}.status{display:inline-block;padding:3px 8px;border-radius:999px;background:#e8eef6;color:#1e3a5f;font-size:12px}.status.low{background:#fff4e5;color:var(--warn)}.bars{display:grid;gap:10px}.barrow{display:grid;grid-template-columns:130px 1fr 96px;gap:10px;align-items:center}.bar{height:9px;background:#e8edf3;border-radius:999px;overflow:hidden}.fill{height:100%;background:var(--accent);width:0}.form{display:grid;grid-template-columns:repeat(2,minmax(160px,1fr));gap:10px}.form .wide{grid-column:1/-1}label{display:grid;gap:5px;font-size:13px;color:var(--muted)}input,select,textarea{border:1px solid var(--line);border-radius:7px;padding:10px;background:#fff;color:var(--ink)}textarea{min-height:76px;resize:vertical}.toast{position:fixed;right:18px;bottom:18px;background:#10243d;color:#fff;border-radius:8px;padding:12px 14px;box-shadow:0 10px 30px #0003;display:none}.view{display:none}.view.active{display:grid}.empty{padding:28px;color:var(--muted);text-align:center}.mobilebar{display:none;background:#10243d;color:#fff;padding:12px 14px;align-items:center;justify-content:space-between}.mobilebar button{width:42px;height:38px;border:1px solid #365472;background:#16304f;color:#fff;border-radius:7px}
@@ -831,6 +981,18 @@ INDEX_HTML = r"""<!doctype html>
   </style>
 </head>
 <body>
+  <div class="authgate" id="authGate">
+    <div class="loginbox">
+      <h2>Dang nhap FasTrack ERP</h2>
+      <p class="muted">Dung tai khoan noi bo de vao ban web va ghi audit log.</p>
+      <form id="loginForm">
+        <label>Tai khoan<input name="username" autocomplete="username" required></label>
+        <label>Mat khau<input name="password" type="password" autocomplete="current-password" required></label>
+        <button class="primary" type="submit">Dang nhap</button>
+      </form>
+      <p class="muted">Mac dinh khi DB trong: admin / Admin@2026!</p>
+    </div>
+  </div>
   <div class="mobilebar"><strong>FasTrack ERP</strong><button id="menuBtn" title="Mở menu">☰</button></div>
   <div class="shell">
     <aside class="side" id="side">
@@ -846,6 +1008,7 @@ INDEX_HTML = r"""<!doctype html>
         <button class="navbtn" data-view="forms">Biểu mẫu</button>
         <button class="navbtn" data-view="reports">Báo cáo</button>
         <button class="navbtn" data-view="finance">Kiểm soát & tài chính</button>
+        <button class="navbtn" data-view="security">Bảo mật</button>
         <button class="navbtn" data-view="settings">Cài đặt</button>
         <button class="navbtn" data-view="deploy">Tên miền</button>
       </nav>
@@ -853,7 +1016,7 @@ INDEX_HTML = r"""<!doctype html>
     <main class="main">
       <div class="topbar">
         <div><h1 id="pageTitle">Tổng quan</h1><div class="muted" id="subtitle">Bản web dùng chung dữ liệu với ứng dụng desktop.</div></div>
-        <div class="actions"><button class="secondary" id="refreshBtn">Tải lại</button><button class="primary" data-view-jump="expenses">Thêm chi phí</button></div>
+        <div class="actions"><span class="userchip" id="userChip">Chưa đăng nhập</span><button class="secondary" id="logoutBtn">Đăng xuất</button><button class="secondary" id="refreshBtn">Tải lại</button><button class="primary" data-view-jump="expenses">Thêm chi phí</button></div>
       </div>
 
       <section class="view active" id="dashboard">
@@ -1113,6 +1276,35 @@ INDEX_HTML = r"""<!doctype html>
         </div>
       </section>
 
+      <section class="view" id="security">
+        <div class="grid two">
+          <div class="card">
+            <h3>Người dùng</h3>
+            <form class="form" id="userForm">
+              <label>Tài khoản<input name="username" required></label>
+              <label>Họ tên<input name="full_name"></label>
+              <label>Email<input name="email" type="email"></label>
+              <label>Vai trò<select name="role"><option value="admin">admin</option><option value="accountant">accountant</option><option value="manager">manager</option><option value="employee">employee</option></select></label>
+              <label class="wide">Mật khẩu tạm<input name="password" type="password" minlength="10" placeholder="Ví dụ: User@2026!"></label>
+              <div class="wide actions"><button class="primary" type="submit">Tạo người dùng</button></div>
+            </form>
+          </div>
+          <div class="card">
+            <h3>Đổi mật khẩu của tôi</h3>
+            <form class="form" id="passwordForm">
+              <label>Mật khẩu hiện tại<input name="old_password" type="password" required></label>
+              <label>Mật khẩu mới<input name="new_password" type="password" minlength="10" required></label>
+              <div class="wide actions"><button class="primary" type="submit">Đổi mật khẩu</button></div>
+            </form>
+            <p class="muted">Mật khẩu mới cần tối thiểu 10 ký tự, có chữ hoa, chữ thường, số và ký tự đặc biệt.</p>
+          </div>
+        </div>
+        <div class="card">
+          <div class="toolbar"><h3>Danh sách người dùng</h3><button class="secondary" type="button" id="reloadUsersBtn">Tải lại</button></div>
+          <div class="tablewrap"><table><thead><tr><th>Tài khoản</th><th>Họ tên</th><th>Email</th><th>Vai trò</th><th>Trạng thái</th><th>Tạo lúc</th></tr></thead><tbody id="userRows"></tbody></table></div>
+        </div>
+      </section>
+
       <section class="view" id="settings">
         <div class="card">
           <h3>Thông tin công ty</h3>
@@ -1152,13 +1344,16 @@ INDEX_HTML = r"""<!doctype html>
   <div class="toast" id="toast"></div>
 
   <script>
-    const state={dashboard:null,expenses:[],inventory:[],history:[],projects:[],categories:[],projectAccounting:null,workItems:[],diaries:[],documents:[],forms:[],reports:null,finance:null,settings:null};
+    const state={auth:null,users:[],dashboard:null,expenses:[],inventory:[],history:[],projects:[],categories:[],projectAccounting:null,workItems:[],diaries:[],documents:[],forms:[],reports:null,finance:null,settings:null};
     const money=v=>new Intl.NumberFormat('vi-VN',{maximumFractionDigits:0}).format(Number(v||0));
     const esc=v=>String(v??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
     const toast=t=>{const el=document.getElementById('toast');el.textContent=t;el.style.display='block';setTimeout(()=>el.style.display='none',2800)};
-    async function api(url,options){const r=await fetch(url,options);const data=await r.json();if(!r.ok)throw new Error(data.error||'Có lỗi xảy ra');return data}
-    function switchView(id){document.querySelectorAll('.view').forEach(v=>v.classList.toggle('active',v.id===id));document.querySelectorAll('.navbtn').forEach(b=>b.classList.toggle('active',b.dataset.view===id));document.getElementById('pageTitle').textContent={dashboard:'Tổng quan',expenses:'Chi phí',inventory:'Vật tư kho',projects:'Dự án',projectAccounting:'Kế toán công trình',construction:'Công trường',documents:'Chứng từ',forms:'Biểu mẫu',reports:'Báo cáo',finance:'Kiểm soát & tài chính',settings:'Cài đặt',deploy:'Tên miền'}[id]||'FasTrack ERP';document.getElementById('side').classList.remove('open')}
-    async function loadAll(){await Promise.all([loadDashboard(),loadCatalogs(),loadExpenses(),loadInventory(),loadProjects(),loadProjectAccounting(),loadConstruction(),loadDocuments(),loadForms(),loadReports(),loadFinance(),loadSettings()])}
+    async function api(url,options={}){const r=await fetch(url,options);const data=await r.json();if(r.status===401){showLogin();throw new Error(data.error||'Cần đăng nhập')}if(!r.ok)throw new Error(data.error||'Có lỗi xảy ra');return data}
+    function showLogin(){authGate.classList.remove('hidden')}
+    function hideLogin(){authGate.classList.add('hidden')}
+    function switchView(id){document.querySelectorAll('.view').forEach(v=>v.classList.toggle('active',v.id===id));document.querySelectorAll('.navbtn').forEach(b=>b.classList.toggle('active',b.dataset.view===id));document.getElementById('pageTitle').textContent={dashboard:'Tổng quan',expenses:'Chi phí',inventory:'Vật tư kho',projects:'Dự án',projectAccounting:'Kế toán công trình',construction:'Công trường',documents:'Chứng từ',forms:'Biểu mẫu',reports:'Báo cáo',finance:'Kiểm soát & tài chính',security:'Bảo mật',settings:'Cài đặt',deploy:'Tên miền'}[id]||'FasTrack ERP';document.getElementById('side').classList.remove('open')}
+    async function boot(){const me=await api('/api/auth/me');state.auth=me.user||null;if(!me.authenticated){showLogin();return}hideLogin();userChip.textContent=`${state.auth.full_name||state.auth.username} · ${state.auth.role}`;await loadAll()}
+    async function loadAll(){await Promise.all([loadDashboard(),loadCatalogs(),loadExpenses(),loadInventory(),loadProjects(),loadProjectAccounting(),loadConstruction(),loadDocuments(),loadForms(),loadReports(),loadFinance(),loadSettings(),loadUsers()])}
     async function loadDashboard(){state.dashboard=await api('/api/dashboard');renderDashboard()}
     async function loadCatalogs(){const [projects,categories]=await Promise.all([api('/api/projects'),api('/api/categories')]);state.projects=projects;state.categories=categories;fillSelects();renderProjects()}
     async function loadExpenses(){state.expenses=await api('/api/expenses');renderExpenses()}
@@ -1171,6 +1366,7 @@ INDEX_HTML = r"""<!doctype html>
     async function loadReports(){state.reports=await api('/api/reports/summary');renderReports()}
     async function loadFinance(){state.finance=await api('/api/finance-center');renderFinance()}
     async function loadSettings(){state.settings=await api('/api/settings');renderSettings()}
+    async function loadUsers(){try{state.users=await api('/api/users');renderUsers()}catch(err){state.users=[];renderUsers(err.message)}}
     function fillSelects(){const projectOptions='<option value="">Không gắn dự án</option>'+state.projects.map(p=>`<option value="${p.id}">${esc(p.code)} - ${esc(p.name)}</option>`).join('');const requiredProjectOptions=state.projects.map(p=>`<option value="${p.id}">${esc(p.code)} - ${esc(p.name)}</option>`).join('');const categoryOptions=state.categories.map(c=>`<option value="${c.id}">${esc(c.code)} - ${esc(c.name)}</option>`).join('');expenseProject.innerHTML=projectOptions;diaryProject.innerHTML=projectOptions;documentProject.innerHTML=projectOptions;contractProject.innerHTML=requiredProjectOptions;costPlanProject.innerHTML=requiredProjectOptions;revenueProject.innerHTML=requiredProjectOptions;expenseCategory.innerHTML=categoryOptions;documentCategory.innerHTML='<option value="">Chọn danh mục</option>'+categoryOptions;costPlanCategory.innerHTML=categoryOptions;fillContractSelects()}
     function fillContractSelects(){const rows=(state.projectAccounting&&state.projectAccounting.contracts)||[];const options='<option value="">Chọn hợp đồng</option>'+rows.map(c=>`<option value="${c.id}">${esc(c.contract_no)} - ${esc(c.partner_name)}</option>`).join('');if(typeof billingContract!=='undefined'){billingContract.innerHTML=options;revenueContract.innerHTML=options}}
     function renderDashboard(){const d=state.dashboard||{},s=d.stats||{};kTotal.textContent=money(s.total_expenses);kMonth.textContent=money(s.monthly_expenses);kProjects.textContent=s.total_projects||0;kDocs.textContent=s.total_documents||0;kStock.textContent=money(d.stock_value);const max=Math.max(1,...(d.categories||[]).map(x=>x.total||0));categoryBars.innerHTML=(d.categories||[]).map(x=>`<div class="barrow"><strong>${esc(x.name)}</strong><div class="bar"><div class="fill" style="width:${Math.round((x.total||0)/max*100)}%"></div></div><span class="num">${money(x.total)}</span></div>`).join('')||'<div class="empty">Chưa có dữ liệu chi phí.</div>';lowStockRows.innerHTML=(d.low_stock||[]).map(x=>`<tr><td>${esc(x.code)}</td><td>${esc(x.name)}</td><td class="num">${money(x.quantity)} ${esc(x.unit)}</td><td class="num">${money(x.min_quantity)}</td></tr>`).join('')||'<tr><td colspan="4" class="empty">Không có cảnh báo tồn kho.</td></tr>'}
@@ -1184,10 +1380,14 @@ INDEX_HTML = r"""<!doctype html>
     function drawBars(el,rows,labelKey,valueKey){const max=Math.max(1,...rows.map(r=>Number(r[valueKey]||0)));el.innerHTML=rows.map(r=>`<div class="barrow"><strong>${esc(r[labelKey])}</strong><div class="bar"><div class="fill" style="width:${Math.round(Number(r[valueKey]||0)/max*100)}%"></div></div><span class="num">${money(r[valueKey])}</span></div>`).join('')||'<div class="empty">Chưa có dữ liệu.</div>'}
     function renderReports(){const r=state.reports||{};drawBars(monthlyBars,r.monthly_expenses||[],'month','total');drawBars(projectBars,r.project_expenses||[],'project','total');stockReportRows.innerHTML=(r.stock||[]).map(x=>`<tr><td>${esc(x.name)}</td><td class="num">${money(x.quantity)}</td><td class="num">${money(x.unit_price)}</td><td class="num">${money(x.total_value)}</td></tr>`).join('')||'<tr><td colspan="4" class="empty">Chưa có dữ liệu tồn kho.</td></tr>'}
     function renderFinance(){const f=state.finance||{},bank=f.bank||{},vat=f.vat||{},pay=f.payroll||{},payCurrent=pay.current||{};fAlerts.textContent=(f.alert_counts||{}).total||0;fUnreconciled.textContent=(bank.summary||{}).unreconciled_count||0;fOutputVat.textContent=money(vat.output_vat);fVatPayable.textContent=money(vat.vat_payable);fPayrollNet.textContent=money(payCurrent.net_amount);const q=(financeSearch.value||'').toLowerCase();const alerts=(f.alerts||[]).filter(a=>JSON.stringify(a).toLowerCase().includes(q));alertRows.innerHTML=alerts.map(a=>`<tr><td>${esc(a.source)}</td><td><span class="status ${a.priority==='critical'?'low':''}">${esc(a.priority)}</span></td><td><strong>${esc(a.title)}</strong><br><span class="muted">${esc(a.message)}</span></td><td>${esc(a.due_date||'')}</td></tr>`).join('')||'<tr><td colspan="4" class="empty">Không có cảnh báo.</td></tr>';thresholdRows.innerHTML=(f.approval_thresholds||[]).map(t=>`<tr><td>${esc(t.role)}</td><td class="num">${money(t.max_amount)}</td><td>${Number(t.can_final_approve)?'Có':'Không'}</td><td><span class="status">${Number(t.active)?'active':'inactive'}</span></td></tr>`).join('')||'<tr><td colspan="4" class="empty">Chưa có hạn mức.</td></tr>';periodRows.innerHTML=(f.fiscal_periods||[]).slice(0,18).map(p=>`<tr><td>${esc(p.fiscal_period)}</td><td>${esc(p.period_start)}</td><td>${esc(p.period_end)}</td><td><span class="status ${Number(p.is_locked)?'low':''}">${Number(p.is_locked)?'locked':'open'}</span></td><td><button class="secondary" type="button" data-lock-period="${esc(p.fiscal_period)}" data-lock-value="${Number(p.is_locked)?0:1}">${Number(p.is_locked)?'Mở':'Khóa'}</button></td></tr>`).join('')||'<tr><td colspan="5" class="empty">Chưa có kỳ kế toán.</td></tr>';bankRows.innerHTML=(bank.unreconciled||[]).map(b=>`<tr><td>${esc(b.transaction_date)}</td><td>${esc(b.description)}</td><td class="num">${money(b.amount)}</td><td><span class="status">open</span></td></tr>`).join('')||'<tr><td colspan="4" class="empty">Không có giao dịch chưa đối soát.</td></tr>';vatRows.innerHTML=[['Kỳ',vat.period||''],['Doanh thu chịu thuế',money(vat.output_taxable)],['VAT đầu ra',money(vat.output_vat)],['Chi phí chịu thuế',money(vat.input_taxable)],['VAT đầu vào',money(vat.input_vat)],['Phải nộp',money(vat.vat_payable)],['Còn khấu trừ',money(vat.vat_credit)]].map(x=>`<tr><td>${esc(x[0])}</td><td class="num">${esc(x[1])}</td></tr>`).join('');auditRows.innerHTML=(f.audit_log||[]).map(a=>`<tr><td>${esc(a.created_at)}</td><td>${esc(a.action)}</td><td>${esc(a.entity_type)}</td><td>${esc(String(a.detail||'').slice(0,120))}</td></tr>`).join('')||'<tr><td colspan="4" class="empty">Chưa có audit log.</td></tr>';document.querySelectorAll('[data-lock-period]').forEach(btn=>btn.addEventListener('click',async()=>{try{await api('/api/fiscal-locks',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({fiscal_period:btn.dataset.lockPeriod,locked:btn.dataset.lockValue})});await loadFinance();toast('Đã cập nhật khóa kỳ')}catch(err){toast(err.message)}}))}
+    function renderUsers(error){if(error){userRows.innerHTML=`<tr><td colspan="6" class="empty">${esc(error)}</td></tr>`;return}userRows.innerHTML=(state.users||[]).map(u=>`<tr><td>${esc(u.username)}</td><td>${esc(u.full_name||'')}</td><td>${esc(u.email||'')}</td><td><span class="status">${esc(u.role)}</span></td><td>${Number(u.active)?'active':'inactive'}</td><td>${esc(u.created_at||'')}</td></tr>`).join('')||'<tr><td colspan="6" class="empty">Chưa có người dùng.</td></tr>'}
     function renderSettings(){const s=state.settings||{},settings=s.settings||{};['company_name','company_tax_code','company_representative','company_short_name'].forEach(k=>{if(settingsForm[k])settingsForm[k].value=settings[k]||''});backupHealth.textContent=s.backup_health||'';linkageRows.innerHTML=(s.linkage_checks||[]).map(x=>`<tr><td>${esc(x.group)}</td><td>${esc(x.issue)}</td><td><span class="status">${esc(x.status)}</span></td><td class="num">${money(x.count)}</td></tr>`).join('')||'<tr><td colspan="4" class="empty">Không có cảnh báo.</td></tr>';databaseRows.innerHTML=Object.entries(s.database||{}).map(([k,v])=>`<tr><td>${esc(k)}</td><td class="num">${money(v)}</td></tr>`).join('');backupRows.innerHTML=(s.backups||[]).map(b=>`<tr><td>${esc(b.name)}</td><td>${esc(b.size)}</td><td>${esc(b.date)}</td></tr>`).join('')||'<tr><td colspan="3" class="empty">Chưa có bản sao lưu.</td></tr>'}
     document.querySelectorAll('[data-view]').forEach(b=>b.addEventListener('click',()=>switchView(b.dataset.view)));
     document.querySelectorAll('[data-view-jump]').forEach(b=>b.addEventListener('click',()=>switchView(b.dataset.viewJump)));
     menuBtn.addEventListener('click',()=>side.classList.toggle('open'));refreshBtn.addEventListener('click',()=>loadAll().then(()=>toast('Đã tải lại dữ liệu')));
+    loginForm.addEventListener('submit',async e=>{e.preventDefault();const data=Object.fromEntries(new FormData(loginForm).entries());try{const r=await api('/api/auth/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});state.auth=r.user;hideLogin();userChip.textContent=`${state.auth.full_name||state.auth.username} · ${state.auth.role}`;loginForm.reset();await loadAll();toast('Đã đăng nhập')}catch(err){toast(err.message)}});
+    logoutBtn.addEventListener('click',async()=>{try{await api('/api/auth/logout',{method:'POST'});}catch(err){}state.auth=null;userChip.textContent='Chưa đăng nhập';showLogin()});
+    reloadUsersBtn.addEventListener('click',()=>loadUsers());
     expenseSearch.addEventListener('input',renderExpenses);inventorySearch.addEventListener('input',renderInventory);contractSearch.addEventListener('input',renderProjectAccounting);documentSearch.addEventListener('input',renderDocuments);formSearch.addEventListener('input',renderForms);financeSearch.addEventListener('input',renderFinance);
     expenseForm.expense_date.value=new Date().toISOString().slice(0,10);
     diaryForm.diary_date.value=new Date().toISOString().slice(0,10);
@@ -1208,9 +1408,11 @@ INDEX_HTML = r"""<!doctype html>
     bankForm.addEventListener('submit',async e=>{e.preventDefault();const data=Object.fromEntries(new FormData(bankForm).entries());try{await api('/api/bank/transactions',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});bankForm.reset();bankForm.transaction_date.value=new Date().toISOString().slice(0,10);await loadFinance();toast('Đã thêm giao dịch ngân hàng')}catch(err){toast(err.message)}});
     autoMatchBtn.addEventListener('click',async()=>{try{const r=await api('/api/bank/auto-match',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});await loadFinance();toast(`Đã tự khớp ${r.matched||0} giao dịch`)}catch(err){toast(err.message)}});
     settingsForm.addEventListener('submit',async e=>{e.preventDefault();const data=Object.fromEntries(new FormData(settingsForm).entries());try{await api('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});await loadSettings();toast('Đã lưu cài đặt')}catch(err){toast(err.message)}});
+    userForm.addEventListener('submit',async e=>{e.preventDefault();const data=Object.fromEntries(new FormData(userForm).entries());try{await api('/api/users',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});userForm.reset();await loadUsers();toast('Đã tạo người dùng')}catch(err){toast(err.message)}});
+    passwordForm.addEventListener('submit',async e=>{e.preventDefault();const data=Object.fromEntries(new FormData(passwordForm).entries());try{await api('/api/auth/change-password',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});passwordForm.reset();toast('Đã đổi mật khẩu')}catch(err){toast(err.message)}});
     backupBtn.addEventListener('click',async()=>{try{const r=await api('/api/backups',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});await loadSettings();toast(r.message||'Đã sao lưu')}catch(err){toast(err.message)}});
     navigator.serviceWorker&&navigator.serviceWorker.register('/service-worker.js');
-    loadAll().catch(err=>toast(err.message));
+    boot().catch(err=>toast(err.message));
   </script>
 </body>
 </html>"""
