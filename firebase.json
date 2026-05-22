@@ -1,0 +1,19 @@
+{
+  "hosting": {
+    "public": "firebase_public",
+    "ignore": [
+      "firebase.json",
+      "**/.*",
+      "**/node_modules/**"
+    ],
+    "rewrites": [
+      {
+        "source": "**",
+        "run": {
+          "serviceId": "fastrack-erp-web",
+          "region": "asia-southeast1"
+        }
+      }
+    ]
+  }
+}
