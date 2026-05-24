@@ -1163,6 +1163,24 @@ def create_app():
         construction = ConstructionManager()
         report = WebReportGenerator()
         stats = expenses.get_statistics()
+        conn = get_connection()
+        cursor = conn.cursor()
+        today = date.today()
+        this_month_start = today.replace(day=1)
+        previous_month_end = this_month_start - timedelta(days=1)
+        previous_month_start = previous_month_end.replace(day=1)
+        cursor.execute(
+            """
+            SELECT COALESCE(SUM(amount), 0)
+            FROM expenses
+            WHERE expense_date BETWEEN ? AND ?
+            """,
+            (previous_month_start.isoformat(), previous_month_end.isoformat()),
+        )
+        previous_month_expenses = float(cursor.fetchone()[0] or 0)
+        current_month_expenses = float(stats.get("monthly_expenses") or 0)
+        month_delta = current_month_expenses - previous_month_expenses
+        month_delta_percent = (month_delta / previous_month_expenses * 100) if previous_month_expenses else (100 if current_month_expenses else 0)
         categories = [
             {"name": row[0] or "Chưa phân loại", "total": row[1] or 0}
             for row in expenses.get_expenses_by_category()
@@ -1171,6 +1189,42 @@ def create_app():
             {"name": row[0] or "Không có dự án", "total": row[1] or 0}
             for row in expenses.get_expenses_by_project()
         ]
+        cursor.execute(
+            """
+            SELECT p.id, p.code, p.name, p.location, COALESCE(p.budget, 0) AS budget,
+                   COALESCE(SUM(e.amount), 0) AS spent,
+                   COALESCE(AVG(w.percent_complete), 0) AS progress,
+                   COUNT(DISTINCT w.id) AS work_item_count
+            FROM projects p
+            LEFT JOIN expenses e ON e.project_id = p.id
+            LEFT JOIN construction_work_items w ON w.project_id = p.id
+            WHERE p.status = 'active'
+            GROUP BY p.id
+            ORDER BY p.code
+            LIMIT 8
+            """
+        )
+        active_projects = []
+        for row in cursor.fetchall():
+            budget = float(row["budget"] or 0)
+            spent = float(row["spent"] or 0)
+            active_projects.append(
+                {
+                    "id": row["id"],
+                    "code": row["code"],
+                    "name": row["name"],
+                    "location": row["location"],
+                    "budget": budget,
+                    "spent": spent,
+                    "budget_used_percent": (spent / budget * 100) if budget else 0,
+                    "progress": float(row["progress"] or 0),
+                    "work_item_count": row["work_item_count"],
+                }
+            )
+        cursor.execute("SELECT MAX(updated_at) FROM expenses")
+        last_expense_update = cursor.fetchone()[0]
+        cursor.execute("SELECT MAX(created_at) FROM documents")
+        last_document_update = cursor.fetchone()[0]
         stock_value = sum(float(row[3] or 0) for row in report.get_material_stock_summary())
         low_stock = [
             row_to_dict(row, ("id", "code", "name", "unit", "quantity", "min_quantity", "category"))
@@ -1179,11 +1233,23 @@ def create_app():
         return jsonify(
             {
                 "stats": stats,
+                "trend": {
+                    "previous_month_expenses": previous_month_expenses,
+                    "month_delta": month_delta,
+                    "month_delta_percent": month_delta_percent,
+                },
                 "categories": categories[:8],
                 "projects": projects[:8],
+                "active_projects": active_projects,
                 "construction": construction.get_dashboard(),
                 "stock_value": stock_value,
                 "low_stock": low_stock,
+                "sync": {
+                    "mode": "SQLite shared desktop/web",
+                    "last_expense_update": last_expense_update,
+                    "last_document_update": last_document_update,
+                    "refreshed_at": date.today().isoformat(),
+                },
             }
         )
 
@@ -1803,12 +1869,13 @@ INDEX_HTML = r"""<!doctype html>
   <link rel="manifest" href="/manifest.json">
   <title>FasTrack ERP Web</title>
   <style>
-    :root{--bg:#f4f6f8;--panel:#fff;--ink:#172033;--muted:#667085;--line:#dde3ea;--brand:#1e3a5f;--accent:#0f766e;--warn:#b45309;--danger:#b42318}
-    *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font-family:Segoe UI,Arial,sans-serif}button,input,select,textarea{font:inherit}
+    :root{--bg:#f4f6f8;--panel:#fff;--ink:#172033;--muted:#667085;--line:#dde3ea;--brand:#1e3a5f;--accent:#0f766e;--warn:#b45309;--danger:#b42318;--good:#15803d;--soft:#eef6ff}
+    body.dark{--bg:#0f172a;--panel:#111c32;--ink:#e5edf7;--muted:#9aa8bb;--line:#26354f;--brand:#60a5fa;--accent:#2dd4bf;--soft:#16233a}
+    *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font-family:Inter,Roboto,Segoe UI,Arial,sans-serif}button,input,select,textarea{font:inherit}
     .authgate{position:fixed;inset:0;background:#10243d;display:grid;place-items:center;z-index:20;padding:18px}.loginbox{width:min(420px,100%);background:#fff;border-radius:8px;padding:22px;border:1px solid var(--line);box-shadow:0 20px 50px #0005}.loginbox h2{margin:0 0 6px}.loginbox form{display:grid;gap:12px;margin-top:18px}.loginbox .primary{width:100%}.userchip{display:flex;align-items:center;gap:8px;border:1px solid var(--line);border-radius:7px;padding:8px 10px;background:#fff;color:var(--muted);font-size:13px}.hidden{display:none!important}
     .shell{display:grid;grid-template-columns:248px 1fr;min-height:100vh}.side{background:#10243d;color:#fff;padding:18px 14px;position:sticky;top:0;height:100vh;overflow:auto}.brand{display:flex;align-items:center;gap:10px;font-weight:800;font-size:18px;margin-bottom:18px}.mark{width:34px;height:34px;border-radius:8px;background:#c9a227;display:grid;place-items:center;color:#10243d}
-    nav{display:grid;gap:6px}.navbtn{width:100%;border:0;background:transparent;color:#dbe7f3;text-align:left;padding:11px 12px;border-radius:7px;cursor:pointer}.navbtn.active,.navbtn:hover{background:#1e3a5f;color:#fff}.main{padding:20px;min-width:0}.topbar{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:16px}.topbar h1{font-size:24px;margin:0}.muted{color:var(--muted)}.grid{display:grid;gap:14px}.kpis{grid-template-columns:repeat(5,minmax(140px,1fr))}.card{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:14px}.kpi .label{font-size:13px;color:var(--muted)}.kpi .value{font-size:22px;font-weight:800;margin-top:6px}.two{grid-template-columns:1.1fr .9fr}.actions{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.primary{background:var(--brand);color:#fff;border:0;border-radius:7px;padding:10px 13px;cursor:pointer}.secondary{background:#fff;color:var(--brand);border:1px solid var(--line);border-radius:7px;padding:9px 12px;cursor:pointer}.danger{color:var(--danger)}.toolbar{display:flex;justify-content:space-between;gap:12px;align-items:center;margin-bottom:12px}.search{max-width:320px;width:100%;border:1px solid var(--line);border-radius:7px;padding:10px 12px}
-    table{width:100%;border-collapse:collapse;font-size:14px}th,td{border-bottom:1px solid var(--line);padding:10px;text-align:left;vertical-align:top}th{font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em}td.num{text-align:right;font-variant-numeric:tabular-nums}.status{display:inline-block;padding:3px 8px;border-radius:999px;background:#e8eef6;color:#1e3a5f;font-size:12px}.status.low{background:#fff4e5;color:var(--warn)}.bars{display:grid;gap:10px}.barrow{display:grid;grid-template-columns:130px 1fr 96px;gap:10px;align-items:center}.bar{height:9px;background:#e8edf3;border-radius:999px;overflow:hidden}.fill{height:100%;background:var(--accent);width:0}.form{display:grid;grid-template-columns:repeat(2,minmax(160px,1fr));gap:10px}.form .wide{grid-column:1/-1}label{display:grid;gap:5px;font-size:13px;color:var(--muted)}input,select,textarea{border:1px solid var(--line);border-radius:7px;padding:10px;background:#fff;color:var(--ink)}textarea{min-height:76px;resize:vertical}.toast{position:fixed;right:18px;bottom:18px;background:#10243d;color:#fff;border-radius:8px;padding:12px 14px;box-shadow:0 10px 30px #0003;display:none}.view{display:none}.view.active{display:grid}.empty{padding:28px;color:var(--muted);text-align:center}.mobilebar{display:none;background:#10243d;color:#fff;padding:12px 14px;align-items:center;justify-content:space-between}.mobilebar button{width:42px;height:38px;border:1px solid #365472;background:#16304f;color:#fff;border-radius:7px}
+    nav{display:grid;gap:9px}.navbtn{width:100%;border:0;background:transparent;color:#dbe7f3;text-align:left;padding:12px 13px;border-radius:7px;cursor:pointer}.navbtn.active,.navbtn:hover{background:#1e3a5f;color:#fff}.main{padding:24px;min-width:0}.topbar{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:18px}.topbar h1{font-size:24px;margin:0}.muted{color:var(--muted)}.grid{display:grid;gap:16px}.kpis{grid-template-columns:repeat(5,minmax(150px,1fr))}.card{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:16px}.kpi{position:relative;overflow:hidden}.kpi .label{font-size:13px;color:var(--muted)}.kpi .value{font-size:23px;font-weight:800;margin-top:6px}.kpi .icon{font-size:20px;width:34px;height:34px;border-radius:8px;display:grid;place-items:center;background:var(--soft);margin-bottom:8px}.trend{font-size:12px;margin-top:7px;color:var(--muted)}.trend.good{color:var(--good)}.trend.bad{color:var(--danger)}.two{grid-template-columns:1.1fr .9fr}.actions{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.primary{background:linear-gradient(135deg,#1e3a5f,#0f766e);color:#fff;border:0;border-radius:7px;padding:10px 13px;cursor:pointer}.primary.cta{background:#f97316;box-shadow:0 8px 20px #f9731633}.secondary{background:var(--panel);color:var(--brand);border:1px solid var(--line);border-radius:7px;padding:9px 12px;cursor:pointer}.danger{color:var(--danger)}.toolbar{display:flex;justify-content:space-between;gap:12px;align-items:center;margin-bottom:12px}.search{max-width:320px;width:100%;border:1px solid var(--line);border-radius:7px;padding:10px 12px}
+    table{width:100%;border-collapse:collapse;font-size:14px}th,td{border-bottom:1px solid var(--line);padding:10px;text-align:left;vertical-align:top}th{font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em}td.num{text-align:right;font-variant-numeric:tabular-nums}.status{display:inline-block;padding:3px 8px;border-radius:999px;background:#e8eef6;color:#1e3a5f;font-size:12px}.status.low{background:#fff4e5;color:var(--warn)}.bars{display:grid;gap:10px}.barrow{display:grid;grid-template-columns:130px 1fr 96px;gap:10px;align-items:center}.bar,.progress{height:9px;background:#e8edf3;border-radius:999px;overflow:hidden}.fill{height:100%;background:var(--accent);width:0}.chart{width:100%;height:250px}.project-mini{display:grid;gap:11px}.project-line{display:grid;gap:7px}.project-line header{display:flex;justify-content:space-between;gap:12px}.syncbox{display:grid;gap:6px;background:var(--soft);border:1px solid var(--line);border-radius:8px;padding:12px}.form{display:grid;grid-template-columns:repeat(2,minmax(160px,1fr));gap:10px}.form .wide{grid-column:1/-1}label{display:grid;gap:5px;font-size:13px;color:var(--muted)}input,select,textarea{border:1px solid var(--line);border-radius:7px;padding:10px;background:var(--panel);color:var(--ink)}textarea{min-height:76px;resize:vertical}.toast{position:fixed;right:18px;bottom:18px;background:#10243d;color:#fff;border-radius:8px;padding:12px 14px;box-shadow:0 10px 30px #0003;display:none}.view{display:none}.view.active{display:grid}.empty{padding:28px;color:var(--muted);text-align:center}.mobilebar{display:none;background:#10243d;color:#fff;padding:12px 14px;align-items:center;justify-content:space-between}.mobilebar button{width:42px;height:38px;border:1px solid #365472;background:#16304f;color:#fff;border-radius:7px}
     @media(max-width:980px){.shell{grid-template-columns:1fr}.side{display:none;position:fixed;z-index:5;width:260px}.side.open{display:block}.mobilebar{display:flex}.main{padding:14px}.kpis,.two{grid-template-columns:1fr}.form{grid-template-columns:1fr}.toolbar{align-items:stretch;flex-direction:column}.search{max-width:none}.barrow{grid-template-columns:1fr}.tablewrap{overflow:auto}.topbar{align-items:flex-start;flex-direction:column}}
   </style>
 </head>
@@ -1850,20 +1917,24 @@ INDEX_HTML = r"""<!doctype html>
     <main class="main">
       <div class="topbar">
         <div><h1 id="pageTitle">Tổng quan</h1><div class="muted" id="subtitle">Bản web dùng chung dữ liệu với ứng dụng desktop.</div></div>
-        <div class="actions"><span class="userchip" id="userChip">Chưa đăng nhập</span><button class="secondary" id="logoutBtn">Đăng xuất</button><button class="secondary" id="refreshBtn">Tải lại</button><button class="primary" data-view-jump="expenses">Thêm chi phí</button></div>
+        <div class="actions"><span class="userchip" id="userChip">Chưa đăng nhập</span><button class="secondary" id="themeBtn">Tối</button><button class="secondary" id="logoutBtn">Đăng xuất</button><button class="secondary" id="refreshBtn">Tải lại</button><button class="primary cta" data-view-jump="expenses">Thêm chi phí</button></div>
       </div>
 
       <section class="view active" id="dashboard">
         <div class="grid kpis">
-          <div class="card kpi"><div class="label">Tổng chi phí</div><div class="value" id="kTotal">0</div></div>
-          <div class="card kpi"><div class="label">Chi phí tháng này</div><div class="value" id="kMonth">0</div></div>
-          <div class="card kpi"><div class="label">Dự án active</div><div class="value" id="kProjects">0</div></div>
-          <div class="card kpi"><div class="label">Chứng từ</div><div class="value" id="kDocs">0</div></div>
-          <div class="card kpi"><div class="label">Giá trị tồn kho</div><div class="value" id="kStock">0</div></div>
+          <div class="card kpi"><div class="icon">Σ</div><div class="label">Tổng chi phí</div><div class="value" id="kTotal">0</div><div class="trend" id="kTotalTrend">Lũy kế toàn hệ thống</div></div>
+          <div class="card kpi"><div class="icon">↗</div><div class="label">Chi phí tháng này</div><div class="value" id="kMonth">0</div><div class="trend" id="kMonthTrend">So với tháng trước</div></div>
+          <div class="card kpi" data-view-jump="projects"><div class="icon">▦</div><div class="label">Dự án active</div><div class="value" id="kProjects">0</div><div class="trend">Click để xem danh sách</div></div>
+          <div class="card kpi"><div class="icon">□</div><div class="label">Chứng từ</div><div class="value" id="kDocs">0</div><div class="trend">Hồ sơ kế toán</div></div>
+          <div class="card kpi"><div class="icon">◇</div><div class="label">Giá trị tồn kho</div><div class="value" id="kStock">0</div><div class="trend">Theo đơn giá hiện tại</div></div>
         </div>
         <div class="grid two">
-          <div class="card"><h3>Chi phí theo danh mục</h3><div class="bars" id="categoryBars"></div></div>
-          <div class="card"><h3>Cảnh báo tồn kho</h3><div class="tablewrap"><table><thead><tr><th>Mã</th><th>Vật tư</th><th>Tồn</th><th>Min</th></tr></thead><tbody id="lowStockRows"></tbody></table></div></div>
+          <div class="card"><h3>Cơ cấu chi phí</h3><canvas class="chart" id="categoryPie"></canvas><div class="bars" id="categoryBars"></div></div>
+          <div class="card"><h3>Chi phí theo dự án</h3><canvas class="chart" id="projectChart"></canvas></div>
+        </div>
+        <div class="grid two">
+          <div class="card"><div class="toolbar"><h3>Dự án đang chạy</h3><button class="secondary" type="button" data-view-jump="projects">Mở dự án</button></div><div class="project-mini" id="activeProjectRows"></div></div>
+          <div class="card"><h3>Đồng bộ Desktop/Web</h3><div class="syncbox" id="syncBox"></div><h3>Cảnh báo tồn kho</h3><div class="tablewrap"><table><thead><tr><th>Mã</th><th>Vật tư</th><th>Tồn</th><th>Min</th></tr></thead><tbody id="lowStockRows"></tbody></table></div></div>
         </div>
       </section>
 
@@ -2267,6 +2338,10 @@ INDEX_HTML = r"""<!doctype html>
     const money=v=>new Intl.NumberFormat('vi-VN',{maximumFractionDigits:0}).format(Number(v||0));
     const esc=v=>String(v??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
     const toast=t=>{const el=document.getElementById('toast');el.textContent=t;el.style.display='block';setTimeout(()=>el.style.display='none',2800)};
+    const palette=['#1e3a5f','#0f766e','#f97316','#7c3aed','#dc2626','#0891b2','#65a30d','#b45309'];
+    function pct(v){const n=Number(v||0);return `${n>0?'+':''}${n.toFixed(1)}%`}
+    function drawPie(canvas,rows,labelKey,valueKey){const ctx=canvas.getContext('2d'),w=canvas.clientWidth,h=canvas.clientHeight,dpr=window.devicePixelRatio||1;canvas.width=w*dpr;canvas.height=h*dpr;ctx.scale(dpr,dpr);ctx.clearRect(0,0,w,h);const total=rows.reduce((s,r)=>s+Number(r[valueKey]||0),0);let start=-Math.PI/2;const cx=w*.32,cy=h*.48,r=Math.min(w,h)*.32;if(!total){ctx.fillStyle=getComputedStyle(document.body).getPropertyValue('--muted');ctx.fillText('Chưa có dữ liệu',20,30);return}rows.forEach((row,i)=>{const val=Number(row[valueKey]||0),end=start+Math.PI*2*val/total;ctx.beginPath();ctx.moveTo(cx,cy);ctx.arc(cx,cy,r,start,end);ctx.closePath();ctx.fillStyle=palette[i%palette.length];ctx.fill();start=end});ctx.font='12px Inter,Segoe UI';rows.slice(0,7).forEach((row,i)=>{const y=22+i*24;ctx.fillStyle=palette[i%palette.length];ctx.fillRect(w*.62,y-10,10,10);ctx.fillStyle=getComputedStyle(document.body).getPropertyValue('--ink');ctx.fillText(`${row[labelKey]} · ${Math.round(Number(row[valueKey]||0)/total*100)}%`,w*.62+16,y)})}
+    function drawColumn(canvas,rows,labelKey,valueKey){const ctx=canvas.getContext('2d'),w=canvas.clientWidth,h=canvas.clientHeight,dpr=window.devicePixelRatio||1;canvas.width=w*dpr;canvas.height=h*dpr;ctx.scale(dpr,dpr);ctx.clearRect(0,0,w,h);const max=Math.max(1,...rows.map(r=>Number(r[valueKey]||0)));const pad=30,barW=Math.max(18,(w-pad*2)/(rows.length||1)-12);ctx.font='12px Inter,Segoe UI';rows.forEach((row,i)=>{const x=pad+i*(barW+12),bh=(h-70)*Number(row[valueKey]||0)/max,y=h-38-bh;ctx.fillStyle=palette[i%palette.length];ctx.fillRect(x,y,barW,bh);ctx.fillStyle=getComputedStyle(document.body).getPropertyValue('--muted');ctx.fillText(String(row[labelKey]||'').slice(0,10),x,h-16)})}
     async function api(url,options={}){const token=localStorage.getItem('fastrack_auth_token');options={...options,headers:{...(options.headers||{})}};if(token)options.headers.Authorization=`Bearer ${token}`;const r=await fetch(url,options);const data=await r.json();if(r.status===401){localStorage.removeItem('fastrack_auth_token');showLogin();throw new Error(data.error||'Cần đăng nhập')}if(!r.ok)throw new Error(data.error||'Có lỗi xảy ra');return data}
     function showLogin(){authGate.classList.remove('hidden')}
     function hideLogin(){authGate.classList.add('hidden')}
@@ -2294,7 +2369,7 @@ INDEX_HTML = r"""<!doctype html>
     function renderOfflineData(){const d=state.offlineData||{},s=d.summary||{};odTables.textContent=s.table_count||0;odActiveTables.textContent=s.active_table_count||0;odRecords.textContent=money(s.record_count);const q=(offlineSearch.value||'').toLowerCase();const tables=(d.tables||[]).filter(t=>JSON.stringify(t).toLowerCase().includes(q));offlineTableRows.innerHTML=tables.map(t=>`<tr><td><strong>${esc(t.label)}</strong></td><td>${esc(t.name)}</td><td class="num">${money(t.count)}</td><td><button class="secondary" type="button" data-offline-table="${esc(t.name)}">Xem</button></td></tr>`).join('')||'<tr><td colspan="4" class="empty">Chưa có dữ liệu.</td></tr>';document.querySelectorAll('[data-offline-table]').forEach(btn=>btn.addEventListener('click',()=>{offlineTableSearch.value='';loadOfflineTable(btn.dataset.offlineTable)}));if(!state.offlineTable&&tables.length){loadOfflineTable(tables.find(t=>t.count)?.name||tables[0].name)}}
     function renderOfflinePreview(){const t=state.offlineTable||{},rows=t.rows||[],columns=(t.columns&&t.columns.length?t.columns:[...new Set(rows.flatMap(r=>Object.keys(r)))]).slice(0,14);offlinePreviewTitle.textContent=`${t.label||t.name||''} · ${money(t.total||0)} dòng · trang ${t.page||1}`;odCurrent.textContent=t.name||'-';odPreviewCount.textContent=`${money(rows.length)} / ${money(t.total||0)}`;offlinePrevBtn.disabled=(t.page||1)<=1;offlineNextBtn.disabled=((t.offset||0)+rows.length)>=(t.total||0);offlinePreviewHead.innerHTML=columns.length?`<tr>${columns.map(c=>`<th>${esc(c)}</th>`).join('')}</tr>`:'';offlinePreviewRows.innerHTML=rows.map(r=>`<tr>${columns.map(c=>`<td>${esc(String(r[c]??'').slice(0,120))}</td>`).join('')}</tr>`).join('')||'<tr><td class="empty">Không có dòng dữ liệu.</td></tr>'}
     function renderOfflineSchema(){const s=state.offlineSchema||{},q=(schemaSearch.value||'').toLowerCase();const tables=(s.tables||[]).filter(t=>JSON.stringify({name:t.name,label:t.label,columns:t.columns}).toLowerCase().includes(q));schemaRows.innerHTML=tables.map(t=>`<tr><td><strong>${esc(t.name)}</strong><br><span class="muted">${esc(t.label)}</span></td><td class="num">${money(t.column_count)}</td><td class="num">${money(t.row_count)}</td><td class="num">${money((t.indexes||[]).length)}</td><td class="num">${money((t.foreign_keys||[]).length)}</td><td><span class="status ${t.data_exposed?'':'low'}">${t.data_exposed?'online':'schema'}</span></td></tr>`).join('')||'<tr><td colspan="6" class="empty">Chưa có cấu trúc dữ liệu.</td></tr>';relationRows.innerHTML=(s.relationships||[]).map(r=>`<tr><td>${esc(r.from_table)}</td><td>${esc(r.from_column)}</td><td>${esc(r.to_table)}</td><td>${esc(r.to_column)}</td></tr>`).join('')||'<tr><td colspan="4" class="empty">Chưa khai báo khóa ngoại.</td></tr>'}
-    function renderDashboard(){const d=state.dashboard||{},s=d.stats||{};kTotal.textContent=money(s.total_expenses);kMonth.textContent=money(s.monthly_expenses);kProjects.textContent=s.total_projects||0;kDocs.textContent=s.total_documents||0;kStock.textContent=money(d.stock_value);const max=Math.max(1,...(d.categories||[]).map(x=>x.total||0));categoryBars.innerHTML=(d.categories||[]).map(x=>`<div class="barrow"><strong>${esc(x.name)}</strong><div class="bar"><div class="fill" style="width:${Math.round((x.total||0)/max*100)}%"></div></div><span class="num">${money(x.total)}</span></div>`).join('')||'<div class="empty">Chưa có dữ liệu chi phí.</div>';lowStockRows.innerHTML=(d.low_stock||[]).map(x=>`<tr><td>${esc(x.code)}</td><td>${esc(x.name)}</td><td class="num">${money(x.quantity)} ${esc(x.unit)}</td><td class="num">${money(x.min_quantity)}</td></tr>`).join('')||'<tr><td colspan="4" class="empty">Không có cảnh báo tồn kho.</td></tr>'}
+    function renderDashboard(){const d=state.dashboard||{},s=d.stats||{},t=d.trend||{};kTotal.textContent=money(s.total_expenses);kMonth.textContent=money(s.monthly_expenses);kProjects.textContent=s.total_projects||0;kDocs.textContent=s.total_documents||0;kStock.textContent=money(d.stock_value);kMonthTrend.textContent=`${pct(t.month_delta_percent)} so với tháng trước`;kMonthTrend.className=`trend ${Number(t.month_delta||0)<=0?'good':'bad'}`;const max=Math.max(1,...(d.categories||[]).map(x=>x.total||0));categoryBars.innerHTML=(d.categories||[]).map(x=>`<div class="barrow"><strong>${esc(x.name)}</strong><div class="bar"><div class="fill" style="width:${Math.round((x.total||0)/max*100)}%"></div></div><span class="num">${money(x.total)}</span></div>`).join('')||'<div class="empty">Chưa có dữ liệu chi phí.</div>';drawPie(categoryPie,d.categories||[],'name','total');drawColumn(projectChart,d.projects||[],'name','total');activeProjectRows.innerHTML=(d.active_projects||[]).map(p=>`<div class="project-line"><header><strong>${esc(p.code)} · ${esc(p.name)}</strong><span>${money(p.budget_used_percent)}%</span></header><div class="progress"><div class="fill" style="width:${Math.min(100,Math.round(p.budget_used_percent||p.progress||0))}%"></div></div><div class="muted">Đã chi ${money(p.spent)} / ngân sách ${money(p.budget)} · tiến độ ${money(p.progress)}% · ${money(p.work_item_count)} hạng mục</div></div>`).join('')||'<div class="empty">Chưa có dự án active.</div>';const sync=d.sync||{};syncBox.innerHTML=`<strong>Real-time sync</strong><span>Chế độ: ${esc(sync.mode||'')}</span><span>Chi phí cập nhật: ${esc(sync.last_expense_update||'chưa có')}</span><span>Chứng từ cập nhật: ${esc(sync.last_document_update||'chưa có')}</span>`;lowStockRows.innerHTML=(d.low_stock||[]).map(x=>`<tr><td>${esc(x.code)}</td><td>${esc(x.name)}</td><td class="num">${money(x.quantity)} ${esc(x.unit)}</td><td class="num">${money(x.min_quantity)}</td></tr>`).join('')||'<tr><td colspan="4" class="empty">Không có cảnh báo tồn kho.</td></tr>'}
     function renderExpenses(){const q=(expenseSearch.value||'').toLowerCase();const rows=state.expenses.filter(e=>JSON.stringify(e).toLowerCase().includes(q));expenseRows.innerHTML=rows.map(e=>`<tr><td>${esc(e.expense_date)}</td><td>${esc(e.project_name||'')}</td><td>${esc(e.category_name||'')}</td><td>${esc(e.description||'')}</td><td class="num">${money(e.amount)}</td><td><span class="status">${esc(e.status)}</span></td></tr>`).join('')||'<tr><td colspan="6" class="empty">Chưa có chi phí.</td></tr>'}
     function renderInventory(){const q=(inventorySearch.value||'').toLowerCase();const rows=state.inventory.filter(i=>JSON.stringify(i).toLowerCase().includes(q));inventoryRows.innerHTML=rows.map(i=>`<tr><td>${esc(i.code)}</td><td>${esc(i.name)}</td><td>${esc(i.category)}</td><td class="num">${money(i.quantity)} ${esc(i.unit)}</td><td class="num">${money(i.unit_price)}</td><td><span class="status">${esc(i.status)}</span></td></tr>`).join('')||'<tr><td colspan="6" class="empty">Chưa có vật tư.</td></tr>';historyRows.innerHTML=state.history.map(h=>`<tr><td>${esc(h.transaction_date)}</td><td>${esc(h.code)}</td><td>${esc(h.name)}</td><td>${esc(h.transaction_type)}</td><td class="num">${money(h.quantity)}</td><td>${esc(h.notes)}</td></tr>`).join('')||'<tr><td colspan="6" class="empty">Chưa có giao dịch kho.</td></tr>'}
     function renderProjects(){projectRows.innerHTML=state.projects.map(p=>`<tr><td>${esc(p.code)}</td><td>${esc(p.name)}</td><td>${esc(p.location)}</td><td class="num">${money(p.budget)}</td><td><span class="status">${esc(p.status)}</span></td></tr>`).join('')||'<tr><td colspan="5" class="empty">Chưa có dự án.</td></tr>'}
@@ -2310,6 +2385,7 @@ INDEX_HTML = r"""<!doctype html>
     function renderSettings(){const s=state.settings||{},settings=s.settings||{};['company_name','company_tax_code','company_representative','company_short_name'].forEach(k=>{if(settingsForm[k])settingsForm[k].value=settings[k]||''});backupHealth.textContent=s.backup_health||'';linkageRows.innerHTML=(s.linkage_checks||[]).map(x=>`<tr><td>${esc(x.group)}</td><td>${esc(x.issue)}</td><td><span class="status">${esc(x.status)}</span></td><td class="num">${money(x.count)}</td></tr>`).join('')||'<tr><td colspan="4" class="empty">Không có cảnh báo.</td></tr>';databaseRows.innerHTML=Object.entries(s.database||{}).map(([k,v])=>`<tr><td>${esc(k)}</td><td class="num">${money(v)}</td></tr>`).join('');backupRows.innerHTML=(s.backups||[]).map(b=>`<tr><td>${esc(b.name)}</td><td>${esc(b.size)}</td><td>${esc(b.date)}</td></tr>`).join('')||'<tr><td colspan="3" class="empty">Chưa có bản sao lưu.</td></tr>'}
     document.querySelectorAll('[data-view]').forEach(b=>b.addEventListener('click',()=>switchView(b.dataset.view)));
     document.querySelectorAll('[data-view-jump]').forEach(b=>b.addEventListener('click',()=>switchView(b.dataset.viewJump)));
+    themeBtn.addEventListener('click',()=>{document.body.classList.toggle('dark');themeBtn.textContent=document.body.classList.contains('dark')?'Sáng':'Tối';renderDashboard();renderReports()});
     menuBtn.addEventListener('click',()=>side.classList.toggle('open'));refreshBtn.addEventListener('click',()=>loadAll().then(()=>toast('Đã tải lại dữ liệu')));
     loginForm.addEventListener('submit',async e=>{e.preventDefault();const data=Object.fromEntries(new FormData(loginForm).entries());try{const r=await api('/api/auth/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});if(r.token)localStorage.setItem('fastrack_auth_token',r.token);state.auth=r.user;hideLogin();userChip.textContent=`${state.auth.full_name||state.auth.username} · ${state.auth.role}`;loginForm.reset();await loadAll();toast('Đã đăng nhập')}catch(err){toast(err.message)}});
     logoutBtn.addEventListener('click',async()=>{try{await api('/api/auth/logout',{method:'POST'});}catch(err){}localStorage.removeItem('fastrack_auth_token');state.auth=null;userChip.textContent='Chưa đăng nhập';showLogin()});
