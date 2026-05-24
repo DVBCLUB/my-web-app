@@ -161,6 +161,75 @@ def rows_to_csv(rows: list[dict[str, Any]], columns: list[str]) -> str:
     return output.getvalue()
 
 
+def offline_schema_snapshot() -> dict[str, Any]:
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT name, sql
+        FROM sqlite_master
+        WHERE type = 'table'
+          AND name NOT LIKE 'sqlite_%'
+        ORDER BY name
+        """
+    )
+    tables = []
+    relationships = []
+    for table in cursor.fetchall():
+        table_name = table["name"]
+        cursor.execute(f'PRAGMA table_info("{table_name}")')
+        columns = [row_to_dict(row) for row in cursor.fetchall()]
+        cursor.execute(f'PRAGMA foreign_key_list("{table_name}")')
+        foreign_keys = [row_to_dict(row) for row in cursor.fetchall()]
+        for fk in foreign_keys:
+            relationships.append(
+                {
+                    "from_table": table_name,
+                    "from_column": fk.get("from"),
+                    "to_table": fk.get("table"),
+                    "to_column": fk.get("to"),
+                }
+            )
+        indexes = []
+        cursor.execute(f'PRAGMA index_list("{table_name}")')
+        for index in cursor.fetchall():
+            index_data = row_to_dict(index)
+            index_name = index_data.get("name")
+            cursor.execute(f'PRAGMA index_info("{index_name}")')
+            index_data["columns"] = [row["name"] for row in cursor.fetchall()]
+            indexes.append(index_data)
+        try:
+            cursor.execute(f'SELECT COUNT(*) FROM "{table_name}"')
+            row_count = int(cursor.fetchone()[0] or 0)
+        except Exception:
+            row_count = 0
+        tables.append(
+            {
+                "name": table_name,
+                "label": OFFLINE_DATA_TABLES.get(table_name, table_name),
+                "row_count": row_count,
+                "column_count": len(columns),
+                "columns": columns,
+                "foreign_keys": foreign_keys,
+                "indexes": indexes,
+                "sql": table["sql"],
+                "data_exposed": table_name in OFFLINE_DATA_TABLES,
+            }
+        )
+    return {
+        "summary": {
+            "table_count": len(tables),
+            "column_count": sum(table["column_count"] for table in tables),
+            "relationship_count": len(relationships),
+            "index_count": sum(len(table["indexes"]) for table in tables),
+            "record_count": sum(table["row_count"] for table in tables),
+            "web_exposed_table_count": sum(1 for table in tables if table["data_exposed"]),
+        },
+        "tables": tables,
+        "relationships": relationships,
+    }
+
+
 def public_user(user: dict[str, Any] | None) -> dict[str, Any]:
     if not user:
         return {}
@@ -1428,6 +1497,21 @@ def create_app():
             headers={"Content-Disposition": "attachment; filename=fastrack-offline-data.json"},
         )
 
+    @app.get("/api/offline-schema")
+    @api_error
+    def offline_schema():
+        return jsonify(offline_schema_snapshot())
+
+    @app.get("/api/offline-schema/export.json")
+    @api_error
+    def offline_schema_export_json():
+        payload = json.dumps(offline_schema_snapshot(), ensure_ascii=False, default=str)
+        return Response(
+            payload,
+            mimetype="application/json; charset=utf-8",
+            headers={"Content-Disposition": "attachment; filename=fastrack-offline-schema.json"},
+        )
+
     @app.get("/api/offline-data/<table_name>")
     @api_error
     def offline_data_table(table_name):
@@ -1801,6 +1885,16 @@ INDEX_HTML = r"""<!doctype html>
             <div class="tablewrap"><table id="offlinePreviewTable"><thead id="offlinePreviewHead"></thead><tbody id="offlinePreviewRows"></tbody></table></div>
           </div>
         </div>
+        <div class="grid two">
+          <div class="card">
+            <div class="toolbar"><h3>Cấu trúc database offline</h3><div class="actions"><input class="search" id="schemaSearch" placeholder="Tìm bảng/cột"><button class="secondary" type="button" id="schemaJsonBtn">Schema JSON</button></div></div>
+            <div class="tablewrap"><table><thead><tr><th>Bảng</th><th>Cột</th><th>Dòng</th><th>Index</th><th>FK</th><th>Web</th></tr></thead><tbody id="schemaRows"></tbody></table></div>
+          </div>
+          <div class="card">
+            <h3>Quan hệ dữ liệu</h3>
+            <div class="tablewrap"><table><thead><tr><th>Từ bảng</th><th>Cột</th><th>Đến bảng</th><th>Cột</th></tr></thead><tbody id="relationRows"></tbody></table></div>
+          </div>
+        </div>
       </section>
 
       <section class="view" id="expenses">
@@ -2169,7 +2263,7 @@ INDEX_HTML = r"""<!doctype html>
   <div class="toast" id="toast"></div>
 
   <script>
-    const state={auth:null,users:[],offlineData:null,offlineTable:null,dashboard:null,expenses:[],inventory:[],history:[],projects:[],categories:[],projectAccounting:null,workItems:[],diaries:[],documents:[],forms:[],reports:null,accounting:null,finance:null,settings:null};
+    const state={auth:null,users:[],offlineData:null,offlineSchema:null,offlineTable:null,dashboard:null,expenses:[],inventory:[],history:[],projects:[],categories:[],projectAccounting:null,workItems:[],diaries:[],documents:[],forms:[],reports:null,accounting:null,finance:null,settings:null};
     const money=v=>new Intl.NumberFormat('vi-VN',{maximumFractionDigits:0}).format(Number(v||0));
     const esc=v=>String(v??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
     const toast=t=>{const el=document.getElementById('toast');el.textContent=t;el.style.display='block';setTimeout(()=>el.style.display='none',2800)};
@@ -2180,7 +2274,7 @@ INDEX_HTML = r"""<!doctype html>
     async function boot(){const me=await api('/api/auth/me');state.auth=me.user||null;if(!me.authenticated){showLogin();return}hideLogin();userChip.textContent=`${state.auth.full_name||state.auth.username} · ${state.auth.role}`;await loadAll()}
     async function loadAll(){await Promise.all([loadDashboard(),loadOfflineData(),loadCatalogs(),loadExpenses(),loadInventory(),loadProjects(),loadProjectAccounting(),loadConstruction(),loadDocuments(),loadForms(),loadReports(),loadAccounting(),loadFinance(),loadSettings(),loadUsers()])}
     async function loadDashboard(){state.dashboard=await api('/api/dashboard');renderDashboard()}
-    async function loadOfflineData(){state.offlineData=await api('/api/offline-data');renderOfflineData()}
+    async function loadOfflineData(){const [data,schema]=await Promise.all([api('/api/offline-data'),api('/api/offline-schema')]);state.offlineData=data;state.offlineSchema=schema;renderOfflineData();renderOfflineSchema()}
     async function loadOfflineTable(name,page=1){const q=offlineTableSearch.value||'';state.offlineTable=await api(`/api/offline-data/${encodeURIComponent(name)}?limit=100&page=${page}&q=${encodeURIComponent(q)}`);renderOfflinePreview()}
     async function loadCatalogs(){const [projects,categories]=await Promise.all([api('/api/projects'),api('/api/categories')]);state.projects=projects;state.categories=categories;fillSelects();renderProjects()}
     async function loadExpenses(){state.expenses=await api('/api/expenses');renderExpenses()}
@@ -2199,6 +2293,7 @@ INDEX_HTML = r"""<!doctype html>
     function fillContractSelects(){const rows=(state.projectAccounting&&state.projectAccounting.contracts)||[];const options='<option value="">Chọn hợp đồng</option>'+rows.map(c=>`<option value="${c.id}">${esc(c.contract_no)} - ${esc(c.partner_name)}</option>`).join('');if(typeof billingContract!=='undefined'){billingContract.innerHTML=options;revenueContract.innerHTML=options}}
     function renderOfflineData(){const d=state.offlineData||{},s=d.summary||{};odTables.textContent=s.table_count||0;odActiveTables.textContent=s.active_table_count||0;odRecords.textContent=money(s.record_count);const q=(offlineSearch.value||'').toLowerCase();const tables=(d.tables||[]).filter(t=>JSON.stringify(t).toLowerCase().includes(q));offlineTableRows.innerHTML=tables.map(t=>`<tr><td><strong>${esc(t.label)}</strong></td><td>${esc(t.name)}</td><td class="num">${money(t.count)}</td><td><button class="secondary" type="button" data-offline-table="${esc(t.name)}">Xem</button></td></tr>`).join('')||'<tr><td colspan="4" class="empty">Chưa có dữ liệu.</td></tr>';document.querySelectorAll('[data-offline-table]').forEach(btn=>btn.addEventListener('click',()=>{offlineTableSearch.value='';loadOfflineTable(btn.dataset.offlineTable)}));if(!state.offlineTable&&tables.length){loadOfflineTable(tables.find(t=>t.count)?.name||tables[0].name)}}
     function renderOfflinePreview(){const t=state.offlineTable||{},rows=t.rows||[],columns=(t.columns&&t.columns.length?t.columns:[...new Set(rows.flatMap(r=>Object.keys(r)))]).slice(0,14);offlinePreviewTitle.textContent=`${t.label||t.name||''} · ${money(t.total||0)} dòng · trang ${t.page||1}`;odCurrent.textContent=t.name||'-';odPreviewCount.textContent=`${money(rows.length)} / ${money(t.total||0)}`;offlinePrevBtn.disabled=(t.page||1)<=1;offlineNextBtn.disabled=((t.offset||0)+rows.length)>=(t.total||0);offlinePreviewHead.innerHTML=columns.length?`<tr>${columns.map(c=>`<th>${esc(c)}</th>`).join('')}</tr>`:'';offlinePreviewRows.innerHTML=rows.map(r=>`<tr>${columns.map(c=>`<td>${esc(String(r[c]??'').slice(0,120))}</td>`).join('')}</tr>`).join('')||'<tr><td class="empty">Không có dòng dữ liệu.</td></tr>'}
+    function renderOfflineSchema(){const s=state.offlineSchema||{},q=(schemaSearch.value||'').toLowerCase();const tables=(s.tables||[]).filter(t=>JSON.stringify({name:t.name,label:t.label,columns:t.columns}).toLowerCase().includes(q));schemaRows.innerHTML=tables.map(t=>`<tr><td><strong>${esc(t.name)}</strong><br><span class="muted">${esc(t.label)}</span></td><td class="num">${money(t.column_count)}</td><td class="num">${money(t.row_count)}</td><td class="num">${money((t.indexes||[]).length)}</td><td class="num">${money((t.foreign_keys||[]).length)}</td><td><span class="status ${t.data_exposed?'':'low'}">${t.data_exposed?'online':'schema'}</span></td></tr>`).join('')||'<tr><td colspan="6" class="empty">Chưa có cấu trúc dữ liệu.</td></tr>';relationRows.innerHTML=(s.relationships||[]).map(r=>`<tr><td>${esc(r.from_table)}</td><td>${esc(r.from_column)}</td><td>${esc(r.to_table)}</td><td>${esc(r.to_column)}</td></tr>`).join('')||'<tr><td colspan="4" class="empty">Chưa khai báo khóa ngoại.</td></tr>'}
     function renderDashboard(){const d=state.dashboard||{},s=d.stats||{};kTotal.textContent=money(s.total_expenses);kMonth.textContent=money(s.monthly_expenses);kProjects.textContent=s.total_projects||0;kDocs.textContent=s.total_documents||0;kStock.textContent=money(d.stock_value);const max=Math.max(1,...(d.categories||[]).map(x=>x.total||0));categoryBars.innerHTML=(d.categories||[]).map(x=>`<div class="barrow"><strong>${esc(x.name)}</strong><div class="bar"><div class="fill" style="width:${Math.round((x.total||0)/max*100)}%"></div></div><span class="num">${money(x.total)}</span></div>`).join('')||'<div class="empty">Chưa có dữ liệu chi phí.</div>';lowStockRows.innerHTML=(d.low_stock||[]).map(x=>`<tr><td>${esc(x.code)}</td><td>${esc(x.name)}</td><td class="num">${money(x.quantity)} ${esc(x.unit)}</td><td class="num">${money(x.min_quantity)}</td></tr>`).join('')||'<tr><td colspan="4" class="empty">Không có cảnh báo tồn kho.</td></tr>'}
     function renderExpenses(){const q=(expenseSearch.value||'').toLowerCase();const rows=state.expenses.filter(e=>JSON.stringify(e).toLowerCase().includes(q));expenseRows.innerHTML=rows.map(e=>`<tr><td>${esc(e.expense_date)}</td><td>${esc(e.project_name||'')}</td><td>${esc(e.category_name||'')}</td><td>${esc(e.description||'')}</td><td class="num">${money(e.amount)}</td><td><span class="status">${esc(e.status)}</span></td></tr>`).join('')||'<tr><td colspan="6" class="empty">Chưa có chi phí.</td></tr>'}
     function renderInventory(){const q=(inventorySearch.value||'').toLowerCase();const rows=state.inventory.filter(i=>JSON.stringify(i).toLowerCase().includes(q));inventoryRows.innerHTML=rows.map(i=>`<tr><td>${esc(i.code)}</td><td>${esc(i.name)}</td><td>${esc(i.category)}</td><td class="num">${money(i.quantity)} ${esc(i.unit)}</td><td class="num">${money(i.unit_price)}</td><td><span class="status">${esc(i.status)}</span></td></tr>`).join('')||'<tr><td colspan="6" class="empty">Chưa có vật tư.</td></tr>';historyRows.innerHTML=state.history.map(h=>`<tr><td>${esc(h.transaction_date)}</td><td>${esc(h.code)}</td><td>${esc(h.name)}</td><td>${esc(h.transaction_type)}</td><td class="num">${money(h.quantity)}</td><td>${esc(h.notes)}</td></tr>`).join('')||'<tr><td colspan="6" class="empty">Chưa có giao dịch kho.</td></tr>'}
@@ -2219,7 +2314,7 @@ INDEX_HTML = r"""<!doctype html>
     loginForm.addEventListener('submit',async e=>{e.preventDefault();const data=Object.fromEntries(new FormData(loginForm).entries());try{const r=await api('/api/auth/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});if(r.token)localStorage.setItem('fastrack_auth_token',r.token);state.auth=r.user;hideLogin();userChip.textContent=`${state.auth.full_name||state.auth.username} · ${state.auth.role}`;loginForm.reset();await loadAll();toast('Đã đăng nhập')}catch(err){toast(err.message)}});
     logoutBtn.addEventListener('click',async()=>{try{await api('/api/auth/logout',{method:'POST'});}catch(err){}localStorage.removeItem('fastrack_auth_token');state.auth=null;userChip.textContent='Chưa đăng nhập';showLogin()});
     reloadUsersBtn.addEventListener('click',()=>loadUsers());
-    offlineSearch.addEventListener('input',renderOfflineData);offlineReloadBtn.addEventListener('click',()=>loadOfflineData());offlineJsonBtn.addEventListener('click',()=>{window.location.href='/api/offline-data/export.json?limit_per_table=5000'});offlineCsvBtn.addEventListener('click',()=>{const t=state.offlineTable||{};if(!t.name)return toast('Chưa chọn bảng');window.location.href=`/api/offline-data/${encodeURIComponent(t.name)}.csv?limit=5000&q=${encodeURIComponent(offlineTableSearch.value||'')}`});offlinePrevBtn.addEventListener('click',()=>{const t=state.offlineTable||{};if(t.name&&Number(t.page)>1)loadOfflineTable(t.name,Number(t.page)-1)});offlineNextBtn.addEventListener('click',()=>{const t=state.offlineTable||{};if(t.name)loadOfflineTable(t.name,Number(t.page||1)+1)});offlineTableSearch.addEventListener('change',()=>{const t=state.offlineTable||{};if(t.name)loadOfflineTable(t.name,1)});
+    offlineSearch.addEventListener('input',renderOfflineData);schemaSearch.addEventListener('input',renderOfflineSchema);schemaJsonBtn.addEventListener('click',()=>{window.location.href='/api/offline-schema/export.json'});offlineReloadBtn.addEventListener('click',()=>loadOfflineData());offlineJsonBtn.addEventListener('click',()=>{window.location.href='/api/offline-data/export.json?limit_per_table=5000'});offlineCsvBtn.addEventListener('click',()=>{const t=state.offlineTable||{};if(!t.name)return toast('Chưa chọn bảng');window.location.href=`/api/offline-data/${encodeURIComponent(t.name)}.csv?limit=5000&q=${encodeURIComponent(offlineTableSearch.value||'')}`});offlinePrevBtn.addEventListener('click',()=>{const t=state.offlineTable||{};if(t.name&&Number(t.page)>1)loadOfflineTable(t.name,Number(t.page)-1)});offlineNextBtn.addEventListener('click',()=>{const t=state.offlineTable||{};if(t.name)loadOfflineTable(t.name,Number(t.page||1)+1)});offlineTableSearch.addEventListener('change',()=>{const t=state.offlineTable||{};if(t.name)loadOfflineTable(t.name,1)});
     reportMonth.value=new Date().toISOString().slice(0,7);reportMonth.addEventListener('change',()=>loadReports());csvExportBtn.addEventListener('click',()=>{window.location.href=`/api/export/monthly-report.csv?month=${encodeURIComponent(reportMonth.value)}`});sheetsExportBtn.addEventListener('click',async()=>{try{const r=await api('/api/export/sheets',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({month:reportMonth.value})});toast(r.url?'Đã xuất Google Sheets':'Đã gửi yêu cầu xuất')}catch(err){toast(err.message)}});
     expenseSearch.addEventListener('input',renderExpenses);inventorySearch.addEventListener('input',renderInventory);contractSearch.addEventListener('input',renderProjectAccounting);documentSearch.addEventListener('input',renderDocuments);formSearch.addEventListener('input',renderForms);accountSearch.addEventListener('input',renderAccounting);journalSearch.addEventListener('input',renderAccounting);financeSearch.addEventListener('input',renderFinance);
     expenseForm.expense_date.value=new Date().toISOString().slice(0,10);
