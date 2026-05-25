@@ -1143,12 +1143,20 @@ class WebAccountingWorkspace:
                 WHERE COALESCE(debit_account, '') <> ''
                   AND entry_date <= ?
                   AND COALESCE(is_reversed, 0) = 0
+                  AND NOT EXISTS (
+                      SELECT 1 FROM journal_entry_lines l
+                      WHERE l.journal_entry_id = journal_entries.id
+                  )
                 UNION ALL
                 SELECT credit_account AS account_code, 0 AS debit_amount, amount AS credit_amount
                 FROM journal_entries
                 WHERE COALESCE(credit_account, '') <> ''
                   AND entry_date <= ?
                   AND COALESCE(is_reversed, 0) = 0
+                  AND NOT EXISTS (
+                      SELECT 1 FROM journal_entry_lines l
+                      WHERE l.journal_entry_id = journal_entries.id
+                  )
                 UNION ALL
                 SELECT l.account_code, l.debit_amount, l.credit_amount
                 FROM journal_entry_lines l
