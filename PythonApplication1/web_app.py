@@ -551,6 +551,39 @@ def update_expense_approval_web(expense_id: int, action: str, actor: dict[str, A
     return {"id": expense_id, "status": status}
 
 
+def site_intake_snapshot(limit: int = 80) -> dict[str, Any]:
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT d.id, d.doc_type, d.doc_number, d.doc_date, d.supplier_name,
+               d.description, d.amount, COALESCE(p.code, '') AS project_code,
+               COALESCE(p.name, '') AS project_name, d.status, d.file_path,
+               COALESCE(u.full_name, u.username, '') AS created_by_name,
+               d.created_at
+        FROM documents d
+        LEFT JOIN projects p ON p.id = d.project_id
+        LEFT JOIN users u ON u.id = d.created_by
+        WHERE d.status IN ('site_submitted', 'field_received', 'draft', 'approved')
+          AND (d.doc_type LIKE '%Phiếu giao%' OR d.doc_type LIKE '%Biên nhận%'
+               OR d.doc_type LIKE '%Bàn giao%' OR d.description LIKE '%Công trường%'
+               OR d.description LIKE '%cong truong%' OR d.status = 'site_submitted')
+        ORDER BY CASE WHEN d.status = 'site_submitted' THEN 0 ELSE 1 END, d.doc_date DESC, d.id DESC
+        LIMIT ?
+        """,
+        (limit,),
+    )
+    rows = [row_to_dict(row) for row in cursor.fetchall()]
+    pending = [row for row in rows if row.get("status") == "site_submitted"]
+    return {
+        "rows": rows,
+        "summary": {
+            "pending_count": len(pending),
+            "pending_amount": sum(float(row.get("amount") or 0) for row in pending),
+        },
+    }
+
+
 def offline_schema_snapshot() -> dict[str, Any]:
     conn = get_connection()
     cursor = conn.cursor()
@@ -1868,6 +1901,32 @@ def create_app():
         DocumentManager().update_document_status(document_id, data.get("status", "draft"))
         return jsonify({"status": "saved"})
 
+    @app.get("/api/site-intake")
+    @api_error
+    def site_intake():
+        return jsonify(site_intake_snapshot())
+
+    @app.post("/api/site-intake")
+    @api_error
+    def create_site_intake():
+        data = request.get_json(force=True)
+        document_id = DocumentManager().add_document(
+            data.get("doc_type", "Phiếu giao hàng công trường"),
+            data.get("doc_number", ""),
+            data.get("doc_date") or date.today().isoformat(),
+            data.get("supplier_name", ""),
+            data.get("description", ""),
+            float(data.get("amount") or 0),
+            data.get("project_id") or None,
+            data.get("category_id") or None,
+            data.get("file_path", ""),
+            int(data.get("created_by") or session.get("user_id") or 1),
+            status="site_submitted",
+            vat_rate=float(data.get("vat_rate") or 0),
+        )
+        AuditLogManager().log("document", document_id, "site_submitted", session.get("user_id"), new_value=data)
+        return jsonify({"id": document_id, "status": "site_submitted"})
+
     @app.get("/api/documents/<int:document_id>/validation")
     @api_error
     def validate_document(document_id):
@@ -2625,6 +2684,30 @@ INDEX_HTML = r"""<!doctype html>
       </section>
 
       <section class="view" id="construction">
+        <div class="grid kpis">
+          <div class="card kpi"><div class="label">Chứng từ hiện trường chờ xử lý</div><div class="value" id="sitePendingCount">0</div></div>
+          <div class="card kpi"><div class="label">Giá trị tạm ghi nhận</div><div class="value" id="sitePendingAmount">0</div></div>
+        </div>
+        <div class="grid two">
+          <div class="card">
+            <h3>Gửi chứng từ từ công trường</h3>
+            <form class="form" id="siteIntakeForm">
+              <label>Ngày chứng từ<input name="doc_date" type="date"></label>
+              <label>Dự án<select name="project_id" id="siteProject"></select></label>
+              <label>Loại chứng từ<input name="doc_type" value="Phiếu giao hàng công trường"></label>
+              <label>Số chứng từ<input name="doc_number" placeholder="Tự sinh nếu bỏ trống"></label>
+              <label>Nhà cung cấp / người giao<input name="supplier_name"></label>
+              <label>Giá trị tạm tính<input name="amount" type="number" min="0" step="1000"></label>
+              <label class="wide">Nội dung<textarea name="description" placeholder="VD: giao thép D16 tại công trường, người nhận, biển số xe"></textarea></label>
+              <label class="wide">Link ảnh/PDF<input name="file_path" placeholder="Google Drive/Firebase Storage/link ảnh hiện trường"></label>
+              <div class="wide actions"><button class="primary" type="submit">Gửi về kế toán</button></div>
+            </form>
+          </div>
+          <div class="card">
+            <div class="toolbar"><h3>Inbox công trường</h3><button class="secondary" type="button" id="reloadSiteIntakeBtn">Tải lại</button></div>
+            <div class="tablewrap"><table><thead><tr><th>Ngày</th><th>Dự án</th><th>Chứng từ</th><th>Nội dung</th><th>Giá trị</th><th>TT</th><th>Duyệt</th></tr></thead><tbody id="siteIntakeRows"></tbody></table></div>
+          </div>
+        </div>
         <div class="card">
           <h3>Hạng mục công trường</h3>
           <div class="tablewrap"><table><thead><tr><th>Dự án</th><th>Mã HM</th><th>Hạng mục</th><th>KL KH</th><th>Hoàn thành</th><th>Chi phí thực tế</th><th>TT</th></tr></thead><tbody id="workRows"></tbody></table></div>
@@ -2866,7 +2949,7 @@ INDEX_HTML = r"""<!doctype html>
   <div class="toast" id="toast"></div>
 
   <script>
-    const state={auth:null,users:[],offlineData:null,offlineSchema:null,offlineTable:null,dashboard:null,expenses:[],approvals:null,inventory:[],history:[],inventoryWorkspace:null,projects:[],categories:[],projectAccounting:null,workItems:[],diaries:[],documents:[],forms:[],reports:null,accounting:null,finance:null,settings:null};
+    const state={auth:null,users:[],offlineData:null,offlineSchema:null,offlineTable:null,dashboard:null,expenses:[],approvals:null,inventory:[],history:[],inventoryWorkspace:null,projects:[],categories:[],projectAccounting:null,workItems:[],diaries:[],siteIntake:null,documents:[],forms:[],reports:null,accounting:null,finance:null,settings:null};
     const money=v=>new Intl.NumberFormat('vi-VN',{maximumFractionDigits:0}).format(Number(v||0));
     const esc=v=>String(v??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
     const toast=t=>{const el=document.getElementById('toast');el.textContent=t;el.style.display='block';setTimeout(()=>el.style.display='none',2800)};
@@ -2879,7 +2962,7 @@ INDEX_HTML = r"""<!doctype html>
     function hideLogin(){authGate.classList.add('hidden')}
     function switchView(id){document.querySelectorAll('.view').forEach(v=>v.classList.toggle('active',v.id===id));document.querySelectorAll('.navbtn').forEach(b=>b.classList.toggle('active',b.dataset.view===id));document.getElementById('pageTitle').textContent={dashboard:'Tổng quan',offlineData:'Dữ liệu offline',expenses:'Chi phí',inventory:'Vật tư kho',projects:'Dự án',projectAccounting:'Kế toán công trình',construction:'Công trường',documents:'Chứng từ',forms:'Biểu mẫu',reports:'Báo cáo',accounting:'Sổ sách kế toán',finance:'Kiểm soát & tài chính',security:'Bảo mật',settings:'Cài đặt',deploy:'Tên miền'}[id]||'FasTrack ERP';document.getElementById('side').classList.remove('open')}
     async function boot(){const me=await api('/api/auth/me');state.auth=me.user||null;if(!me.authenticated){showLogin();return}hideLogin();userChip.textContent=`${state.auth.full_name||state.auth.username} · ${state.auth.role}`;await loadAll()}
-    async function loadAll(){await Promise.all([loadDashboard(),loadOfflineData(),loadCatalogs(),loadExpenses(),loadApprovals(),loadInventory(),loadProjects(),loadProjectAccounting(),loadConstruction(),loadDocuments(),loadForms(),loadReports(),loadAccounting(),loadFinance(),loadSettings(),loadUsers()])}
+    async function loadAll(){await Promise.all([loadDashboard(),loadOfflineData(),loadCatalogs(),loadExpenses(),loadApprovals(),loadInventory(),loadProjects(),loadProjectAccounting(),loadConstruction(),loadSiteIntake(),loadDocuments(),loadForms(),loadReports(),loadAccounting(),loadFinance(),loadSettings(),loadUsers()])}
     async function loadDashboard(){state.dashboard=await api('/api/dashboard');renderDashboard()}
     async function loadOfflineData(){const [data,schema]=await Promise.all([api('/api/offline-data'),api('/api/offline-schema')]);state.offlineData=data;state.offlineSchema=schema;renderOfflineData();renderOfflineSchema()}
     async function loadOfflineTable(name,page=1){const q=offlineTableSearch.value||'';state.offlineTable=await api(`/api/offline-data/${encodeURIComponent(name)}?limit=100&page=${page}&q=${encodeURIComponent(q)}`);renderOfflinePreview()}
@@ -2890,6 +2973,7 @@ INDEX_HTML = r"""<!doctype html>
     async function loadProjects(){state.projects=await api('/api/projects');fillSelects();renderProjects()}
     async function loadProjectAccounting(){state.projectAccounting=await api('/api/project-accounting');renderProjectAccounting()}
     async function loadConstruction(){const [workItems,diaries]=await Promise.all([api('/api/construction/work-items'),api('/api/construction/diaries')]);state.workItems=workItems;state.diaries=diaries;renderConstruction();fillInventorySelects()}
+    async function loadSiteIntake(){state.siteIntake=await api('/api/site-intake');renderSiteIntake()}
     async function loadDocuments(){state.documents=await api('/api/documents');renderDocuments()}
     async function loadForms(){state.forms=await api('/api/forms');renderForms()}
     async function loadReports(){state.reports=await api('/api/reports/summary');state.monthlyExport=await api(`/api/export/monthly-report?month=${encodeURIComponent(reportMonth.value||new Date().toISOString().slice(0,7))}`);renderReports()}
@@ -2897,7 +2981,7 @@ INDEX_HTML = r"""<!doctype html>
     async function loadFinance(){state.finance=await api('/api/finance-center');renderFinance()}
     async function loadSettings(){state.settings=await api('/api/settings');renderSettings()}
     async function loadUsers(){try{state.users=await api('/api/users');renderUsers()}catch(err){state.users=[];renderUsers(err.message)}}
-    function fillSelects(){const projectOptions='<option value="">Không gắn dự án</option>'+state.projects.map(p=>`<option value="${p.id}">${esc(p.code)} - ${esc(p.name)}</option>`).join('');const requiredProjectOptions=state.projects.map(p=>`<option value="${p.id}">${esc(p.code)} - ${esc(p.name)}</option>`).join('');const categoryOptions=state.categories.map(c=>`<option value="${c.id}">${esc(c.code)} - ${esc(c.name)}</option>`).join('');expenseProject.innerHTML=projectOptions;diaryProject.innerHTML=projectOptions;documentProject.innerHTML=projectOptions;contractProject.innerHTML=requiredProjectOptions;costPlanProject.innerHTML=requiredProjectOptions;revenueProject.innerHTML=requiredProjectOptions;expenseCategory.innerHTML=categoryOptions;documentCategory.innerHTML='<option value="">Chọn danh mục</option>'+categoryOptions;costPlanCategory.innerHTML=categoryOptions;fillContractSelects()}
+    function fillSelects(){const projectOptions='<option value="">Không gắn dự án</option>'+state.projects.map(p=>`<option value="${p.id}">${esc(p.code)} - ${esc(p.name)}</option>`).join('');const requiredProjectOptions=state.projects.map(p=>`<option value="${p.id}">${esc(p.code)} - ${esc(p.name)}</option>`).join('');const categoryOptions=state.categories.map(c=>`<option value="${c.id}">${esc(c.code)} - ${esc(c.name)}</option>`).join('');expenseProject.innerHTML=projectOptions;diaryProject.innerHTML=projectOptions;siteProject.innerHTML=projectOptions;documentProject.innerHTML=projectOptions;contractProject.innerHTML=requiredProjectOptions;costPlanProject.innerHTML=requiredProjectOptions;revenueProject.innerHTML=requiredProjectOptions;expenseCategory.innerHTML=categoryOptions;documentCategory.innerHTML='<option value="">Chọn danh mục</option>'+categoryOptions;costPlanCategory.innerHTML=categoryOptions;fillContractSelects()}
     function fillInventorySelects(){const ws=state.inventoryWorkspace||{};const mats=(ws.materials||state.inventory||[]);const work=(ws.work_items||state.workItems||[]);const matOptions='<option value="">Chọn vật tư</option>'+mats.map(m=>`<option value="${m.id}">${esc(m.code)} - ${esc(m.name)} (${money(m.quantity)} ${esc(m.unit||'')})</option>`).join('');const projectOptions='<option value="">Kho chung</option>'+state.projects.map(p=>`<option value="${p.id}">${esc(p.code)} - ${esc(p.name)}</option>`).join('');const workOptions='<option value="">Không gắn hạng mục</option>'+work.map(w=>`<option value="${w.id}">${esc(w.project_code)} · ${esc(w.item_code)} ${esc(w.item_name)}</option>`).join('');if(typeof inventoryMaterialSelect!=='undefined'){inventoryMaterialSelect.innerHTML=matOptions;standardMaterialSelect.innerHTML=matOptions;inventoryProjectSelect.innerHTML=projectOptions;inventoryWorkItemSelect.innerHTML=workOptions;standardWorkItemSelect.innerHTML=workOptions}}
     function fillContractSelects(){const rows=(state.projectAccounting&&state.projectAccounting.contracts)||[];const options='<option value="">Chọn hợp đồng</option>'+rows.map(c=>`<option value="${c.id}">${esc(c.contract_no)} - ${esc(c.partner_name)}</option>`).join('');if(typeof billingContract!=='undefined'){billingContract.innerHTML=options;revenueContract.innerHTML=options}}
     function renderOfflineData(){const d=state.offlineData||{},s=d.summary||{};odTables.textContent=s.table_count||0;odActiveTables.textContent=s.active_table_count||0;odRecords.textContent=money(s.record_count);const q=(offlineSearch.value||'').toLowerCase();const tables=(d.tables||[]).filter(t=>JSON.stringify(t).toLowerCase().includes(q));offlineTableRows.innerHTML=tables.map(t=>`<tr><td><strong>${esc(t.label)}</strong></td><td>${esc(t.name)}</td><td class="num">${money(t.count)}</td><td><button class="secondary" type="button" data-offline-table="${esc(t.name)}">Xem</button></td></tr>`).join('')||'<tr><td colspan="4" class="empty">Chưa có dữ liệu.</td></tr>';document.querySelectorAll('[data-offline-table]').forEach(btn=>btn.addEventListener('click',()=>{offlineTableSearch.value='';loadOfflineTable(btn.dataset.offlineTable)}));if(!state.offlineTable&&tables.length){loadOfflineTable(tables.find(t=>t.count)?.name||tables[0].name)}}
@@ -2911,6 +2995,8 @@ INDEX_HTML = r"""<!doctype html>
     function renderProjects(){projectRows.innerHTML=state.projects.map(p=>`<tr><td>${esc(p.code)}</td><td>${esc(p.name)}</td><td>${esc(p.location)}</td><td class="num">${money(p.budget)}</td><td><span class="status">${esc(p.status)}</span></td></tr>`).join('')||'<tr><td colspan="5" class="empty">Chưa có dự án.</td></tr>'}
     function renderProjectAccounting(){const pa=state.projectAccounting||{},d=pa.dashboard||{};paActive.textContent=d.active_projects||0;paPlanned.textContent=money(d.total_planned);paSpent.textContent=money(d.total_spent);paRevenue.textContent=money(d.total_revenue);paProfit.textContent=money(d.profit);fillContractSelects();const q=(contractSearch.value||'').toLowerCase();const contracts=(pa.contracts||[]).filter(c=>JSON.stringify(c).toLowerCase().includes(q));contractRows.innerHTML=contracts.map(c=>`<tr><td>${esc(c.project_code)} ${esc(c.project_name)}</td><td>${esc(c.contract_type)}</td><td>${esc(c.contract_no)}</td><td>${esc(c.partner_name)}</td><td class="num">${money(c.contract_value)}</td><td class="num">${money(c.billed)}</td><td><span class="status">${esc(c.status)}</span></td></tr>`).join('')||'<tr><td colspan="7" class="empty">Chưa có hợp đồng.</td></tr>';billingRows.innerHTML=(pa.billings||[]).map(b=>`<tr><td>${esc(b.billing_date)}</td><td>${esc(b.contract_no)}</td><td>${esc(b.milestone_name)}</td><td class="num">${money(b.net_amount)}</td><td><span class="status">${esc(b.status)}</span></td></tr>`).join('')||'<tr><td colspan="5" class="empty">Chưa có nghiệm thu.</td></tr>';revenueRows.innerHTML=(pa.revenues||[]).map(r=>`<tr><td>${esc(r.revenue_date)}</td><td>${esc(r.project_code)} ${esc(r.project_name)}</td><td>${esc(r.contract_no)}</td><td class="num">${money(r.amount)}</td><td class="num">${money(r.vat_amount)}</td></tr>`).join('')||'<tr><td colspan="5" class="empty">Chưa có doanh thu.</td></tr>';costPlanRows.innerHTML=(pa.cost_plan_actual||[]).map(x=>{const diff=Number(x.planned||0)-Number(x.actual||0);return `<tr><td>${esc(x.project_code)} ${esc(x.project_name)}</td><td>${esc(x.category)}</td><td class="num">${money(x.planned)}</td><td class="num">${money(x.actual)}</td><td class="num">${money(diff)}</td></tr>`}).join('')||'<tr><td colspan="5" class="empty">Chưa có dự toán.</td></tr>';projectPlRows.innerHTML=(pa.project_pl||[]).map(x=>`<tr><td>${esc(x.code)} ${esc(x.name)}</td><td class="num">${money(x.revenue)}</td><td class="num">${money(x.cost)}</td><td class="num">${money(x.profit)}</td></tr>`).join('')||'<tr><td colspan="4" class="empty">Chưa có P/L công trình.</td></tr>';const costing=pa.costing||{},cs=costing.summary||{};costingActual.textContent=money(cs.actual);costingPlanned.textContent=money(cs.planned);costingVariance.textContent=money(cs.variance);costingOverrun.textContent=cs.overrun_count||0;costingSummaryText.textContent=`Đã dùng ${pct(cs.used_percent)} dự toán · lãi gộp ${money(cs.gross_profit)}`;costingRows.innerHTML=(costing.projects||[]).map(p=>{const b=p.cost_buckets||{};return `<tr><td><strong>${esc(p.code)} ${esc(p.name)}</strong><br><span class="muted">Tiến độ ${money(p.progress)}% · dùng ${pct(p.used_percent)}</span></td><td class="num">${money(b.direct_material)}</td><td class="num">${money(b.direct_labor)}</td><td class="num">${money(b.machine)}</td><td class="num">${money(b.overhead)}</td><td class="num">${money(p.actual)}</td><td class="num">${money(p.planned)}</td><td><span class="status ${p.status==='overrun'?'low':''}">${esc(p.status)}</span></td></tr>`}).join('')||'<tr><td colspan="8" class="empty">Chưa có dữ liệu giá thành.</td></tr>'}
     function renderConstruction(){workRows.innerHTML=state.workItems.map(w=>`<tr><td>${esc(w.project_code)} ${esc(w.project_name)}</td><td>${esc(w.item_code)}</td><td>${esc(w.item_name)}</td><td class="num">${money(w.planned_quantity)} ${esc(w.unit)}</td><td class="num">${money(w.percent_complete)}%</td><td class="num">${money(w.actual_expense)}</td><td><span class="status">${esc(w.status)}</span></td></tr>`).join('')||'<tr><td colspan="7" class="empty">Chưa có hạng mục.</td></tr>';diaryRows.innerHTML=state.diaries.map(d=>`<tr><td>${esc(d.diary_date)}</td><td>${esc(d.project_code)} ${esc(d.project_name)}</td><td>${esc(d.weather)}</td><td>${esc(d.work_content)}</td><td>${esc(d.reporter)}</td></tr>`).join('')||'<tr><td colspan="5" class="empty">Chưa có nhật ký.</td></tr>'}
+    function renderSiteIntake(){const si=state.siteIntake||{},s=si.summary||{};sitePendingCount.textContent=s.pending_count||0;sitePendingAmount.textContent=money(s.pending_amount);siteIntakeRows.innerHTML=(si.rows||[]).map(d=>`<tr><td>${esc(d.doc_date)}</td><td>${esc(d.project_code)} ${esc(d.project_name)}</td><td><strong>${esc(d.doc_type)}</strong><br><span class="muted">${esc(d.doc_number||'')}</span></td><td>${esc(d.description||'')}<br><span class="muted">${esc(d.file_path||'')}</span></td><td class="num">${money(d.amount)}</td><td><span class="status ${d.status==='site_submitted'?'low':''}">${esc(d.status)}</span></td><td>${d.status==='site_submitted'?`<button class="secondary" type="button" data-site-approve="${d.id}">Duyệt</button>`:''}</td></tr>`).join('')||'<tr><td colspan="7" class="empty">Chưa có chứng từ hiện trường.</td></tr>';document.querySelectorAll('[data-site-approve]').forEach(btn=>btn.addEventListener('click',()=>approveSiteDocument(btn.dataset.siteApprove)))}
+    async function approveSiteDocument(id){try{await api(`/api/documents/${id}/status`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({status:'approved'})});await Promise.all([loadSiteIntake(),loadDocuments(),loadDashboard()]);toast('Đã duyệt chứng từ hiện trường')}catch(err){toast(err.message)}}
     function renderDocuments(){const q=(documentSearch.value||'').toLowerCase();const rows=state.documents.filter(d=>JSON.stringify(d).toLowerCase().includes(q));documentRows.innerHTML=rows.map(d=>`<tr><td>${esc(d.doc_date)}</td><td>${esc(d.doc_type)}</td><td>${esc(d.doc_number)}</td><td>${esc(d.supplier_name)}</td><td class="num">${money(d.amount)}</td><td>${esc(d.project_name)}</td><td><span class="status">${esc(d.status)}</span></td></tr>`).join('')||'<tr><td colspan="7" class="empty">Chưa có chứng từ.</td></tr>'}
     function renderForms(){const q=(formSearch.value||'').toLowerCase();const rows=state.forms.filter(f=>JSON.stringify(f).toLowerCase().includes(q));formRows.innerHTML=rows.map(f=>`<tr><td>${esc(f.form_code)}</td><td>${esc(f.form_name)}</td><td>${esc(f.scope)}</td><td>${esc(f.file_path)}</td></tr>`).join('')||'<tr><td colspan="4" class="empty">Chưa có biểu mẫu.</td></tr>'}
     function drawBars(el,rows,labelKey,valueKey){const max=Math.max(1,...rows.map(r=>Number(r[valueKey]||0)));el.innerHTML=rows.map(r=>`<div class="barrow"><strong>${esc(r[labelKey])}</strong><div class="bar"><div class="fill" style="width:${Math.round(Number(r[valueKey]||0)/max*100)}%"></div></div><span class="num">${money(r[valueKey])}</span></div>`).join('')||'<div class="empty">Chưa có dữ liệu.</div>'}
@@ -2928,8 +3014,9 @@ INDEX_HTML = r"""<!doctype html>
     reloadUsersBtn.addEventListener('click',()=>loadUsers());
     offlineSearch.addEventListener('input',renderOfflineData);schemaSearch.addEventListener('input',renderOfflineSchema);schemaJsonBtn.addEventListener('click',()=>{window.location.href='/api/offline-schema/export.json'});offlineReloadBtn.addEventListener('click',()=>loadOfflineData());offlineJsonBtn.addEventListener('click',()=>{window.location.href='/api/offline-data/export.json?limit_per_table=5000'});offlineCsvBtn.addEventListener('click',()=>{const t=state.offlineTable||{};if(!t.name)return toast('Chưa chọn bảng');window.location.href=`/api/offline-data/${encodeURIComponent(t.name)}.csv?limit=5000&q=${encodeURIComponent(offlineTableSearch.value||'')}`});offlinePrevBtn.addEventListener('click',()=>{const t=state.offlineTable||{};if(t.name&&Number(t.page)>1)loadOfflineTable(t.name,Number(t.page)-1)});offlineNextBtn.addEventListener('click',()=>{const t=state.offlineTable||{};if(t.name)loadOfflineTable(t.name,Number(t.page||1)+1)});offlineTableSearch.addEventListener('change',()=>{const t=state.offlineTable||{};if(t.name)loadOfflineTable(t.name,1)});
     reportMonth.value=new Date().toISOString().slice(0,7);reportMonth.addEventListener('change',()=>loadReports());csvExportBtn.addEventListener('click',()=>{window.location.href=`/api/export/monthly-report.csv?month=${encodeURIComponent(reportMonth.value)}`});sheetsExportBtn.addEventListener('click',async()=>{try{const r=await api('/api/export/sheets',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({month:reportMonth.value})});toast(r.url?'Đã xuất Google Sheets':'Đã gửi yêu cầu xuất')}catch(err){toast(err.message)}});
-    expenseSearch.addEventListener('input',renderExpenses);reloadApprovalsBtn.addEventListener('click',()=>loadApprovals());inventorySearch.addEventListener('input',renderInventory);reloadInventoryWorkspaceBtn.addEventListener('click',()=>loadInventory());contractSearch.addEventListener('input',renderProjectAccounting);documentSearch.addEventListener('input',renderDocuments);formSearch.addEventListener('input',renderForms);accountSearch.addEventListener('input',renderAccounting);journalSearch.addEventListener('input',renderAccounting);financeSearch.addEventListener('input',renderFinance);
+    expenseSearch.addEventListener('input',renderExpenses);reloadApprovalsBtn.addEventListener('click',()=>loadApprovals());inventorySearch.addEventListener('input',renderInventory);reloadInventoryWorkspaceBtn.addEventListener('click',()=>loadInventory());reloadSiteIntakeBtn.addEventListener('click',()=>loadSiteIntake());contractSearch.addEventListener('input',renderProjectAccounting);documentSearch.addEventListener('input',renderDocuments);formSearch.addEventListener('input',renderForms);accountSearch.addEventListener('input',renderAccounting);journalSearch.addEventListener('input',renderAccounting);financeSearch.addEventListener('input',renderFinance);
     expenseForm.expense_date.value=new Date().toISOString().slice(0,10);
+    siteIntakeForm.doc_date.value=new Date().toISOString().slice(0,10);
     diaryForm.diary_date.value=new Date().toISOString().slice(0,10);
     documentForm.doc_date.value=new Date().toISOString().slice(0,10);
     contractForm.signed_date.value=new Date().toISOString().slice(0,10);
@@ -2945,6 +3032,7 @@ INDEX_HTML = r"""<!doctype html>
     billingForm.addEventListener('submit',async e=>{e.preventDefault();const data=Object.fromEntries(new FormData(billingForm).entries());try{await api('/api/project-accounting/billings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});billingForm.reset();billingForm.vat_rate.value='10';billingForm.retention_rate.value='5';billingForm.billing_date.value=new Date().toISOString().slice(0,10);await Promise.all([loadProjectAccounting(),loadFinance()]);toast('Đã lưu nghiệm thu')}catch(err){toast(err.message)}});
     revenueForm.addEventListener('submit',async e=>{e.preventDefault();const data=Object.fromEntries(new FormData(revenueForm).entries());try{await api('/api/project-accounting/revenues',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});revenueForm.reset();revenueForm.revenue_date.value=new Date().toISOString().slice(0,10);await Promise.all([loadProjectAccounting(),loadFinance()]);toast('Đã lưu doanh thu')}catch(err){toast(err.message)}});
     diaryForm.addEventListener('submit',async e=>{e.preventDefault();const data=Object.fromEntries(new FormData(diaryForm).entries());try{await api('/api/construction/diaries',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});diaryForm.reset();diaryForm.diary_date.value=new Date().toISOString().slice(0,10);await loadConstruction();toast('Đã lưu nhật ký')}catch(err){toast(err.message)}});
+    siteIntakeForm.addEventListener('submit',async e=>{e.preventDefault();const data=Object.fromEntries(new FormData(siteIntakeForm).entries());try{await api('/api/site-intake',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});siteIntakeForm.reset();siteIntakeForm.doc_type.value='Phiếu giao hàng công trường';siteIntakeForm.doc_date.value=new Date().toISOString().slice(0,10);await Promise.all([loadSiteIntake(),loadDocuments(),loadDashboard()]);toast('Đã gửi chứng từ về kế toán')}catch(err){toast(err.message)}});
     documentForm.addEventListener('submit',async e=>{e.preventDefault();const data=Object.fromEntries(new FormData(documentForm).entries());try{await api('/api/documents',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});documentForm.reset();documentForm.doc_type.value='Hóa đơn';documentForm.vat_rate.value='10';documentForm.doc_date.value=new Date().toISOString().slice(0,10);await Promise.all([loadDashboard(),loadDocuments()]);toast('Đã lưu chứng từ')}catch(err){toast(err.message)}});
     thresholdForm.addEventListener('submit',async e=>{e.preventDefault();const data=Object.fromEntries(new FormData(thresholdForm).entries());try{await api('/api/approval-thresholds',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});thresholdForm.reset();await loadFinance();toast('Đã lưu hạn mức')}catch(err){toast(err.message)}});
     bankForm.addEventListener('submit',async e=>{e.preventDefault();const data=Object.fromEntries(new FormData(bankForm).entries());try{await api('/api/bank/transactions',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});bankForm.reset();bankForm.transaction_date.value=new Date().toISOString().slice(0,10);await loadFinance();toast('Đã thêm giao dịch ngân hàng')}catch(err){toast(err.message)}});
