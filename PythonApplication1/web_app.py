@@ -183,6 +183,22 @@ def offline_column_sensitivity(column_name: str) -> str | None:
     return None
 
 
+OFFLINE_MIGRATION_ACTIONS = {
+    "materials": (1, "/inventory/materials/create", "Tao/import danh muc vat tu"),
+    "inventory_transactions": (1, "/inventory/transactions/create", "Nhap giao dich kho tu ban offline"),
+    "purchase_orders": (2, "/inventory", "Tao don mua hang tu canh bao ton kho"),
+    "project_contracts": (1, "/project-accounting/contracts/create", "Nhap hop dong cong trinh"),
+    "project_cost_plans": (1, "/project-accounting", "Nhap du toan chi phi cong trinh"),
+    "construction_work_items": (1, "/construction/work-items/create", "Nhap hang muc cong truong"),
+    "site_diaries": (2, "/construction", "Nhap nhat ky cong truong"),
+    "documents": (1, "/documents/create", "Nhap chung tu ke toan"),
+    "bank_transactions": (1, "/finance", "Import sao ke/giao dich ngan hang"),
+    "employees": (2, "/finance", "Dong bo danh sach nhan su"),
+    "payroll_lines": (2, "/finance", "Dong bo bang luong"),
+    "fixed_assets": (2, "/accounting", "Dong bo tai san co dinh"),
+}
+
+
 def offline_table_columns(table_name: str) -> list[str]:
     if table_name not in OFFLINE_DATA_TABLES:
         raise ValueError("Bang du lieu khong duoc phep truy cap")
@@ -324,6 +340,23 @@ def offline_data_quality_snapshot() -> dict[str, Any]:
             "status": readiness_status,
             "next_action": next_action,
         })
+    migration_backlog = []
+    for table in empty_tables:
+        priority, route, action = OFFLINE_MIGRATION_ACTIONS.get(
+            table["name"],
+            (3, "/offline-data", "Ra soat va import neu can dung tren web"),
+        )
+        group_status = next((item for item in group_readiness if item["group"] == table["group"]), {})
+        migration_backlog.append({
+            "priority": priority,
+            "table": table["name"],
+            "label": table["label"],
+            "group": table["group"],
+            "route": route,
+            "action": action,
+            "group_status": group_status.get("status") or "unknown",
+        })
+    migration_backlog.sort(key=lambda item: (item["priority"], item["group"], item["table"]))
     return {
         "ok": issue_count == 0,
         "status": status,
@@ -342,6 +375,7 @@ def offline_data_quality_snapshot() -> dict[str, Any]:
         "stale_web_tables": stale_web_tables,
         "empty_tables": [{"name": table["name"], "label": table["label"], "group": table["group"]} for table in empty_tables],
         "group_readiness": group_readiness,
+        "migration_backlog": migration_backlog,
         "foreign_key_issues": foreign_key_issues,
         "sensitive_columns": sensitive_columns,
     }
@@ -3125,6 +3159,8 @@ INDEX_HTML = r"""<!doctype html>
           <div class="tablewrap"><table><thead><tr><th>Nhóm kiểm tra</th><th>Trạng thái</th><th>Chi tiết</th></tr></thead><tbody id="offlineQualityRows"></tbody></table></div>
           <h3>Mức sẵn sàng theo nghiệp vụ</h3>
           <div class="tablewrap"><table><thead><tr><th>Nghiệp vụ</th><th>Sẵn sàng</th><th>Bảng có dữ liệu</th><th>Dòng</th><th>Việc tiếp theo</th></tr></thead><tbody id="offlineReadinessRows"></tbody></table></div>
+          <h3>Backlog chuyển dữ liệu ưu tiên</h3>
+          <div class="tablewrap"><table><thead><tr><th>Ưu tiên</th><th>Nghiệp vụ</th><th>Bảng</th><th>Hành động</th><th>Mở</th></tr></thead><tbody id="offlineBacklogRows"></tbody></table></div>
         </div>
         <div class="grid two">
           <div class="card">
@@ -3727,6 +3763,7 @@ INDEX_HTML = r"""<!doctype html>
     const viewTitles={dashboard:'Tổng quan',offlineData:'Dữ liệu offline',expenses:'Chi phí',inventory:'Vật tư kho',projects:'Dự án',projectAccounting:'Kế toán công trình',construction:'Công trường',documents:'Chứng từ',forms:'Biểu mẫu',reports:'Báo cáo',accounting:'Sổ sách kế toán',finance:'Kiểm soát & tài chính',security:'Bảo mật',settings:'Cài đặt',deploy:'Tên miền'};
     const viewRoutes={dashboard:'/',offlineData:'/offline-data',expenses:'/expenses',inventory:'/inventory',projects:'/projects',projectAccounting:'/project-accounting',construction:'/construction',documents:'/documents',forms:'/forms',reports:'/reports',accounting:'/accounting',finance:'/finance',security:'/security',settings:'/settings',deploy:'/deploy'};
     const routeActions={'/documents/create':{view:'documents',focus:'documentForm'},'/projects/create':{view:'projects',focus:'projectForm'},'/expenses/create':{view:'expenses',focus:'expenseForm'},'/inventory/materials/create':{view:'inventory',focus:'materialForm'},'/inventory/transactions/create':{view:'inventory',focus:'inventoryTransactionForm'},'/project-accounting/contracts/create':{view:'projectAccounting',focus:'contractForm'},'/construction/site-intake/create':{view:'construction',focus:'siteIntakeForm'},'/construction/work-items/create':{view:'construction',focus:'workItemForm'},'/accounting/mappings':{view:'accounting',focus:'accountMappingForm'}};
+    function routeActionForPath(path){return routeActions[path]||{view:Object.entries(viewRoutes).find(([,route])=>route===path)?.[0]||'offlineData'}}
     function routeAction(){const path=window.location.pathname.replace(/\/$/,'')||'/';return routeActions[path]||{view:Object.entries(viewRoutes).find(([,route])=>route===path)?.[0]||'dashboard'}}
     function focusPanel(id){if(!id)return;setTimeout(()=>{const el=document.getElementById(id);if(!el)return;el.scrollIntoView({behavior:'smooth',block:'start'});const input=el.querySelector('input,select,textarea,button');if(input)input.focus({preventScroll:true})},120)}
     function switchView(id,options={}){document.querySelectorAll('.view').forEach(v=>v.classList.toggle('active',v.id===id));document.querySelectorAll('.navbtn').forEach(b=>b.classList.toggle('active',b.dataset.view===id));document.getElementById('pageTitle').textContent=viewTitles[id]||'FasTrack ERP';document.getElementById('side').classList.remove('open');if(options.push!==false){const path=options.path||viewRoutes[id]||'/';if(window.location.pathname!==path)history.pushState({view:id},'',path)}focusPanel(options.focus)}
@@ -3761,7 +3798,7 @@ INDEX_HTML = r"""<!doctype html>
     function tableChip(name,label){return `<button class="mini-cta" type="button" data-offline-table="${esc(name)}">${esc(label||name)}</button>`}
     function renderQualityItems(items,type){items=(items||[]).slice(0,8);if(!items.length)return 'Không có vấn đề';if(type==='missing'||type==='stale')return items.map(name=>`<span class="status low">${esc(name)}</span>`).join(' ');if(type==='foreign_key')return items.map(x=>tableChip(x.table,`${x.table}#${x.rowid||''}`)).join(' ');if(type==='sensitive')return items.map(x=>`${tableChip(x.table,`${x.table}.${x.column}`)} <span class="muted">${esc(x.sensitivity==='redacted'?'đã che':'metadata')}</span>`).join(' ');return items.map(x=>tableChip(x.name,x.name)).join(' ')}
     function bindOfflineTableButtons(root=document){root.querySelectorAll('[data-offline-table]').forEach(btn=>btn.addEventListener('click',()=>{offlineTableSearch.value='';loadOfflineTable(btn.dataset.offlineTable);document.getElementById('offlinePreviewTitle')?.scrollIntoView({behavior:'smooth',block:'center'})}))}
-    function renderOfflineQuality(){const q=state.offlineQuality||{},s=q.summary||{};odQualityStatus.textContent=q.ok?'OK':'Cần rà soát';odFkIssues.textContent=s.foreign_key_issue_count||0;odSensitiveCols.textContent=s.sensitive_column_count||0;odEmptyTables.textContent=s.empty_table_count||0;odMissingTables.textContent=s.missing_from_web_count||0;offlineQualityTime.textContent=q.generated_at?`Cập nhật ${fullDate(q.generated_at)}`:'Chưa rà soát';const checks=[['Độ phủ web',s.missing_from_web_count||0,'missing',q.missing_from_web||[]],['Catalog dư',s.stale_web_table_count||0,'stale',q.stale_web_tables||[]],['Khóa ngoại',s.foreign_key_issue_count||0,'foreign_key',q.foreign_key_issues||[]],['Cột bảo mật',s.sensitive_column_count||0,'sensitive',q.sensitive_columns||[]],['Bảng trống',s.empty_table_count||0,'empty',q.empty_tables||[]]];offlineQualityRows.innerHTML=checks.map(([name,count,type,items])=>`<tr><td>${esc(name)}</td><td><span class="status ${count&&type!=='sensitive'?'low':''}">${count?money(count):'OK'}</span></td><td>${renderQualityItems(items,type)}</td></tr>`).join('');offlineReadinessRows.innerHTML=(q.group_readiness||[]).map(g=>`<tr><td><strong>${esc(g.group)}</strong></td><td><div class="progress"><div class="fill ${g.status==='ready'?'good':g.status==='partial'?'warn':'bad'}" style="width:${Math.min(100,Math.round(Number(g.readiness_percent||0)))}%"></div></div><span class="muted">${money(g.readiness_percent)}% · ${esc(g.status)}</span></td><td class="num">${money(g.active_table_count)} / ${money(g.table_count)}</td><td class="num">${money(g.record_count)}</td><td>${esc(g.next_action||'')}</td></tr>`).join('')||'<tr><td colspan="5" class="empty">Chưa có dữ liệu readiness.</td></tr>';bindOfflineTableButtons(offlineQualityRows)}
+    function renderOfflineQuality(){const q=state.offlineQuality||{},s=q.summary||{};odQualityStatus.textContent=q.ok?'OK':'Cần rà soát';odFkIssues.textContent=s.foreign_key_issue_count||0;odSensitiveCols.textContent=s.sensitive_column_count||0;odEmptyTables.textContent=s.empty_table_count||0;odMissingTables.textContent=s.missing_from_web_count||0;offlineQualityTime.textContent=q.generated_at?`Cập nhật ${fullDate(q.generated_at)}`:'Chưa rà soát';const checks=[['Độ phủ web',s.missing_from_web_count||0,'missing',q.missing_from_web||[]],['Catalog dư',s.stale_web_table_count||0,'stale',q.stale_web_tables||[]],['Khóa ngoại',s.foreign_key_issue_count||0,'foreign_key',q.foreign_key_issues||[]],['Cột bảo mật',s.sensitive_column_count||0,'sensitive',q.sensitive_columns||[]],['Bảng trống',s.empty_table_count||0,'empty',q.empty_tables||[]]];offlineQualityRows.innerHTML=checks.map(([name,count,type,items])=>`<tr><td>${esc(name)}</td><td><span class="status ${count&&type!=='sensitive'?'low':''}">${count?money(count):'OK'}</span></td><td>${renderQualityItems(items,type)}</td></tr>`).join('');offlineReadinessRows.innerHTML=(q.group_readiness||[]).map(g=>`<tr><td><strong>${esc(g.group)}</strong></td><td><div class="progress"><div class="fill ${g.status==='ready'?'good':g.status==='partial'?'warn':'bad'}" style="width:${Math.min(100,Math.round(Number(g.readiness_percent||0)))}%"></div></div><span class="muted">${money(g.readiness_percent)}% · ${esc(g.status)}</span></td><td class="num">${money(g.active_table_count)} / ${money(g.table_count)}</td><td class="num">${money(g.record_count)}</td><td>${esc(g.next_action||'')}</td></tr>`).join('')||'<tr><td colspan="5" class="empty">Chưa có dữ liệu readiness.</td></tr>';offlineBacklogRows.innerHTML=(q.migration_backlog||[]).slice(0,16).map(item=>`<tr><td><span class="status ${item.priority===1?'low':''}">P${money(item.priority)}</span></td><td>${esc(item.group)}</td><td><strong>${esc(item.label)}</strong><br><span class="muted">${esc(item.table)}</span></td><td>${esc(item.action)}</td><td><button class="secondary" type="button" data-view-path="${esc(item.route)}">Mở form</button> ${tableChip(item.table,'Xem bảng')}</td></tr>`).join('')||'<tr><td colspan="5" class="empty">Không còn backlog chuyển dữ liệu.</td></tr>';offlineBacklogRows.querySelectorAll('[data-view-path]').forEach(btn=>btn.addEventListener('click',()=>{const action=routeActions[btn.dataset.viewPath]||routeActionForPath(btn.dataset.viewPath);switchView(action.view||'offlineData',{path:btn.dataset.viewPath,focus:action.focus})}));bindOfflineTableButtons(offlineQualityRows);bindOfflineTableButtons(offlineBacklogRows)}
     function renderDashboard(){const d=state.dashboard||{},s=d.stats||{},t=d.trend||{};kTotal.textContent=money(s.total_expenses);kMonth.textContent=money(s.monthly_expenses);kProjects.textContent=s.total_projects||0;renderDocumentKpi(s.total_documents);kStock.textContent=money(d.stock_value);kMonthTrend.textContent=`${pct(t.month_delta_percent)} so với tháng trước`;kMonthTrend.className=`trend ${Number(t.month_delta||0)<=0?'good':'bad'}`;const max=Math.max(1,...(d.categories||[]).map(x=>x.total||0));categoryBars.innerHTML=(d.categories||[]).map(x=>`<div class="barrow"><strong>${esc(x.name)}</strong><div class="bar"><div class="fill" style="width:${Math.round((x.total||0)/max*100)}%"></div></div><span class="num">${money(x.total)}</span></div>`).join('')||'<div class="empty">Chưa có dữ liệu chi phí đã duyệt.</div>';renderCharts(d);renderActiveProjects();renderSyncBox(d.sync||{},s);renderLowStock(d.low_stock||[]);refreshIcons();if(state.approvals)renderApprovals()}
     function renderExpenses(){const q=(expenseSearch.value||'').toLowerCase();const rows=state.expenses.filter(e=>JSON.stringify(e).toLowerCase().includes(q));expenseRows.innerHTML=rows.map(e=>`<tr><td>${esc(e.expense_date)}</td><td>${esc(e.project_name||'')}</td><td>${esc(e.category_name||'')}</td><td>${esc(e.description||'')}</td><td class="num">${money(e.amount)}</td><td><span class="status ${e.status==='pending'?'low':''}">${esc(e.status)}</span></td></tr>`).join('')||'<tr><td colspan="6" class="empty">Chưa có chi phí.</td></tr>'}
     function renderApprovals(){const a=state.approvals||{},s=a.summary||{},d=state.dashboard||{},stats=d.stats||{};approvalPendingCount.textContent=s.pending_count||0;approvalPendingAmount.textContent=money(s.pending_amount);approvedOfficialTotal.textContent=money(stats.total_expenses);approvalRows.innerHTML=(a.pending||[]).map(e=>`<tr><td>${esc(e.expense_date)}</td><td>${esc(e.project_code)} ${esc(e.project_name)}</td><td>${esc(e.category_name)}</td><td>${esc(e.description)}</td><td class="num">${money(e.amount)}</td><td>${esc(e.created_by_name||e.created_by||'')}</td><td><button class="secondary" type="button" data-expense-approve="${e.id}">Duyệt</button> <button class="secondary" type="button" data-expense-reject="${e.id}">Từ chối</button></td></tr>`).join('')||'<tr><td colspan="7" class="empty">Không có chi phí chờ duyệt.</td></tr>';document.querySelectorAll('[data-expense-approve]').forEach(btn=>btn.addEventListener('click',()=>setExpenseApproval(btn.dataset.expenseApprove,'approved')));document.querySelectorAll('[data-expense-reject]').forEach(btn=>btn.addEventListener('click',()=>setExpenseApproval(btn.dataset.expenseReject,'rejected')))}
