@@ -12,7 +12,7 @@ import csv
 import io
 import json
 import os
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from functools import wraps
 from typing import Any
 from urllib.parse import quote
@@ -34,9 +34,11 @@ from modules.construction import ConstructionManager
 from modules.controls import ApprovalThresholdManager, AuditLogManager
 from modules.fiscal_lock import FiscalPeriodLockManager
 from modules.invoices import DocumentManager
+from modules.material_controls import MaterialControlManager
 from modules.materials import MaterialManager
 from modules.notification_center import NotificationCenter
 from modules.project_accounting import ProjectAccountingManager
+from modules.purchase_orders import PurchaseOrderManager
 from modules.template_renderer import TemplateRenderer
 from modules.utilities import UtilityManager
 
@@ -159,6 +161,137 @@ def rows_to_csv(rows: list[dict[str, Any]], columns: list[str]) -> str:
     for row in rows:
         writer.writerow(row)
     return output.getvalue()
+
+
+def inventory_workspace_snapshot() -> dict[str, Any]:
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT id, code, name, unit, quantity, unit_price,
+               COALESCE(average_cost, unit_price, 0) AS average_cost,
+               COALESCE(min_quantity, 0) AS min_quantity,
+               category, supplier, status,
+               COALESCE(quantity, 0) * COALESCE(average_cost, unit_price, 0) AS stock_value
+        FROM materials
+        ORDER BY category, name
+        """
+    )
+    materials = [row_to_dict(row) for row in cursor.fetchall()]
+    cursor.execute(
+        """
+        SELECT w.id, w.project_id, COALESCE(p.code, '') AS project_code,
+               COALESCE(p.name, '') AS project_name, w.item_code, w.item_name,
+               w.unit, w.planned_quantity, w.completed_quantity,
+               COALESCE(w.percent_complete, 0) AS percent_complete, w.status
+        FROM construction_work_items w
+        LEFT JOIN projects p ON p.id = w.project_id
+        ORDER BY p.code, w.item_code, w.id
+        """
+    )
+    work_items = [row_to_dict(row) for row in cursor.fetchall()]
+    cursor.execute(
+        """
+        SELECT s.id, s.work_item_id, s.material_id, COALESCE(p.code, '') AS project_code,
+               COALESCE(p.name, '') AS project_name, COALESCE(w.item_code, '') AS item_code,
+               COALESCE(w.item_name, 'Chung') AS item_name, m.code AS material_code,
+               m.name AS material_name, m.unit, s.basis_unit, s.standard_qty_per_unit,
+               s.tolerance_percent, s.notes, s.active
+        FROM material_standards s
+        JOIN materials m ON m.id = s.material_id
+        LEFT JOIN construction_work_items w ON w.id = s.work_item_id
+        LEFT JOIN projects p ON p.id = w.project_id
+        WHERE s.active = 1
+        ORDER BY p.code, w.item_code, m.name
+        """
+    )
+    standards = [row_to_dict(row) for row in cursor.fetchall()]
+    cursor.execute(
+        """
+        SELECT it.id, it.transaction_date, it.transaction_type, it.quantity,
+               it.project_id, COALESCE(p.code, '') AS project_code,
+               COALESCE(p.name, '') AS project_name, m.code AS material_code,
+               m.name AS material_name, m.unit, it.notes
+        FROM inventory_transactions it
+        JOIN materials m ON m.id = it.material_id
+        LEFT JOIN projects p ON p.id = it.project_id
+        ORDER BY it.transaction_date DESC, it.id DESC
+        LIMIT 80
+        """
+    )
+    history = [row_to_dict(row) for row in cursor.fetchall()]
+
+    material_by_id = {int(row["id"]): row for row in materials}
+    smart_alerts: list[dict[str, Any]] = []
+    for standard in standards:
+        work_item = next((w for w in work_items if w["id"] == standard["work_item_id"]), {})
+        material = material_by_id.get(int(standard["material_id"] or 0), {})
+        remaining_basis = max(
+            0.0,
+            float(work_item.get("planned_quantity") or 0)
+            - float(work_item.get("completed_quantity") or 0),
+        )
+        needed_qty = remaining_basis * float(standard["standard_qty_per_unit"] or 0)
+        available_qty = float(material.get("quantity") or 0)
+        min_qty = float(material.get("min_quantity") or 0)
+        shortage_qty = max(0.0, needed_qty - available_qty, min_qty - available_qty)
+        if shortage_qty <= 0:
+            continue
+        progress = float(work_item.get("percent_complete") or 0)
+        smart_alerts.append(
+            {
+                "project_id": work_item.get("project_id"),
+                "project_code": standard.get("project_code") or "",
+                "project_name": standard.get("project_name") or "",
+                "work_item_id": standard.get("work_item_id"),
+                "item_code": standard.get("item_code") or "",
+                "item_name": standard.get("item_name") or "Chung",
+                "material_id": standard.get("material_id"),
+                "material_code": standard.get("material_code"),
+                "material_name": standard.get("material_name"),
+                "unit": standard.get("unit"),
+                "available_qty": available_qty,
+                "needed_qty": needed_qty,
+                "min_quantity": min_qty,
+                "shortage_qty": shortage_qty,
+                "progress": progress,
+                "priority": "critical" if progress >= 70 or available_qty <= 0 else "warning",
+                "suggestion": "Tao don mua hang",
+            }
+        )
+    smart_alerts.sort(key=lambda row: (row["priority"] != "critical", -float(row["shortage_qty"] or 0)))
+    low_stock = [
+        {
+            **row,
+            "shortage_qty": max(0.0, float(row.get("min_quantity") or 0) - float(row.get("quantity") or 0)),
+            "priority": "warning",
+            "suggestion": "Bo sung dinh muc ton kho",
+        }
+        for row in materials
+        if float(row.get("min_quantity") or 0) > 0
+        and float(row.get("quantity") or 0) <= float(row.get("min_quantity") or 0)
+    ]
+    return {
+        "summary": {
+            "material_count": len(materials),
+            "stock_value": sum(float(row.get("stock_value") or 0) for row in materials),
+            "low_stock_count": len(low_stock),
+            "smart_alert_count": len(smart_alerts),
+            "standard_count": len(standards),
+        },
+        "materials": materials,
+        "work_items": work_items,
+        "standards": standards,
+        "history": history,
+        "alerts": smart_alerts + low_stock,
+        "purchase_orders": PurchaseOrderManager().get_open_purchase_orders(),
+        "valuation_methods": [
+            {"code": "weighted_average", "name": "Binh quan gia quyen", "status": "active"},
+            {"code": "fifo", "name": "FIFO", "status": "planned"},
+            {"code": "specific", "name": "Dich danh theo lo", "status": "planned"},
+            {"code": "periodic_average", "name": "Binh quan cuoi ky", "status": "planned"},
+        ],
+    }
 
 
 def offline_schema_snapshot() -> dict[str, Any]:
@@ -1329,19 +1462,77 @@ def create_app():
         keys = ("id", "code", "name", "transaction_type", "quantity", "transaction_date", "project_name", "notes")
         return jsonify([row_to_dict(row, keys) for row in MaterialManager().get_inventory_history(limit=50)])
 
+    @app.get("/api/inventory-workspace")
+    @api_error
+    def inventory_workspace():
+        return jsonify(inventory_workspace_snapshot())
+
     @app.post("/api/inventory/transactions")
     @api_error
     def create_inventory_transaction():
         data = request.get_json(force=True)
-        transaction_id = MaterialManager().add_inventory_transaction(
-            int(data["material_id"]),
-            data["transaction_type"],
-            float(data.get("quantity") or 0),
-            data.get("project_id") or None,
-            data.get("notes", ""),
-            int(data.get("created_by") or session.get("user_id") or 1),
-        )
+        manager = MaterialManager()
+        transaction_type = data["transaction_type"]
+        if transaction_type == "import":
+            transaction_id = manager.receive_material(
+                int(data["material_id"]),
+                float(data.get("quantity") or 0),
+                float(data.get("unit_price") or data.get("price") or 0),
+                received_by=int(data.get("created_by") or session.get("user_id") or 1),
+                notes=data.get("notes", ""),
+            )
+        elif transaction_type == "export":
+            transaction_id = manager.issue_material(
+                int(data["material_id"]),
+                float(data.get("quantity") or 0),
+                data.get("project_id") or None,
+                data.get("work_item_id") or None,
+                issued_by=int(data.get("created_by") or session.get("user_id") or 1),
+                notes=data.get("notes", ""),
+            )
+        else:
+            raise ValueError("Loai giao dich kho khong hop le")
         return jsonify({"id": transaction_id, "status": "created"})
+
+    @app.post("/api/material-standards")
+    @api_error
+    def create_material_standard():
+        data = request.get_json(force=True)
+        MaterialControlManager().save_standard(
+            int(data["material_id"]),
+            int(data["work_item_id"]) if data.get("work_item_id") else None,
+            data.get("basis_unit") or "m2",
+            float(data.get("standard_qty_per_unit") or 0),
+            float(data.get("tolerance_percent") or 15),
+            data.get("notes", ""),
+        )
+        return jsonify({"status": "saved"})
+
+    @app.post("/api/purchase-orders/from-alert")
+    @api_error
+    def create_purchase_order_from_alert():
+        data = request.get_json(force=True)
+        po_number = data.get("po_number") or f"PO-WEB-{datetime.now().strftime('%Y%m%d%H%M%S')}"
+        quantity = float(data.get("quantity") or data.get("shortage_qty") or 0)
+        material_id = int(data["material_id"]) if data.get("material_id") else None
+        material_name = data.get("material_name") or "Vat tu can mua"
+        unit_price = float(data.get("unit_price") or 0)
+        po_id = PurchaseOrderManager().create_purchase_order(
+            po_number,
+            supplier_name=data.get("supplier_name", ""),
+            expected_date=data.get("expected_date"),
+            notes=data.get("notes") or "Tao tu canh bao ton kho web",
+            lines=[
+                {
+                    "material_id": material_id,
+                    "description": material_name,
+                    "quantity": quantity,
+                    "unit_price": unit_price,
+                    "project_id": data.get("project_id") or None,
+                }
+            ],
+        )
+        return jsonify({"id": po_id, "status": "draft"})
 
     @app.post("/api/inventory/materials")
     @api_error
@@ -1989,13 +2180,61 @@ INDEX_HTML = r"""<!doctype html>
       </section>
 
       <section class="view" id="inventory">
+        <div class="grid kpis">
+          <div class="card kpi"><div class="label">Giá trị tồn kho</div><div class="value" id="invStockValue">0</div></div>
+          <div class="card kpi"><div class="label">Vật tư</div><div class="value" id="invMaterialCount">0</div></div>
+          <div class="card kpi"><div class="label">Cảnh báo thông minh</div><div class="value" id="invSmartAlerts">0</div></div>
+          <div class="card kpi"><div class="label">Định mức</div><div class="value" id="invStandardCount">0</div></div>
+        </div>
+        <div class="grid two">
+          <div class="card">
+            <h3>Nhập / xuất kho công trình</h3>
+            <form class="form" id="inventoryTransactionForm">
+              <label>Vật tư<select name="material_id" id="inventoryMaterialSelect" required></select></label>
+              <label>Loại<select name="transaction_type"><option value="export">Xuất cho công trình</option><option value="import">Nhập kho</option></select></label>
+              <label>Số lượng<input name="quantity" type="number" min="0" step="0.01" required></label>
+              <label>Đơn giá nhập<input name="unit_price" type="number" min="0" step="1000" placeholder="Chỉ dùng khi nhập"></label>
+              <label>Dự án<select name="project_id" id="inventoryProjectSelect"></select></label>
+              <label>Hạng mục<select name="work_item_id" id="inventoryWorkItemSelect"></select></label>
+              <label class="wide">Ghi chú<textarea name="notes" placeholder="VD: Phiếu giao hàng, ký nhận công trường"></textarea></label>
+              <div class="wide actions"><button class="primary" type="submit">Ghi phiếu kho</button></div>
+            </form>
+            <p class="muted">Xuất kho dùng giá bình quân gia quyền và tự động tạo bút toán 621/152.</p>
+          </div>
+          <div class="card">
+            <h3>Định mức vật tư theo hạng mục</h3>
+            <form class="form" id="materialStandardForm">
+              <label>Hạng mục<select name="work_item_id" id="standardWorkItemSelect"></select></label>
+              <label>Vật tư<select name="material_id" id="standardMaterialSelect" required></select></label>
+              <label>Cơ sở<input name="basis_unit" value="m2"></label>
+              <label>Định mức / đơn vị<input name="standard_qty_per_unit" type="number" min="0" step="0.0001" required></label>
+              <label>Sai lệch %<input name="tolerance_percent" type="number" min="0" step="1" value="15"></label>
+              <label class="wide">Ghi chú<textarea name="notes"></textarea></label>
+              <div class="wide actions"><button class="primary" type="submit">Lưu định mức</button></div>
+            </form>
+          </div>
+        </div>
+        <div class="card">
+          <div class="toolbar"><h3>Cảnh báo vật tư theo tiến độ</h3><button class="secondary" type="button" id="reloadInventoryWorkspaceBtn">Tải lại</button></div>
+          <div class="tablewrap"><table><thead><tr><th>Ưu tiên</th><th>Dự án / hạng mục</th><th>Vật tư</th><th>Cần dùng</th><th>Đang có</th><th>Thiếu</th><th>Gợi ý</th></tr></thead><tbody id="smartStockRows"></tbody></table></div>
+        </div>
         <div class="card">
           <div class="toolbar"><h3>Tồn kho vật tư</h3><input class="search" id="inventorySearch" placeholder="Tìm vật tư"></div>
-          <div class="tablewrap"><table><thead><tr><th>Mã</th><th>Tên vật tư</th><th>Nhóm</th><th>Tồn</th><th>Đơn giá</th><th>Trạng thái</th></tr></thead><tbody id="inventoryRows"></tbody></table></div>
+          <div class="tablewrap"><table><thead><tr><th>Mã</th><th>Tên vật tư</th><th>Nhóm</th><th>Tồn</th><th>Giá BQ</th><th>Định mức</th><th>Trạng thái</th></tr></thead><tbody id="inventoryRows"></tbody></table></div>
+        </div>
+        <div class="grid two">
+          <div class="card">
+            <h3>Phương pháp tính giá xuất kho</h3>
+            <div class="tablewrap"><table><thead><tr><th>Mã</th><th>Tên phương pháp</th><th>Trạng thái</th></tr></thead><tbody id="valuationRows"></tbody></table></div>
+          </div>
+          <div class="card">
+            <h3>Đơn mua hàng đang mở</h3>
+            <div class="tablewrap"><table><thead><tr><th>Số PO</th><th>Nhà cung cấp</th><th>Ngày đặt</th><th>Giá trị</th><th>TT</th></tr></thead><tbody id="poRows"></tbody></table></div>
+          </div>
         </div>
         <div class="card">
           <h3>Giao dịch kho gần đây</h3>
-          <div class="tablewrap"><table><thead><tr><th>Ngày</th><th>Mã</th><th>Vật tư</th><th>Loại</th><th>SL</th><th>Ghi chú</th></tr></thead><tbody id="historyRows"></tbody></table></div>
+          <div class="tablewrap"><table><thead><tr><th>Ngày</th><th>Mã</th><th>Vật tư</th><th>Loại</th><th>SL</th><th>Dự án</th><th>Ghi chú</th></tr></thead><tbody id="historyRows"></tbody></table></div>
         </div>
       </section>
 
@@ -2334,7 +2573,7 @@ INDEX_HTML = r"""<!doctype html>
   <div class="toast" id="toast"></div>
 
   <script>
-    const state={auth:null,users:[],offlineData:null,offlineSchema:null,offlineTable:null,dashboard:null,expenses:[],inventory:[],history:[],projects:[],categories:[],projectAccounting:null,workItems:[],diaries:[],documents:[],forms:[],reports:null,accounting:null,finance:null,settings:null};
+    const state={auth:null,users:[],offlineData:null,offlineSchema:null,offlineTable:null,dashboard:null,expenses:[],inventory:[],history:[],inventoryWorkspace:null,projects:[],categories:[],projectAccounting:null,workItems:[],diaries:[],documents:[],forms:[],reports:null,accounting:null,finance:null,settings:null};
     const money=v=>new Intl.NumberFormat('vi-VN',{maximumFractionDigits:0}).format(Number(v||0));
     const esc=v=>String(v??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
     const toast=t=>{const el=document.getElementById('toast');el.textContent=t;el.style.display='block';setTimeout(()=>el.style.display='none',2800)};
@@ -2353,10 +2592,10 @@ INDEX_HTML = r"""<!doctype html>
     async function loadOfflineTable(name,page=1){const q=offlineTableSearch.value||'';state.offlineTable=await api(`/api/offline-data/${encodeURIComponent(name)}?limit=100&page=${page}&q=${encodeURIComponent(q)}`);renderOfflinePreview()}
     async function loadCatalogs(){const [projects,categories]=await Promise.all([api('/api/projects'),api('/api/categories')]);state.projects=projects;state.categories=categories;fillSelects();renderProjects()}
     async function loadExpenses(){state.expenses=await api('/api/expenses');renderExpenses()}
-    async function loadInventory(){const [items,history]=await Promise.all([api('/api/inventory'),api('/api/inventory/history')]);state.inventory=items;state.history=history;renderInventory()}
+    async function loadInventory(){const [items,history,workspace]=await Promise.all([api('/api/inventory'),api('/api/inventory/history'),api('/api/inventory-workspace')]);state.inventory=workspace.materials||items;state.history=workspace.history||history;state.inventoryWorkspace=workspace;renderInventory();fillInventorySelects()}
     async function loadProjects(){state.projects=await api('/api/projects');fillSelects();renderProjects()}
     async function loadProjectAccounting(){state.projectAccounting=await api('/api/project-accounting');renderProjectAccounting()}
-    async function loadConstruction(){const [workItems,diaries]=await Promise.all([api('/api/construction/work-items'),api('/api/construction/diaries')]);state.workItems=workItems;state.diaries=diaries;renderConstruction()}
+    async function loadConstruction(){const [workItems,diaries]=await Promise.all([api('/api/construction/work-items'),api('/api/construction/diaries')]);state.workItems=workItems;state.diaries=diaries;renderConstruction();fillInventorySelects()}
     async function loadDocuments(){state.documents=await api('/api/documents');renderDocuments()}
     async function loadForms(){state.forms=await api('/api/forms');renderForms()}
     async function loadReports(){state.reports=await api('/api/reports/summary');state.monthlyExport=await api(`/api/export/monthly-report?month=${encodeURIComponent(reportMonth.value||new Date().toISOString().slice(0,7))}`);renderReports()}
@@ -2365,13 +2604,14 @@ INDEX_HTML = r"""<!doctype html>
     async function loadSettings(){state.settings=await api('/api/settings');renderSettings()}
     async function loadUsers(){try{state.users=await api('/api/users');renderUsers()}catch(err){state.users=[];renderUsers(err.message)}}
     function fillSelects(){const projectOptions='<option value="">Không gắn dự án</option>'+state.projects.map(p=>`<option value="${p.id}">${esc(p.code)} - ${esc(p.name)}</option>`).join('');const requiredProjectOptions=state.projects.map(p=>`<option value="${p.id}">${esc(p.code)} - ${esc(p.name)}</option>`).join('');const categoryOptions=state.categories.map(c=>`<option value="${c.id}">${esc(c.code)} - ${esc(c.name)}</option>`).join('');expenseProject.innerHTML=projectOptions;diaryProject.innerHTML=projectOptions;documentProject.innerHTML=projectOptions;contractProject.innerHTML=requiredProjectOptions;costPlanProject.innerHTML=requiredProjectOptions;revenueProject.innerHTML=requiredProjectOptions;expenseCategory.innerHTML=categoryOptions;documentCategory.innerHTML='<option value="">Chọn danh mục</option>'+categoryOptions;costPlanCategory.innerHTML=categoryOptions;fillContractSelects()}
+    function fillInventorySelects(){const ws=state.inventoryWorkspace||{};const mats=(ws.materials||state.inventory||[]);const work=(ws.work_items||state.workItems||[]);const matOptions='<option value="">Chọn vật tư</option>'+mats.map(m=>`<option value="${m.id}">${esc(m.code)} - ${esc(m.name)} (${money(m.quantity)} ${esc(m.unit||'')})</option>`).join('');const projectOptions='<option value="">Kho chung</option>'+state.projects.map(p=>`<option value="${p.id}">${esc(p.code)} - ${esc(p.name)}</option>`).join('');const workOptions='<option value="">Không gắn hạng mục</option>'+work.map(w=>`<option value="${w.id}">${esc(w.project_code)} · ${esc(w.item_code)} ${esc(w.item_name)}</option>`).join('');if(typeof inventoryMaterialSelect!=='undefined'){inventoryMaterialSelect.innerHTML=matOptions;standardMaterialSelect.innerHTML=matOptions;inventoryProjectSelect.innerHTML=projectOptions;inventoryWorkItemSelect.innerHTML=workOptions;standardWorkItemSelect.innerHTML=workOptions}}
     function fillContractSelects(){const rows=(state.projectAccounting&&state.projectAccounting.contracts)||[];const options='<option value="">Chọn hợp đồng</option>'+rows.map(c=>`<option value="${c.id}">${esc(c.contract_no)} - ${esc(c.partner_name)}</option>`).join('');if(typeof billingContract!=='undefined'){billingContract.innerHTML=options;revenueContract.innerHTML=options}}
     function renderOfflineData(){const d=state.offlineData||{},s=d.summary||{};odTables.textContent=s.table_count||0;odActiveTables.textContent=s.active_table_count||0;odRecords.textContent=money(s.record_count);const q=(offlineSearch.value||'').toLowerCase();const tables=(d.tables||[]).filter(t=>JSON.stringify(t).toLowerCase().includes(q));offlineTableRows.innerHTML=tables.map(t=>`<tr><td><strong>${esc(t.label)}</strong></td><td>${esc(t.name)}</td><td class="num">${money(t.count)}</td><td><button class="secondary" type="button" data-offline-table="${esc(t.name)}">Xem</button></td></tr>`).join('')||'<tr><td colspan="4" class="empty">Chưa có dữ liệu.</td></tr>';document.querySelectorAll('[data-offline-table]').forEach(btn=>btn.addEventListener('click',()=>{offlineTableSearch.value='';loadOfflineTable(btn.dataset.offlineTable)}));if(!state.offlineTable&&tables.length){loadOfflineTable(tables.find(t=>t.count)?.name||tables[0].name)}}
     function renderOfflinePreview(){const t=state.offlineTable||{},rows=t.rows||[],columns=(t.columns&&t.columns.length?t.columns:[...new Set(rows.flatMap(r=>Object.keys(r)))]).slice(0,14);offlinePreviewTitle.textContent=`${t.label||t.name||''} · ${money(t.total||0)} dòng · trang ${t.page||1}`;odCurrent.textContent=t.name||'-';odPreviewCount.textContent=`${money(rows.length)} / ${money(t.total||0)}`;offlinePrevBtn.disabled=(t.page||1)<=1;offlineNextBtn.disabled=((t.offset||0)+rows.length)>=(t.total||0);offlinePreviewHead.innerHTML=columns.length?`<tr>${columns.map(c=>`<th>${esc(c)}</th>`).join('')}</tr>`:'';offlinePreviewRows.innerHTML=rows.map(r=>`<tr>${columns.map(c=>`<td>${esc(String(r[c]??'').slice(0,120))}</td>`).join('')}</tr>`).join('')||'<tr><td class="empty">Không có dòng dữ liệu.</td></tr>'}
     function renderOfflineSchema(){const s=state.offlineSchema||{},q=(schemaSearch.value||'').toLowerCase();const tables=(s.tables||[]).filter(t=>JSON.stringify({name:t.name,label:t.label,columns:t.columns}).toLowerCase().includes(q));schemaRows.innerHTML=tables.map(t=>`<tr><td><strong>${esc(t.name)}</strong><br><span class="muted">${esc(t.label)}</span></td><td class="num">${money(t.column_count)}</td><td class="num">${money(t.row_count)}</td><td class="num">${money((t.indexes||[]).length)}</td><td class="num">${money((t.foreign_keys||[]).length)}</td><td><span class="status ${t.data_exposed?'':'low'}">${t.data_exposed?'online':'schema'}</span></td></tr>`).join('')||'<tr><td colspan="6" class="empty">Chưa có cấu trúc dữ liệu.</td></tr>';relationRows.innerHTML=(s.relationships||[]).map(r=>`<tr><td>${esc(r.from_table)}</td><td>${esc(r.from_column)}</td><td>${esc(r.to_table)}</td><td>${esc(r.to_column)}</td></tr>`).join('')||'<tr><td colspan="4" class="empty">Chưa khai báo khóa ngoại.</td></tr>'}
     function renderDashboard(){const d=state.dashboard||{},s=d.stats||{},t=d.trend||{};kTotal.textContent=money(s.total_expenses);kMonth.textContent=money(s.monthly_expenses);kProjects.textContent=s.total_projects||0;kDocs.textContent=s.total_documents||0;kStock.textContent=money(d.stock_value);kMonthTrend.textContent=`${pct(t.month_delta_percent)} so với tháng trước`;kMonthTrend.className=`trend ${Number(t.month_delta||0)<=0?'good':'bad'}`;const max=Math.max(1,...(d.categories||[]).map(x=>x.total||0));categoryBars.innerHTML=(d.categories||[]).map(x=>`<div class="barrow"><strong>${esc(x.name)}</strong><div class="bar"><div class="fill" style="width:${Math.round((x.total||0)/max*100)}%"></div></div><span class="num">${money(x.total)}</span></div>`).join('')||'<div class="empty">Chưa có dữ liệu chi phí.</div>';drawPie(categoryPie,d.categories||[],'name','total');drawColumn(projectChart,d.projects||[],'name','total');activeProjectRows.innerHTML=(d.active_projects||[]).map(p=>`<div class="project-line"><header><strong>${esc(p.code)} · ${esc(p.name)}</strong><span>${money(p.budget_used_percent)}%</span></header><div class="progress"><div class="fill" style="width:${Math.min(100,Math.round(p.budget_used_percent||p.progress||0))}%"></div></div><div class="muted">Đã chi ${money(p.spent)} / ngân sách ${money(p.budget)} · tiến độ ${money(p.progress)}% · ${money(p.work_item_count)} hạng mục</div></div>`).join('')||'<div class="empty">Chưa có dự án active.</div>';const sync=d.sync||{};syncBox.innerHTML=`<strong>Real-time sync</strong><span>Chế độ: ${esc(sync.mode||'')}</span><span>Chi phí cập nhật: ${esc(sync.last_expense_update||'chưa có')}</span><span>Chứng từ cập nhật: ${esc(sync.last_document_update||'chưa có')}</span>`;lowStockRows.innerHTML=(d.low_stock||[]).map(x=>`<tr><td>${esc(x.code)}</td><td>${esc(x.name)}</td><td class="num">${money(x.quantity)} ${esc(x.unit)}</td><td class="num">${money(x.min_quantity)}</td></tr>`).join('')||'<tr><td colspan="4" class="empty">Không có cảnh báo tồn kho.</td></tr>'}
     function renderExpenses(){const q=(expenseSearch.value||'').toLowerCase();const rows=state.expenses.filter(e=>JSON.stringify(e).toLowerCase().includes(q));expenseRows.innerHTML=rows.map(e=>`<tr><td>${esc(e.expense_date)}</td><td>${esc(e.project_name||'')}</td><td>${esc(e.category_name||'')}</td><td>${esc(e.description||'')}</td><td class="num">${money(e.amount)}</td><td><span class="status">${esc(e.status)}</span></td></tr>`).join('')||'<tr><td colspan="6" class="empty">Chưa có chi phí.</td></tr>'}
-    function renderInventory(){const q=(inventorySearch.value||'').toLowerCase();const rows=state.inventory.filter(i=>JSON.stringify(i).toLowerCase().includes(q));inventoryRows.innerHTML=rows.map(i=>`<tr><td>${esc(i.code)}</td><td>${esc(i.name)}</td><td>${esc(i.category)}</td><td class="num">${money(i.quantity)} ${esc(i.unit)}</td><td class="num">${money(i.unit_price)}</td><td><span class="status">${esc(i.status)}</span></td></tr>`).join('')||'<tr><td colspan="6" class="empty">Chưa có vật tư.</td></tr>';historyRows.innerHTML=state.history.map(h=>`<tr><td>${esc(h.transaction_date)}</td><td>${esc(h.code)}</td><td>${esc(h.name)}</td><td>${esc(h.transaction_type)}</td><td class="num">${money(h.quantity)}</td><td>${esc(h.notes)}</td></tr>`).join('')||'<tr><td colspan="6" class="empty">Chưa có giao dịch kho.</td></tr>'}
+    function renderInventory(){const ws=state.inventoryWorkspace||{},sum=ws.summary||{};if(typeof invStockValue!=='undefined'){invStockValue.textContent=money(sum.stock_value);invMaterialCount.textContent=sum.material_count||0;invSmartAlerts.textContent=sum.smart_alert_count||0;invStandardCount.textContent=sum.standard_count||0}const q=(inventorySearch.value||'').toLowerCase();const rows=state.inventory.filter(i=>JSON.stringify(i).toLowerCase().includes(q));inventoryRows.innerHTML=rows.map(i=>`<tr><td>${esc(i.code)}</td><td>${esc(i.name)}</td><td>${esc(i.category)}</td><td class="num">${money(i.quantity)} ${esc(i.unit)}</td><td class="num">${money(i.average_cost||i.unit_price)}</td><td class="num">${money(i.min_quantity||0)}</td><td><span class="status ${Number(i.quantity||0)<=Number(i.min_quantity||0)&&Number(i.min_quantity||0)>0?'low':''}">${esc(i.status)}</span></td></tr>`).join('')||'<tr><td colspan="7" class="empty">Chưa có vật tư.</td></tr>';smartStockRows.innerHTML=(ws.alerts||[]).map(a=>`<tr><td><span class="status ${a.priority==='critical'?'low':''}">${esc(a.priority||'warning')}</span></td><td><strong>${esc(a.project_code||'Kho')}</strong> ${esc(a.project_name||'')}<br><span class="muted">${esc(a.item_code||'')} ${esc(a.item_name||'')}</span></td><td>${esc(a.material_code||a.code||'')} ${esc(a.material_name||a.name||'')}</td><td class="num">${money(a.needed_qty||a.min_quantity)} ${esc(a.unit||'')}</td><td class="num">${money(a.available_qty??a.quantity)} ${esc(a.unit||'')}</td><td class="num">${money(a.shortage_qty)} ${esc(a.unit||'')}</td><td><button class="secondary" type="button" data-po-alert='${esc(JSON.stringify(a))}'>${esc(a.suggestion||'Tạo PO')}</button></td></tr>`).join('')||'<tr><td colspan="7" class="empty">Không có cảnh báo vật tư.</td></tr>';valuationRows.innerHTML=(ws.valuation_methods||[]).map(v=>`<tr><td>${esc(v.code)}</td><td>${esc(v.name)}</td><td><span class="status ${v.status==='planned'?'low':''}">${esc(v.status)}</span></td></tr>`).join('')||'<tr><td colspan="3" class="empty">Chưa có cấu hình tính giá.</td></tr>';poRows.innerHTML=(ws.purchase_orders||[]).map(p=>`<tr><td>${esc(p.po_number)}</td><td>${esc(p.supplier_name||'')}</td><td>${esc(p.order_date||'')}</td><td class="num">${money(p.total_amount)}</td><td><span class="status">${esc(p.status)}</span></td></tr>`).join('')||'<tr><td colspan="5" class="empty">Chưa có đơn mua hàng mở.</td></tr>';historyRows.innerHTML=state.history.map(h=>`<tr><td>${esc(h.transaction_date)}</td><td>${esc(h.material_code||h.code)}</td><td>${esc(h.material_name||h.name)}</td><td>${esc(h.transaction_type)}</td><td class="num">${money(h.quantity)}</td><td>${esc(h.project_code||'')} ${esc(h.project_name||'')}</td><td>${esc(h.notes)}</td></tr>`).join('')||'<tr><td colspan="7" class="empty">Chưa có giao dịch kho.</td></tr>';document.querySelectorAll('[data-po-alert]').forEach(btn=>btn.addEventListener('click',async()=>{try{const alert=JSON.parse(btn.dataset.poAlert);await api('/api/purchase-orders/from-alert',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(alert)});await loadInventory();toast('Đã tạo đơn mua hàng nháp')}catch(err){toast(err.message)}}))}
     function renderProjects(){projectRows.innerHTML=state.projects.map(p=>`<tr><td>${esc(p.code)}</td><td>${esc(p.name)}</td><td>${esc(p.location)}</td><td class="num">${money(p.budget)}</td><td><span class="status">${esc(p.status)}</span></td></tr>`).join('')||'<tr><td colspan="5" class="empty">Chưa có dự án.</td></tr>'}
     function renderProjectAccounting(){const pa=state.projectAccounting||{},d=pa.dashboard||{};paActive.textContent=d.active_projects||0;paPlanned.textContent=money(d.total_planned);paSpent.textContent=money(d.total_spent);paRevenue.textContent=money(d.total_revenue);paProfit.textContent=money(d.profit);fillContractSelects();const q=(contractSearch.value||'').toLowerCase();const contracts=(pa.contracts||[]).filter(c=>JSON.stringify(c).toLowerCase().includes(q));contractRows.innerHTML=contracts.map(c=>`<tr><td>${esc(c.project_code)} ${esc(c.project_name)}</td><td>${esc(c.contract_type)}</td><td>${esc(c.contract_no)}</td><td>${esc(c.partner_name)}</td><td class="num">${money(c.contract_value)}</td><td class="num">${money(c.billed)}</td><td><span class="status">${esc(c.status)}</span></td></tr>`).join('')||'<tr><td colspan="7" class="empty">Chưa có hợp đồng.</td></tr>';billingRows.innerHTML=(pa.billings||[]).map(b=>`<tr><td>${esc(b.billing_date)}</td><td>${esc(b.contract_no)}</td><td>${esc(b.milestone_name)}</td><td class="num">${money(b.net_amount)}</td><td><span class="status">${esc(b.status)}</span></td></tr>`).join('')||'<tr><td colspan="5" class="empty">Chưa có nghiệm thu.</td></tr>';revenueRows.innerHTML=(pa.revenues||[]).map(r=>`<tr><td>${esc(r.revenue_date)}</td><td>${esc(r.project_code)} ${esc(r.project_name)}</td><td>${esc(r.contract_no)}</td><td class="num">${money(r.amount)}</td><td class="num">${money(r.vat_amount)}</td></tr>`).join('')||'<tr><td colspan="5" class="empty">Chưa có doanh thu.</td></tr>';costPlanRows.innerHTML=(pa.cost_plan_actual||[]).map(x=>{const diff=Number(x.planned||0)-Number(x.actual||0);return `<tr><td>${esc(x.project_code)} ${esc(x.project_name)}</td><td>${esc(x.category)}</td><td class="num">${money(x.planned)}</td><td class="num">${money(x.actual)}</td><td class="num">${money(diff)}</td></tr>`}).join('')||'<tr><td colspan="5" class="empty">Chưa có dự toán.</td></tr>';projectPlRows.innerHTML=(pa.project_pl||[]).map(x=>`<tr><td>${esc(x.code)} ${esc(x.name)}</td><td class="num">${money(x.revenue)}</td><td class="num">${money(x.cost)}</td><td class="num">${money(x.profit)}</td></tr>`).join('')||'<tr><td colspan="4" class="empty">Chưa có P/L công trình.</td></tr>'}
     function renderConstruction(){workRows.innerHTML=state.workItems.map(w=>`<tr><td>${esc(w.project_code)} ${esc(w.project_name)}</td><td>${esc(w.item_code)}</td><td>${esc(w.item_name)}</td><td class="num">${money(w.planned_quantity)} ${esc(w.unit)}</td><td class="num">${money(w.percent_complete)}%</td><td class="num">${money(w.actual_expense)}</td><td><span class="status">${esc(w.status)}</span></td></tr>`).join('')||'<tr><td colspan="7" class="empty">Chưa có hạng mục.</td></tr>';diaryRows.innerHTML=state.diaries.map(d=>`<tr><td>${esc(d.diary_date)}</td><td>${esc(d.project_code)} ${esc(d.project_name)}</td><td>${esc(d.weather)}</td><td>${esc(d.work_content)}</td><td>${esc(d.reporter)}</td></tr>`).join('')||'<tr><td colspan="5" class="empty">Chưa có nhật ký.</td></tr>'}
@@ -2392,7 +2632,7 @@ INDEX_HTML = r"""<!doctype html>
     reloadUsersBtn.addEventListener('click',()=>loadUsers());
     offlineSearch.addEventListener('input',renderOfflineData);schemaSearch.addEventListener('input',renderOfflineSchema);schemaJsonBtn.addEventListener('click',()=>{window.location.href='/api/offline-schema/export.json'});offlineReloadBtn.addEventListener('click',()=>loadOfflineData());offlineJsonBtn.addEventListener('click',()=>{window.location.href='/api/offline-data/export.json?limit_per_table=5000'});offlineCsvBtn.addEventListener('click',()=>{const t=state.offlineTable||{};if(!t.name)return toast('Chưa chọn bảng');window.location.href=`/api/offline-data/${encodeURIComponent(t.name)}.csv?limit=5000&q=${encodeURIComponent(offlineTableSearch.value||'')}`});offlinePrevBtn.addEventListener('click',()=>{const t=state.offlineTable||{};if(t.name&&Number(t.page)>1)loadOfflineTable(t.name,Number(t.page)-1)});offlineNextBtn.addEventListener('click',()=>{const t=state.offlineTable||{};if(t.name)loadOfflineTable(t.name,Number(t.page||1)+1)});offlineTableSearch.addEventListener('change',()=>{const t=state.offlineTable||{};if(t.name)loadOfflineTable(t.name,1)});
     reportMonth.value=new Date().toISOString().slice(0,7);reportMonth.addEventListener('change',()=>loadReports());csvExportBtn.addEventListener('click',()=>{window.location.href=`/api/export/monthly-report.csv?month=${encodeURIComponent(reportMonth.value)}`});sheetsExportBtn.addEventListener('click',async()=>{try{const r=await api('/api/export/sheets',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({month:reportMonth.value})});toast(r.url?'Đã xuất Google Sheets':'Đã gửi yêu cầu xuất')}catch(err){toast(err.message)}});
-    expenseSearch.addEventListener('input',renderExpenses);inventorySearch.addEventListener('input',renderInventory);contractSearch.addEventListener('input',renderProjectAccounting);documentSearch.addEventListener('input',renderDocuments);formSearch.addEventListener('input',renderForms);accountSearch.addEventListener('input',renderAccounting);journalSearch.addEventListener('input',renderAccounting);financeSearch.addEventListener('input',renderFinance);
+    expenseSearch.addEventListener('input',renderExpenses);inventorySearch.addEventListener('input',renderInventory);reloadInventoryWorkspaceBtn.addEventListener('click',()=>loadInventory());contractSearch.addEventListener('input',renderProjectAccounting);documentSearch.addEventListener('input',renderDocuments);formSearch.addEventListener('input',renderForms);accountSearch.addEventListener('input',renderAccounting);journalSearch.addEventListener('input',renderAccounting);financeSearch.addEventListener('input',renderFinance);
     expenseForm.expense_date.value=new Date().toISOString().slice(0,10);
     diaryForm.diary_date.value=new Date().toISOString().slice(0,10);
     documentForm.doc_date.value=new Date().toISOString().slice(0,10);
@@ -2401,6 +2641,8 @@ INDEX_HTML = r"""<!doctype html>
     revenueForm.revenue_date.value=new Date().toISOString().slice(0,10);
     bankForm.transaction_date.value=new Date().toISOString().slice(0,10);
     expenseForm.addEventListener('submit',async e=>{e.preventDefault();const data=Object.fromEntries(new FormData(expenseForm).entries());try{await api('/api/expenses',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});expenseForm.reset();expenseForm.expense_date.value=new Date().toISOString().slice(0,10);await Promise.all([loadDashboard(),loadExpenses()]);toast('Đã lưu chi phí')}catch(err){toast(err.message)}});
+    inventoryTransactionForm.addEventListener('submit',async e=>{e.preventDefault();const data=Object.fromEntries(new FormData(inventoryTransactionForm).entries());try{await api('/api/inventory/transactions',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});inventoryTransactionForm.reset();await Promise.all([loadDashboard(),loadInventory(),loadAccounting()]);toast('Đã ghi phiếu kho')}catch(err){toast(err.message)}});
+    materialStandardForm.addEventListener('submit',async e=>{e.preventDefault();const data=Object.fromEntries(new FormData(materialStandardForm).entries());try{await api('/api/material-standards',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});materialStandardForm.reset();materialStandardForm.basis_unit.value='m2';materialStandardForm.tolerance_percent.value='15';await loadInventory();toast('Đã lưu định mức vật tư')}catch(err){toast(err.message)}});
     projectForm.addEventListener('submit',async e=>{e.preventDefault();const data=Object.fromEntries(new FormData(projectForm).entries());try{await api('/api/projects',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});projectForm.reset();await Promise.all([loadCatalogs(),loadDashboard()]);toast('Đã lưu dự án')}catch(err){toast(err.message)}});
     contractForm.addEventListener('submit',async e=>{e.preventDefault();const data=Object.fromEntries(new FormData(contractForm).entries());try{await api('/api/project-accounting/contracts',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});contractForm.reset();contractForm.vat_rate.value='10';contractForm.retention_rate.value='5';contractForm.signed_date.value=new Date().toISOString().slice(0,10);await loadProjectAccounting();toast('Đã lưu hợp đồng')}catch(err){toast(err.message)}});
     costPlanForm.addEventListener('submit',async e=>{e.preventDefault();const data=Object.fromEntries(new FormData(costPlanForm).entries());try{await api('/api/project-accounting/cost-plans',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});costPlanForm.reset();await loadProjectAccounting();toast('Đã lưu dự toán')}catch(err){toast(err.message)}});
