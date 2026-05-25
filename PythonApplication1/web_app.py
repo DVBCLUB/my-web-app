@@ -1955,6 +1955,7 @@ def create_app():
             data.get("supplier", ""),
             float(data.get("min_quantity") or 0),
         )
+        AuditLogManager().log("material", material_id, "created", session.get("user_id"), new_value=data)
         return jsonify({"id": material_id, "status": "created"})
 
     @app.get("/api/documents")
@@ -2660,6 +2661,19 @@ INDEX_HTML = r"""<!doctype html>
           <div class="card kpi"><div class="label">Cảnh báo thông minh</div><div class="value" id="invSmartAlerts">0</div></div>
           <div class="card kpi"><div class="label">Định mức</div><div class="value" id="invStandardCount">0</div></div>
         </div>
+        <div class="card">
+          <h3>Tạo vật tư kho</h3>
+          <form class="form" id="materialForm">
+            <label>Mã vật tư<input name="code" required placeholder="VD: THEP-D16"></label>
+            <label>Tên vật tư<input name="name" required placeholder="VD: Thép D16"></label>
+            <label>Đơn vị<input name="unit" placeholder="kg, cây, m3"></label>
+            <label>Đơn giá chuẩn<input name="unit_price" type="number" min="0" step="1000"></label>
+            <label>Nhóm vật tư<input name="category" placeholder="Thép, xi măng, cát đá"></label>
+            <label>Nhà cung cấp<input name="supplier"></label>
+            <label>Tồn tối thiểu<input name="min_quantity" type="number" min="0" step="0.01"></label>
+            <div class="wide actions"><button class="primary" type="submit">Tạo vật tư</button></div>
+          </form>
+        </div>
         <div class="grid two">
           <div class="card">
             <h3>Nhập / xuất kho công trình</h3>
@@ -3194,6 +3208,7 @@ INDEX_HTML = r"""<!doctype html>
     revenueForm.revenue_date.value=new Date().toISOString().slice(0,10);
     bankForm.transaction_date.value=new Date().toISOString().slice(0,10);
     expenseForm.addEventListener('submit',async e=>{e.preventDefault();const data=Object.fromEntries(new FormData(expenseForm).entries());try{await api('/api/expenses',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});expenseForm.reset();expenseForm.expense_date.value=new Date().toISOString().slice(0,10);await Promise.all([loadDashboard(),loadExpenses(),loadApprovals()]);toast('Đã đưa chi phí vào hàng chờ duyệt')}catch(err){toast(err.message)}});
+    materialForm.addEventListener('submit',async e=>{e.preventDefault();const data=Object.fromEntries(new FormData(materialForm).entries());try{await api('/api/inventory/materials',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});materialForm.reset();await Promise.all([loadDashboard(),loadInventory()]);toast('Đã tạo vật tư kho')}catch(err){toast(err.message)}});
     inventoryTransactionForm.addEventListener('submit',async e=>{e.preventDefault();const data=Object.fromEntries(new FormData(inventoryTransactionForm).entries());try{await api('/api/inventory/transactions',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});inventoryTransactionForm.reset();await Promise.all([loadDashboard(),loadInventory(),loadAccounting()]);toast('Đã ghi phiếu kho')}catch(err){toast(err.message)}});
     materialStandardForm.addEventListener('submit',async e=>{e.preventDefault();const data=Object.fromEntries(new FormData(materialStandardForm).entries());try{await api('/api/material-standards',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});materialStandardForm.reset();materialStandardForm.basis_unit.value='m2';materialStandardForm.tolerance_percent.value='15';await loadInventory();toast('Đã lưu định mức vật tư')}catch(err){toast(err.message)}});
     projectForm.addEventListener('submit',async e=>{e.preventDefault();const data=Object.fromEntries(new FormData(projectForm).entries());try{await api('/api/projects',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});projectForm.reset();await Promise.all([loadCatalogs(),loadDashboard()]);toast('Đã lưu dự án')}catch(err){toast(err.message)}});
