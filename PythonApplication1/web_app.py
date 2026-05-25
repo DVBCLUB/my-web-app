@@ -638,27 +638,138 @@ def update_expense_approval_web(expense_id: int, action: str, actor: dict[str, A
         raise ValueError("Trang thai phe duyet khong hop le")
     conn = get_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT id, amount, status FROM expenses WHERE id = ?", (expense_id,))
-    expense = cursor.fetchone()
-    if not expense:
-        raise ValueError("Khong tim thay chi phi")
-    if action == "approved":
-        ok, message = ApprovalThresholdManager().can_approve(actor.get("role"), float(expense["amount"] or 0))
-        if not ok:
-            AuditLogManager().log("expense", expense_id, "APPROVAL_BLOCKED", actor.get("id"), new_value={"message": message})
-            raise ValueError(message)
-    status = "approved" if action == "approved" else "rejected" if action == "rejected" else "pending"
-    cursor.execute("UPDATE expenses SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", (status, expense_id))
-    cursor.execute(
-        """
-        INSERT INTO approval_logs (expense_id, action, actor, note)
-        VALUES (?, ?, ?, ?)
-        """,
-        (expense_id, status, actor.get("username") or actor.get("full_name") or actor.get("role") or "web", note),
+    journal_id = None
+    try:
+        cursor.execute("BEGIN")
+        cursor.execute(
+            """
+            SELECT e.id, e.expense_date, e.project_id, e.category_id, e.description,
+                   e.amount, e.status, COALESCE(ec.name, '') AS category_name
+            FROM expenses e
+            LEFT JOIN expense_categories ec ON ec.id = e.category_id
+            WHERE e.id = ?
+            """,
+            (expense_id,),
+        )
+        expense = cursor.fetchone()
+        if not expense:
+            raise ValueError("Khong tim thay chi phi")
+
+        amount = float(expense["amount"] or 0)
+        if amount <= 0:
+            raise ValueError("So tien chi phi phai lon hon 0")
+
+        if action == "approved":
+            ok, message = ApprovalThresholdManager().can_approve(actor.get("role"), amount)
+            if not ok:
+                raise ValueError(message)
+            cursor.execute("SELECT id FROM journal_entries WHERE expense_id = ? LIMIT 1", (expense_id,))
+            existing_journal = cursor.fetchone()
+            if existing_journal:
+                raise ValueError("Chi phi nay da co but toan, khong tao trung")
+            cursor.execute(
+                """
+                SELECT m.debit_account, m.credit_account,
+                       da.account_name AS debit_name, ca.account_name AS credit_name
+                FROM category_account_mappings m
+                JOIN accounts da ON da.account_code = m.debit_account AND COALESCE(da.active, 1) = 1
+                JOIN accounts ca ON ca.account_code = m.credit_account AND COALESCE(ca.active, 1) = 1
+                WHERE m.category_id = ? AND COALESCE(m.active, 1) = 1
+                LIMIT 1
+                """,
+                (expense["category_id"],),
+            )
+            mapping = cursor.fetchone()
+            if not mapping:
+                raise ValueError("Chua co mapping tai khoan No/Co cho loai chi phi nay")
+            debit_account = mapping["debit_account"]
+            credit_account = mapping["credit_account"]
+            debit_total = amount
+            credit_total = amount
+            if abs(debit_total - credit_total) > 0.01:
+                raise ValueError("But toan khong can No/Co")
+
+            description = f"Duyet chi phi #{expense_id}: {expense['description'] or expense['category_name']}"
+            cursor.execute(
+                """
+                INSERT INTO journal_entries
+                (entry_number, entry_date, entry_type, description, debit_account, credit_account,
+                 amount, expense_id, project_id, reference_type, reference_id, created_by)
+                VALUES (?, ?, 'expense_approval', ?, ?, ?, ?, ?, ?, 'expense', ?, ?)
+                """,
+                (
+                    f"EXP-{expense_id}",
+                    expense["expense_date"],
+                    description,
+                    debit_account,
+                    credit_account,
+                    amount,
+                    expense_id,
+                    expense["project_id"],
+                    expense_id,
+                    actor.get("id") or 1,
+                ),
+            )
+            journal_id = cursor.lastrowid
+            cursor.execute(
+                """
+                INSERT INTO journal_entry_lines
+                (journal_entry_id, line_no, account_code, debit_amount, credit_amount,
+                 project_id, expense_id, description)
+                VALUES (?, 1, ?, ?, 0, ?, ?, ?)
+                """,
+                (journal_id, debit_account, amount, expense["project_id"], expense_id, description),
+            )
+            cursor.execute(
+                """
+                INSERT INTO journal_entry_lines
+                (journal_entry_id, line_no, account_code, debit_amount, credit_amount,
+                 project_id, expense_id, description)
+                VALUES (?, 2, ?, 0, ?, ?, ?, ?)
+                """,
+                (journal_id, credit_account, amount, expense["project_id"], expense_id, description),
+            )
+            cursor.execute(
+                """
+                SELECT COALESCE(SUM(debit_amount), 0) AS debit_total,
+                       COALESCE(SUM(credit_amount), 0) AS credit_total
+                FROM journal_entry_lines
+                WHERE journal_entry_id = ?
+                """,
+                (journal_id,),
+            )
+            totals = cursor.fetchone()
+            if abs(float(totals["debit_total"] or 0) - float(totals["credit_total"] or 0)) > 0.01:
+                raise ValueError("But toan khong can sau khi tao dong")
+
+        status = "approved" if action == "approved" else "rejected" if action == "rejected" else "pending"
+        cursor.execute("UPDATE expenses SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", (status, expense_id))
+        cursor.execute(
+            """
+            INSERT INTO approval_logs (expense_id, action, actor, note)
+            VALUES (?, ?, ?, ?)
+            """,
+            (
+                expense_id,
+                status,
+                actor.get("username") or actor.get("full_name") or actor.get("role") or "web",
+                note or (f"Auto journal #{journal_id}" if journal_id else ""),
+            ),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        if action == "approved":
+            AuditLogManager().log("expense", expense_id, "APPROVAL_ROLLBACK", actor.get("id"), new_value={"note": note})
+        raise
+    AuditLogManager().log(
+        "expense",
+        expense_id,
+        f"expense_{status}",
+        actor.get("id"),
+        new_value={"note": note, "journal_id": journal_id},
     )
-    conn.commit()
-    AuditLogManager().log("expense", expense_id, f"expense_{status}", actor.get("id"), new_value={"note": note})
-    return {"id": expense_id, "status": status}
+    return {"id": expense_id, "status": status, "journal_entry_id": journal_id}
 
 
 def site_intake_snapshot(limit: int = 80) -> dict[str, Any]:
