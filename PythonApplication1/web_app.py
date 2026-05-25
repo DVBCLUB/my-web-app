@@ -164,6 +164,16 @@ def rows_to_csv(rows: list[dict[str, Any]], columns: list[str]) -> str:
     return output.getvalue()
 
 
+def csv_payload_rows(data: dict[str, Any]) -> list[dict[str, str]]:
+    text = data.get("csv") or data.get("text") or ""
+    if not text.strip():
+        raise ValueError("Chua co noi dung CSV")
+    reader = csv.DictReader(io.StringIO(text.strip()))
+    if not reader.fieldnames:
+        raise ValueError("CSV can co dong tieu de")
+    return [{(k or "").strip(): (v or "").strip() for k, v in row.items()} for row in reader]
+
+
 def inventory_workspace_snapshot() -> dict[str, Any]:
     conn = get_connection()
     cursor = conn.cursor()
@@ -1958,6 +1968,42 @@ def create_app():
         AuditLogManager().log("material", material_id, "created", session.get("user_id"), new_value=data)
         return jsonify({"id": material_id, "status": "created"})
 
+    @app.post("/api/inventory/materials/import-csv")
+    @api_error
+    def import_materials_csv():
+        data = request.get_json(force=True)
+        rows = csv_payload_rows(data)
+        manager = MaterialManager()
+        created: list[int] = []
+        skipped: list[dict[str, Any]] = []
+        for index, row in enumerate(rows, start=2):
+            code = row.get("code") or row.get("ma_vat_tu") or row.get("ma")
+            name = row.get("name") or row.get("ten_vat_tu") or row.get("ten")
+            if not code or not name:
+                skipped.append({"line": index, "reason": "Thieu code/name"})
+                continue
+            try:
+                material_id = manager.add_material(
+                    code,
+                    name,
+                    row.get("unit") or row.get("don_vi") or "",
+                    float(row.get("unit_price") or row.get("don_gia") or 0),
+                    row.get("category") or row.get("nhom") or "",
+                    row.get("supplier") or row.get("nha_cung_cap") or "",
+                    float(row.get("min_quantity") or row.get("ton_toi_thieu") or 0),
+                )
+                created.append(material_id)
+            except Exception as exc:
+                skipped.append({"line": index, "code": code, "reason": str(exc)})
+        AuditLogManager().log(
+            "material",
+            None,
+            "csv_imported",
+            session.get("user_id"),
+            new_value={"created": len(created), "skipped": skipped[:20]},
+        )
+        return jsonify({"created": len(created), "ids": created, "skipped": skipped})
+
     @app.get("/api/documents")
     @api_error
     def documents():
@@ -2080,6 +2126,48 @@ def create_app():
         )
         AuditLogManager().log("construction_work_item", item_id, "created", session.get("user_id"), new_value=data)
         return jsonify({"id": item_id, "status": "created"})
+
+    @app.post("/api/construction/work-items/import-csv")
+    @api_error
+    def import_construction_work_items_csv():
+        data = request.get_json(force=True)
+        rows = csv_payload_rows(data)
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, code FROM projects")
+        project_by_code = {str(row["code"]).strip(): row["id"] for row in cursor.fetchall()}
+        manager = ConstructionManager()
+        created: list[int] = []
+        skipped: list[dict[str, Any]] = []
+        for index, row in enumerate(rows, start=2):
+            project_id = row.get("project_id") or project_by_code.get(row.get("project_code") or row.get("ma_du_an") or "")
+            item_name = row.get("item_name") or row.get("ten_hang_muc") or row.get("ten")
+            if not project_id or not item_name:
+                skipped.append({"line": index, "reason": "Thieu project_id/project_code hoac item_name"})
+                continue
+            try:
+                item_id = manager.add_work_item(
+                    int(project_id),
+                    row.get("item_code") or row.get("ma_hang_muc") or "",
+                    item_name,
+                    row.get("unit") or row.get("don_vi") or "",
+                    float(row.get("planned_quantity") or row.get("khoi_luong_ke_hoach") or 0),
+                    float(row.get("completed_quantity") or row.get("khoi_luong_da_lam") or 0),
+                    float(row.get("unit_price") or row.get("don_gia") or 0),
+                    row.get("status") or row.get("trang_thai") or "planned",
+                    row.get("notes") or row.get("ghi_chu") or "",
+                )
+                created.append(item_id)
+            except Exception as exc:
+                skipped.append({"line": index, "item_name": item_name, "reason": str(exc)})
+        AuditLogManager().log(
+            "construction_work_item",
+            None,
+            "csv_imported",
+            session.get("user_id"),
+            new_value={"created": len(created), "skipped": skipped[:20]},
+        )
+        return jsonify({"created": len(created), "ids": created, "skipped": skipped})
 
     @app.post("/api/construction/work-items/<int:work_item_id>/progress")
     @api_error
@@ -2674,6 +2762,13 @@ INDEX_HTML = r"""<!doctype html>
             <div class="wide actions"><button class="primary" type="submit">Tạo vật tư</button></div>
           </form>
         </div>
+        <div class="card">
+          <h3>Import vật tư CSV</h3>
+          <form class="form" id="materialImportForm">
+            <label class="wide">CSV<textarea name="csv" placeholder="code,name,unit,unit_price,category,supplier,min_quantity&#10;THEP-D16,Thép D16,kg,18000,Thép,NCC A,100"></textarea></label>
+            <div class="wide actions"><button class="secondary" type="submit">Import vật tư</button><span class="muted" id="materialImportStatus"></span></div>
+          </form>
+        </div>
         <div class="grid two">
           <div class="card">
             <h3>Nhập / xuất kho công trình</h3>
@@ -2883,6 +2978,13 @@ INDEX_HTML = r"""<!doctype html>
             <label>Trạng thái<select name="status"><option value="planned">Kế hoạch</option><option value="in_progress">Đang thi công</option><option value="completed">Hoàn thành</option><option value="paused">Tạm dừng</option></select></label>
             <label class="wide">Ghi chú<textarea name="notes"></textarea></label>
             <div class="wide actions"><button class="primary" type="submit">Tạo hạng mục</button></div>
+          </form>
+        </div>
+        <div class="card">
+          <h3>Import hạng mục CSV</h3>
+          <form class="form" id="workItemImportForm">
+            <label class="wide">CSV<textarea name="csv" placeholder="project_code,item_code,item_name,unit,planned_quantity,completed_quantity,unit_price,status,notes&#10;DA001,HM-01,Móng,m3,120,0,1500000,planned,"></textarea></label>
+            <div class="wide actions"><button class="secondary" type="submit">Import hạng mục</button><span class="muted" id="workItemImportStatus"></span></div>
           </form>
         </div>
         <div class="card">
@@ -3209,6 +3311,7 @@ INDEX_HTML = r"""<!doctype html>
     bankForm.transaction_date.value=new Date().toISOString().slice(0,10);
     expenseForm.addEventListener('submit',async e=>{e.preventDefault();const data=Object.fromEntries(new FormData(expenseForm).entries());try{await api('/api/expenses',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});expenseForm.reset();expenseForm.expense_date.value=new Date().toISOString().slice(0,10);await Promise.all([loadDashboard(),loadExpenses(),loadApprovals()]);toast('Đã đưa chi phí vào hàng chờ duyệt')}catch(err){toast(err.message)}});
     materialForm.addEventListener('submit',async e=>{e.preventDefault();const data=Object.fromEntries(new FormData(materialForm).entries());try{await api('/api/inventory/materials',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});materialForm.reset();await Promise.all([loadDashboard(),loadInventory()]);toast('Đã tạo vật tư kho')}catch(err){toast(err.message)}});
+    materialImportForm.addEventListener('submit',async e=>{e.preventDefault();const data=Object.fromEntries(new FormData(materialImportForm).entries());try{const r=await api('/api/inventory/materials/import-csv',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});materialImportStatus.textContent=`Đã import ${r.created||0}, bỏ qua ${(r.skipped||[]).length}`;materialImportForm.reset();await Promise.all([loadDashboard(),loadInventory()]);toast('Đã import vật tư CSV')}catch(err){materialImportStatus.textContent=err.message;toast(err.message)}});
     inventoryTransactionForm.addEventListener('submit',async e=>{e.preventDefault();const data=Object.fromEntries(new FormData(inventoryTransactionForm).entries());try{await api('/api/inventory/transactions',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});inventoryTransactionForm.reset();await Promise.all([loadDashboard(),loadInventory(),loadAccounting()]);toast('Đã ghi phiếu kho')}catch(err){toast(err.message)}});
     materialStandardForm.addEventListener('submit',async e=>{e.preventDefault();const data=Object.fromEntries(new FormData(materialStandardForm).entries());try{await api('/api/material-standards',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});materialStandardForm.reset();materialStandardForm.basis_unit.value='m2';materialStandardForm.tolerance_percent.value='15';await loadInventory();toast('Đã lưu định mức vật tư')}catch(err){toast(err.message)}});
     projectForm.addEventListener('submit',async e=>{e.preventDefault();const data=Object.fromEntries(new FormData(projectForm).entries());try{await api('/api/projects',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});projectForm.reset();await Promise.all([loadCatalogs(),loadDashboard()]);toast('Đã lưu dự án')}catch(err){toast(err.message)}});
@@ -3217,6 +3320,7 @@ INDEX_HTML = r"""<!doctype html>
     billingForm.addEventListener('submit',async e=>{e.preventDefault();const data=Object.fromEntries(new FormData(billingForm).entries());try{await api('/api/project-accounting/billings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});billingForm.reset();billingForm.vat_rate.value='10';billingForm.retention_rate.value='5';billingForm.billing_date.value=new Date().toISOString().slice(0,10);await Promise.all([loadProjectAccounting(),loadFinance()]);toast('Đã lưu nghiệm thu')}catch(err){toast(err.message)}});
     revenueForm.addEventListener('submit',async e=>{e.preventDefault();const data=Object.fromEntries(new FormData(revenueForm).entries());try{await api('/api/project-accounting/revenues',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});revenueForm.reset();revenueForm.revenue_date.value=new Date().toISOString().slice(0,10);await Promise.all([loadProjectAccounting(),loadFinance()]);toast('Đã lưu doanh thu')}catch(err){toast(err.message)}});
     workItemForm.addEventListener('submit',async e=>{e.preventDefault();const data=Object.fromEntries(new FormData(workItemForm).entries());try{await api('/api/construction/work-items',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});workItemForm.reset();await Promise.all([loadConstruction(),loadInventory(),loadDashboard(),loadProjectAccounting()]);toast('Đã tạo hạng mục công trường')}catch(err){toast(err.message)}});
+    workItemImportForm.addEventListener('submit',async e=>{e.preventDefault();const data=Object.fromEntries(new FormData(workItemImportForm).entries());try{const r=await api('/api/construction/work-items/import-csv',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});workItemImportStatus.textContent=`Đã import ${r.created||0}, bỏ qua ${(r.skipped||[]).length}`;workItemImportForm.reset();await Promise.all([loadConstruction(),loadInventory(),loadDashboard(),loadProjectAccounting()]);toast('Đã import hạng mục CSV')}catch(err){workItemImportStatus.textContent=err.message;toast(err.message)}});
     progressWorkItem.addEventListener('change',()=>{const o=progressWorkItem.selectedOptions[0];if(!o)return;workProgressForm.completed_quantity.value=o.dataset.completed||'';workProgressForm.percent_complete.value=o.dataset.percent||''});
     workProgressForm.addEventListener('submit',async e=>{e.preventDefault();const data=Object.fromEntries(new FormData(workProgressForm).entries()),workItemId=data.work_item_id;delete data.work_item_id;try{await api(`/api/construction/work-items/${workItemId}/progress`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});workProgressForm.reset();await Promise.all([loadConstruction(),loadInventory(),loadDashboard(),loadProjectAccounting()]);toast('Đã cập nhật tiến độ hạng mục')}catch(err){toast(err.message)}});
     diaryForm.addEventListener('submit',async e=>{e.preventDefault();const data=Object.fromEntries(new FormData(diaryForm).entries());try{await api('/api/construction/diaries',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});diaryForm.reset();diaryForm.diary_date.value=new Date().toISOString().slice(0,10);await loadConstruction();toast('Đã lưu nhật ký')}catch(err){toast(err.message)}});
