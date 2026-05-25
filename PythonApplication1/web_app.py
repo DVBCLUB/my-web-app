@@ -78,6 +78,7 @@ OFFLINE_DATA_TABLES = {
     "form_template_fields": "Truong bieu mau",
     "form_field_mappings": "Mapping bieu mau",
     "document_requirements": "Yeu cau chung tu",
+    "document_sequences": "So chung tu tu dong",
     "compliance_rules": "Quy tac tuan thu",
     "category_account_mappings": "Mapping tai khoan",
     "policy_limits": "Han muc chinh sach",
@@ -86,9 +87,69 @@ OFFLINE_DATA_TABLES = {
     "simple_catalogs": "Danh muc dung chung",
     "app_settings": "Cau hinh cong ty",
     "powerbi_sync_log": "Log PowerBI",
+    "advance_requests": "De nghi tam ung",
+    "advance_settlements": "Quyet toan tam ung",
+    "settlement_expense_links": "Lien ket quyet toan - chi phi",
+    "advance_attachments": "Tep dinh kem tam ung",
+    "attachments": "Tep dinh kem chung",
+    "bank_accounts": "Tai khoan ngan hang",
+    "bank_transactions": "Giao dich ngan hang",
+    "bank_reconciliations": "Dot doi soat ngan hang",
+    "bank_reconciliation_matches": "Ket qua doi soat ngan hang",
+    "bank_statement_rows": "Sao ke ngan hang",
+    "check_register": "So sec / uy nhiem chi",
+    "budget_versions": "Phien ban ngan sach",
+    "budget_items": "Hang muc ngan sach",
+    "construction_work_items": "Hang muc cong truong",
+    "site_diaries": "Nhat ky cong truong",
+    "site_diary_expense_suggestions": "Goi y chi phi tu nhat ky",
+    "safety_checks": "Kiem tra an toan",
+    "equipment_usage": "Su dung may thi cong",
+    "material_standards": "Dinh muc vat tu",
+    "inventory_transactions": "Giao dich kho",
+    "purchase_orders": "Don mua hang",
+    "purchase_order_lines": "Dong don mua hang",
+    "suppliers": "Nha cung cap",
+    "subcontractors": "Nha thau phu",
+    "subcontract_payments": "Thanh toan thau phu",
+    "contract_payment_milestones": "Moc thanh toan hop dong",
+    "project_milestones": "Moc tien do du an",
+    "poc_revenue_recognitions": "Ghi nhan doanh thu POC",
+    "overhead_allocations": "Phan bo chi phi chung",
+    "qs_reconciliation_items": "Doi chieu khoi luong QS",
+    "fixed_assets": "Tai san co dinh",
+    "asset_depreciation_runs": "Dot tinh khau hao",
+    "payroll_periods": "Ky luong",
+    "payroll_lines": "Dong luong",
+    "payroll_runs": "Dot chay luong",
+    "payroll_run_lines": "Dong dot chay luong",
+    "employees": "Nhan su",
+    "timesheets": "Bang cong",
+    "currency_rates": "Ty gia",
+    "foreign_currency_transactions": "Giao dich ngoai te",
+    "tax_declarations": "To khai thue",
+    "imported_invoice_records": "Hoa don import",
+    "guarantee_bonds": "Bao lanh",
+    "warranty_periods": "Thoi han bao hanh",
+    "expiring_items": "Muc sap het han",
+    "vendor_scorecards": "Danh gia nha cung cap",
+    "template_versions": "Phien ban bieu mau",
+    "journal_entry_lines": "Dong but toan",
+    "user_project_access": "Phan quyen du an",
+    "users": "Nguoi dung",
+    "schema_migrations": "Lich su nang cap DB",
 }
 
 APPROVED_EXPENSE_STATUSES = ("approved", "posted", "paid")
+OFFLINE_REDACT_COLUMNS = {
+    "password",
+    "password_hash",
+    "token",
+    "access_token",
+    "refresh_token",
+    "secret",
+    "api_key",
+}
 
 
 def offline_table_columns(table_name: str) -> list[str]:
@@ -116,7 +177,14 @@ def offline_table_rows(table_name: str, limit: int = 50, offset: int = 0, q: str
     cursor.execute(f'SELECT COUNT(*) FROM "{table_name}"{where}', params)
     total = int(cursor.fetchone()[0] or 0)
     cursor.execute(f'SELECT * FROM "{table_name}"{where} LIMIT ? OFFSET ?', [*params, limit, offset])
-    rows = [row_to_dict(row) for row in cursor.fetchall()]
+    rows = []
+    for row in cursor.fetchall():
+        item = row_to_dict(row)
+        for column in list(item):
+            key = column.lower()
+            if key in OFFLINE_REDACT_COLUMNS or "password" in key or "token" in key or "secret" in key:
+                item[column] = "[redacted]"
+        rows.append(item)
     return {"columns": columns, "rows": rows, "total": total, "limit": limit, "offset": offset, "q": q}
 
 
