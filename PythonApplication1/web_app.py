@@ -88,6 +88,8 @@ OFFLINE_DATA_TABLES = {
     "powerbi_sync_log": "Log PowerBI",
 }
 
+APPROVED_EXPENSE_STATUSES = ("approved", "posted", "paid")
+
 
 def offline_table_columns(table_name: str) -> list[str]:
     if table_name not in OFFLINE_DATA_TABLES:
@@ -332,7 +334,8 @@ def project_costing_snapshot(project_id: int | None = None) -> dict[str, Any]:
         SELECT p.id, p.code, p.name, COALESCE(p.budget, 0) AS project_budget,
                COALESCE((SELECT SUM(planned_amount) FROM project_cost_plans cp WHERE cp.project_id = p.id), 0) AS planned_total,
                COALESCE((SELECT SUM(amount) FROM project_revenues r WHERE r.project_id = p.id), 0) AS revenue_total,
-               COALESCE((SELECT SUM(amount) FROM expenses e WHERE e.project_id = p.id), 0) AS expense_total,
+               COALESCE((SELECT SUM(amount) FROM expenses e
+                         WHERE e.project_id = p.id AND e.status IN ('approved', 'posted', 'paid')), 0) AS expense_total,
                COALESCE((SELECT SUM(it.quantity * COALESCE(m.average_cost, m.unit_price, 0))
                          FROM inventory_transactions it
                          JOIN materials m ON m.id = it.material_id
@@ -402,6 +405,150 @@ def project_costing_snapshot(project_id: int | None = None) -> dict[str, Any]:
     totals["gross_profit"] = totals["revenue"] - totals["actual"]
     totals["used_percent"] = (totals["actual"] / totals["planned"] * 100) if totals["planned"] else 0
     return {"summary": totals, "projects": projects}
+
+
+def approved_expense_dashboard_snapshot() -> dict[str, Any]:
+    conn = get_connection()
+    cursor = conn.cursor()
+    today = date.today()
+    this_month_start = today.replace(day=1)
+    previous_month_end = this_month_start - timedelta(days=1)
+    previous_month_start = previous_month_end.replace(day=1)
+    cursor.execute(
+        """
+        SELECT
+            COALESCE(SUM(CASE WHEN status IN ('approved', 'posted', 'paid') THEN amount ELSE 0 END), 0) AS total_approved,
+            COALESCE(SUM(CASE WHEN status = 'pending' THEN amount ELSE 0 END), 0) AS pending_amount,
+            SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) AS pending_count
+        FROM expenses
+        """
+    )
+    totals = row_to_dict(cursor.fetchone())
+    cursor.execute(
+        """
+        SELECT COALESCE(SUM(amount), 0)
+        FROM expenses
+        WHERE status IN ('approved', 'posted', 'paid')
+          AND expense_date >= ?
+        """,
+        (this_month_start.isoformat(),),
+    )
+    monthly_expenses = float(cursor.fetchone()[0] or 0)
+    cursor.execute(
+        """
+        SELECT COALESCE(SUM(amount), 0)
+        FROM expenses
+        WHERE status IN ('approved', 'posted', 'paid')
+          AND expense_date BETWEEN ? AND ?
+        """,
+        (previous_month_start.isoformat(), previous_month_end.isoformat()),
+    )
+    previous_month_expenses = float(cursor.fetchone()[0] or 0)
+    cursor.execute(
+        """
+        SELECT ec.name, COALESCE(SUM(e.amount), 0) AS total
+        FROM expenses e
+        JOIN expense_categories ec ON e.category_id = ec.id
+        WHERE e.status IN ('approved', 'posted', 'paid')
+        GROUP BY e.category_id
+        ORDER BY total DESC
+        """
+    )
+    categories = [{"name": row["name"] or "Chua phan loai", "total": row["total"] or 0} for row in cursor.fetchall()]
+    cursor.execute(
+        """
+        SELECT COALESCE(p.name, 'Khong co du an') AS name, COALESCE(SUM(e.amount), 0) AS total
+        FROM expenses e
+        LEFT JOIN projects p ON e.project_id = p.id
+        WHERE e.status IN ('approved', 'posted', 'paid')
+        GROUP BY e.project_id
+        ORDER BY total DESC
+        """
+    )
+    projects = [{"name": row["name"], "total": row["total"] or 0} for row in cursor.fetchall()]
+    return {
+        "total_expenses": float(totals.get("total_approved") or 0),
+        "monthly_expenses": monthly_expenses,
+        "previous_month_expenses": previous_month_expenses,
+        "pending_amount": float(totals.get("pending_amount") or 0),
+        "pending_count": int(totals.get("pending_count") or 0),
+        "categories": categories,
+        "projects": projects,
+    }
+
+
+def expense_approval_snapshot(limit: int = 80) -> dict[str, Any]:
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT e.id, e.expense_date, COALESCE(p.code, '') AS project_code,
+               COALESCE(p.name, '') AS project_name, COALESCE(ec.name, '') AS category_name,
+               e.description, e.amount, e.paid_by, e.payment_method, e.status,
+               e.created_by, COALESCE(u.full_name, u.username, '') AS created_by_name,
+               e.created_at,
+               (SELECT COUNT(*) FROM documents d WHERE d.expense_id = e.id) AS document_count,
+               (SELECT COUNT(*) FROM approval_logs al WHERE al.expense_id = e.id) AS approval_log_count
+        FROM expenses e
+        LEFT JOIN projects p ON p.id = e.project_id
+        LEFT JOIN expense_categories ec ON ec.id = e.category_id
+        LEFT JOIN users u ON u.id = e.created_by
+        WHERE e.status = 'pending'
+        ORDER BY e.expense_date DESC, e.id DESC
+        LIMIT ?
+        """,
+        (limit,),
+    )
+    pending = [row_to_dict(row) for row in cursor.fetchall()]
+    cursor.execute(
+        """
+        SELECT al.id, al.expense_id, al.action, al.actor, al.note, al.created_at,
+               e.description, e.amount
+        FROM approval_logs al
+        JOIN expenses e ON e.id = al.expense_id
+        ORDER BY al.id DESC
+        LIMIT 80
+        """
+    )
+    logs = [row_to_dict(row) for row in cursor.fetchall()]
+    return {
+        "pending": pending,
+        "logs": logs,
+        "summary": {
+            "pending_count": len(pending),
+            "pending_amount": sum(float(row.get("amount") or 0) for row in pending),
+        },
+    }
+
+
+def update_expense_approval_web(expense_id: int, action: str, actor: dict[str, Any] | None, note: str = "") -> dict[str, Any]:
+    actor = actor or {}
+    action = (action or "").strip().lower()
+    if action not in ("approved", "rejected", "pending"):
+        raise ValueError("Trang thai phe duyet khong hop le")
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, amount, status FROM expenses WHERE id = ?", (expense_id,))
+    expense = cursor.fetchone()
+    if not expense:
+        raise ValueError("Khong tim thay chi phi")
+    if action == "approved":
+        ok, message = ApprovalThresholdManager().can_approve(actor.get("role"), float(expense["amount"] or 0))
+        if not ok:
+            AuditLogManager().log("expense", expense_id, "APPROVAL_BLOCKED", actor.get("id"), new_value={"message": message})
+            raise ValueError(message)
+    status = "approved" if action == "approved" else "rejected" if action == "rejected" else "pending"
+    cursor.execute("UPDATE expenses SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", (status, expense_id))
+    cursor.execute(
+        """
+        INSERT INTO approval_logs (expense_id, action, actor, note)
+        VALUES (?, ?, ?, ?)
+        """,
+        (expense_id, status, actor.get("username") or actor.get("full_name") or actor.get("role") or "web", note),
+    )
+    conn.commit()
+    AuditLogManager().log("expense", expense_id, f"expense_{status}", actor.get("id"), new_value={"note": note})
+    return {"id": expense_id, "status": status}
 
 
 def offline_schema_snapshot() -> dict[str, Any]:
@@ -1406,6 +1553,11 @@ def create_app():
         construction = ConstructionManager()
         report = WebReportGenerator()
         stats = expenses.get_statistics()
+        approved_snapshot = approved_expense_dashboard_snapshot()
+        stats["total_expenses"] = approved_snapshot["total_expenses"]
+        stats["monthly_expenses"] = approved_snapshot["monthly_expenses"]
+        stats["pending_expenses"] = approved_snapshot["pending_amount"]
+        stats["pending_expense_count"] = approved_snapshot["pending_count"]
         conn = get_connection()
         cursor = conn.cursor()
         today = date.today()
@@ -1420,18 +1572,12 @@ def create_app():
             """,
             (previous_month_start.isoformat(), previous_month_end.isoformat()),
         )
-        previous_month_expenses = float(cursor.fetchone()[0] or 0)
+        previous_month_expenses = float(approved_snapshot["previous_month_expenses"] or 0)
         current_month_expenses = float(stats.get("monthly_expenses") or 0)
         month_delta = current_month_expenses - previous_month_expenses
         month_delta_percent = (month_delta / previous_month_expenses * 100) if previous_month_expenses else (100 if current_month_expenses else 0)
-        categories = [
-            {"name": row[0] or "Chưa phân loại", "total": row[1] or 0}
-            for row in expenses.get_expenses_by_category()
-        ]
-        projects = [
-            {"name": row[0] or "Không có dự án", "total": row[1] or 0}
-            for row in expenses.get_expenses_by_project()
-        ]
+        categories = approved_snapshot["categories"]
+        projects = approved_snapshot["projects"]
         cursor.execute(
             """
             SELECT p.id, p.code, p.name, p.location, COALESCE(p.budget, 0) AS budget,
@@ -1439,7 +1585,7 @@ def create_app():
                    COALESCE(AVG(w.percent_complete), 0) AS progress,
                    COUNT(DISTINCT w.id) AS work_item_count
             FROM projects p
-            LEFT JOIN expenses e ON e.project_id = p.id
+            LEFT JOIN expenses e ON e.project_id = p.id AND e.status IN ('approved', 'posted', 'paid')
             LEFT JOIN construction_work_items w ON w.project_id = p.id
             WHERE p.status = 'active'
             GROUP BY p.id
@@ -1559,6 +1705,23 @@ def create_app():
             int(data.get("created_by") or session.get("user_id") or 1),
         )
         return jsonify({"id": expense_id, "status": "created"})
+
+    @app.get("/api/expense-approvals")
+    @api_error
+    def expense_approvals():
+        return jsonify(expense_approval_snapshot())
+
+    @app.post("/api/expenses/<int:expense_id>/approval")
+    @api_error
+    def update_expense_approval(expense_id):
+        data = request.get_json(force=True)
+        result = update_expense_approval_web(
+            expense_id,
+            data.get("action", "approved"),
+            current_user(),
+            data.get("note", ""),
+        )
+        return jsonify(result)
 
     @app.get("/api/inventory")
     @api_error
@@ -2284,6 +2447,15 @@ INDEX_HTML = r"""<!doctype html>
             <div class="wide actions"><button class="primary" type="submit">Lưu chi phí</button><button class="secondary" type="reset">Xóa form</button></div>
           </form>
         </div>
+        <div class="grid kpis">
+          <div class="card kpi"><div class="label">Chờ duyệt</div><div class="value" id="approvalPendingCount">0</div></div>
+          <div class="card kpi"><div class="label">Giá trị chờ duyệt</div><div class="value" id="approvalPendingAmount">0</div></div>
+          <div class="card kpi"><div class="label">Đã vào dashboard</div><div class="value" id="approvedOfficialTotal">0</div></div>
+        </div>
+        <div class="card">
+          <div class="toolbar"><h3>Hàng chờ duyệt chi phí</h3><button class="secondary" type="button" id="reloadApprovalsBtn">Tải lại</button></div>
+          <div class="tablewrap"><table><thead><tr><th>Ngày</th><th>Dự án</th><th>Danh mục</th><th>Nội dung</th><th>Số tiền</th><th>Người tạo</th><th>Duyệt</th></tr></thead><tbody id="approvalRows"></tbody></table></div>
+        </div>
         <div class="card">
           <div class="toolbar"><h3>Danh sách chi phí</h3><input class="search" id="expenseSearch" placeholder="Tìm chi phí"></div>
           <div class="tablewrap"><table><thead><tr><th>Ngày</th><th>Dự án</th><th>Danh mục</th><th>Nội dung</th><th>Số tiền</th><th>TT</th></tr></thead><tbody id="expenseRows"></tbody></table></div>
@@ -2694,7 +2866,7 @@ INDEX_HTML = r"""<!doctype html>
   <div class="toast" id="toast"></div>
 
   <script>
-    const state={auth:null,users:[],offlineData:null,offlineSchema:null,offlineTable:null,dashboard:null,expenses:[],inventory:[],history:[],inventoryWorkspace:null,projects:[],categories:[],projectAccounting:null,workItems:[],diaries:[],documents:[],forms:[],reports:null,accounting:null,finance:null,settings:null};
+    const state={auth:null,users:[],offlineData:null,offlineSchema:null,offlineTable:null,dashboard:null,expenses:[],approvals:null,inventory:[],history:[],inventoryWorkspace:null,projects:[],categories:[],projectAccounting:null,workItems:[],diaries:[],documents:[],forms:[],reports:null,accounting:null,finance:null,settings:null};
     const money=v=>new Intl.NumberFormat('vi-VN',{maximumFractionDigits:0}).format(Number(v||0));
     const esc=v=>String(v??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
     const toast=t=>{const el=document.getElementById('toast');el.textContent=t;el.style.display='block';setTimeout(()=>el.style.display='none',2800)};
@@ -2707,12 +2879,13 @@ INDEX_HTML = r"""<!doctype html>
     function hideLogin(){authGate.classList.add('hidden')}
     function switchView(id){document.querySelectorAll('.view').forEach(v=>v.classList.toggle('active',v.id===id));document.querySelectorAll('.navbtn').forEach(b=>b.classList.toggle('active',b.dataset.view===id));document.getElementById('pageTitle').textContent={dashboard:'Tổng quan',offlineData:'Dữ liệu offline',expenses:'Chi phí',inventory:'Vật tư kho',projects:'Dự án',projectAccounting:'Kế toán công trình',construction:'Công trường',documents:'Chứng từ',forms:'Biểu mẫu',reports:'Báo cáo',accounting:'Sổ sách kế toán',finance:'Kiểm soát & tài chính',security:'Bảo mật',settings:'Cài đặt',deploy:'Tên miền'}[id]||'FasTrack ERP';document.getElementById('side').classList.remove('open')}
     async function boot(){const me=await api('/api/auth/me');state.auth=me.user||null;if(!me.authenticated){showLogin();return}hideLogin();userChip.textContent=`${state.auth.full_name||state.auth.username} · ${state.auth.role}`;await loadAll()}
-    async function loadAll(){await Promise.all([loadDashboard(),loadOfflineData(),loadCatalogs(),loadExpenses(),loadInventory(),loadProjects(),loadProjectAccounting(),loadConstruction(),loadDocuments(),loadForms(),loadReports(),loadAccounting(),loadFinance(),loadSettings(),loadUsers()])}
+    async function loadAll(){await Promise.all([loadDashboard(),loadOfflineData(),loadCatalogs(),loadExpenses(),loadApprovals(),loadInventory(),loadProjects(),loadProjectAccounting(),loadConstruction(),loadDocuments(),loadForms(),loadReports(),loadAccounting(),loadFinance(),loadSettings(),loadUsers()])}
     async function loadDashboard(){state.dashboard=await api('/api/dashboard');renderDashboard()}
     async function loadOfflineData(){const [data,schema]=await Promise.all([api('/api/offline-data'),api('/api/offline-schema')]);state.offlineData=data;state.offlineSchema=schema;renderOfflineData();renderOfflineSchema()}
     async function loadOfflineTable(name,page=1){const q=offlineTableSearch.value||'';state.offlineTable=await api(`/api/offline-data/${encodeURIComponent(name)}?limit=100&page=${page}&q=${encodeURIComponent(q)}`);renderOfflinePreview()}
     async function loadCatalogs(){const [projects,categories]=await Promise.all([api('/api/projects'),api('/api/categories')]);state.projects=projects;state.categories=categories;fillSelects();renderProjects()}
     async function loadExpenses(){state.expenses=await api('/api/expenses');renderExpenses()}
+    async function loadApprovals(){state.approvals=await api('/api/expense-approvals');renderApprovals()}
     async function loadInventory(){const [items,history,workspace]=await Promise.all([api('/api/inventory'),api('/api/inventory/history'),api('/api/inventory-workspace')]);state.inventory=workspace.materials||items;state.history=workspace.history||history;state.inventoryWorkspace=workspace;renderInventory();fillInventorySelects()}
     async function loadProjects(){state.projects=await api('/api/projects');fillSelects();renderProjects()}
     async function loadProjectAccounting(){state.projectAccounting=await api('/api/project-accounting');renderProjectAccounting()}
@@ -2730,8 +2903,10 @@ INDEX_HTML = r"""<!doctype html>
     function renderOfflineData(){const d=state.offlineData||{},s=d.summary||{};odTables.textContent=s.table_count||0;odActiveTables.textContent=s.active_table_count||0;odRecords.textContent=money(s.record_count);const q=(offlineSearch.value||'').toLowerCase();const tables=(d.tables||[]).filter(t=>JSON.stringify(t).toLowerCase().includes(q));offlineTableRows.innerHTML=tables.map(t=>`<tr><td><strong>${esc(t.label)}</strong></td><td>${esc(t.name)}</td><td class="num">${money(t.count)}</td><td><button class="secondary" type="button" data-offline-table="${esc(t.name)}">Xem</button></td></tr>`).join('')||'<tr><td colspan="4" class="empty">Chưa có dữ liệu.</td></tr>';document.querySelectorAll('[data-offline-table]').forEach(btn=>btn.addEventListener('click',()=>{offlineTableSearch.value='';loadOfflineTable(btn.dataset.offlineTable)}));if(!state.offlineTable&&tables.length){loadOfflineTable(tables.find(t=>t.count)?.name||tables[0].name)}}
     function renderOfflinePreview(){const t=state.offlineTable||{},rows=t.rows||[],columns=(t.columns&&t.columns.length?t.columns:[...new Set(rows.flatMap(r=>Object.keys(r)))]).slice(0,14);offlinePreviewTitle.textContent=`${t.label||t.name||''} · ${money(t.total||0)} dòng · trang ${t.page||1}`;odCurrent.textContent=t.name||'-';odPreviewCount.textContent=`${money(rows.length)} / ${money(t.total||0)}`;offlinePrevBtn.disabled=(t.page||1)<=1;offlineNextBtn.disabled=((t.offset||0)+rows.length)>=(t.total||0);offlinePreviewHead.innerHTML=columns.length?`<tr>${columns.map(c=>`<th>${esc(c)}</th>`).join('')}</tr>`:'';offlinePreviewRows.innerHTML=rows.map(r=>`<tr>${columns.map(c=>`<td>${esc(String(r[c]??'').slice(0,120))}</td>`).join('')}</tr>`).join('')||'<tr><td class="empty">Không có dòng dữ liệu.</td></tr>'}
     function renderOfflineSchema(){const s=state.offlineSchema||{},q=(schemaSearch.value||'').toLowerCase();const tables=(s.tables||[]).filter(t=>JSON.stringify({name:t.name,label:t.label,columns:t.columns}).toLowerCase().includes(q));schemaRows.innerHTML=tables.map(t=>`<tr><td><strong>${esc(t.name)}</strong><br><span class="muted">${esc(t.label)}</span></td><td class="num">${money(t.column_count)}</td><td class="num">${money(t.row_count)}</td><td class="num">${money((t.indexes||[]).length)}</td><td class="num">${money((t.foreign_keys||[]).length)}</td><td><span class="status ${t.data_exposed?'':'low'}">${t.data_exposed?'online':'schema'}</span></td></tr>`).join('')||'<tr><td colspan="6" class="empty">Chưa có cấu trúc dữ liệu.</td></tr>';relationRows.innerHTML=(s.relationships||[]).map(r=>`<tr><td>${esc(r.from_table)}</td><td>${esc(r.from_column)}</td><td>${esc(r.to_table)}</td><td>${esc(r.to_column)}</td></tr>`).join('')||'<tr><td colspan="4" class="empty">Chưa khai báo khóa ngoại.</td></tr>'}
-    function renderDashboard(){const d=state.dashboard||{},s=d.stats||{},t=d.trend||{};kTotal.textContent=money(s.total_expenses);kMonth.textContent=money(s.monthly_expenses);kProjects.textContent=s.total_projects||0;kDocs.textContent=s.total_documents||0;kStock.textContent=money(d.stock_value);kMonthTrend.textContent=`${pct(t.month_delta_percent)} so với tháng trước`;kMonthTrend.className=`trend ${Number(t.month_delta||0)<=0?'good':'bad'}`;const max=Math.max(1,...(d.categories||[]).map(x=>x.total||0));categoryBars.innerHTML=(d.categories||[]).map(x=>`<div class="barrow"><strong>${esc(x.name)}</strong><div class="bar"><div class="fill" style="width:${Math.round((x.total||0)/max*100)}%"></div></div><span class="num">${money(x.total)}</span></div>`).join('')||'<div class="empty">Chưa có dữ liệu chi phí.</div>';drawPie(categoryPie,d.categories||[],'name','total');drawColumn(projectChart,d.projects||[],'name','total');activeProjectRows.innerHTML=(d.active_projects||[]).map(p=>`<div class="project-line"><header><strong>${esc(p.code)} · ${esc(p.name)}</strong><span>${money(p.budget_used_percent)}%</span></header><div class="progress"><div class="fill" style="width:${Math.min(100,Math.round(p.budget_used_percent||p.progress||0))}%"></div></div><div class="muted">Đã chi ${money(p.spent)} / ngân sách ${money(p.budget)} · tiến độ ${money(p.progress)}% · ${money(p.work_item_count)} hạng mục</div></div>`).join('')||'<div class="empty">Chưa có dự án active.</div>';const sync=d.sync||{};syncBox.innerHTML=`<strong>Real-time sync</strong><span>Chế độ: ${esc(sync.mode||'')}</span><span>Chi phí cập nhật: ${esc(sync.last_expense_update||'chưa có')}</span><span>Chứng từ cập nhật: ${esc(sync.last_document_update||'chưa có')}</span>`;lowStockRows.innerHTML=(d.low_stock||[]).map(x=>`<tr><td>${esc(x.code)}</td><td>${esc(x.name)}</td><td class="num">${money(x.quantity)} ${esc(x.unit)}</td><td class="num">${money(x.min_quantity)}</td></tr>`).join('')||'<tr><td colspan="4" class="empty">Không có cảnh báo tồn kho.</td></tr>'}
-    function renderExpenses(){const q=(expenseSearch.value||'').toLowerCase();const rows=state.expenses.filter(e=>JSON.stringify(e).toLowerCase().includes(q));expenseRows.innerHTML=rows.map(e=>`<tr><td>${esc(e.expense_date)}</td><td>${esc(e.project_name||'')}</td><td>${esc(e.category_name||'')}</td><td>${esc(e.description||'')}</td><td class="num">${money(e.amount)}</td><td><span class="status">${esc(e.status)}</span></td></tr>`).join('')||'<tr><td colspan="6" class="empty">Chưa có chi phí.</td></tr>'}
+    function renderDashboard(){const d=state.dashboard||{},s=d.stats||{},t=d.trend||{};kTotal.textContent=money(s.total_expenses);kMonth.textContent=money(s.monthly_expenses);kProjects.textContent=s.total_projects||0;kDocs.textContent=s.total_documents||0;kStock.textContent=money(d.stock_value);kMonthTrend.textContent=`${pct(t.month_delta_percent)} so với tháng trước`;kMonthTrend.className=`trend ${Number(t.month_delta||0)<=0?'good':'bad'}`;const max=Math.max(1,...(d.categories||[]).map(x=>x.total||0));categoryBars.innerHTML=(d.categories||[]).map(x=>`<div class="barrow"><strong>${esc(x.name)}</strong><div class="bar"><div class="fill" style="width:${Math.round((x.total||0)/max*100)}%"></div></div><span class="num">${money(x.total)}</span></div>`).join('')||'<div class="empty">Chưa có dữ liệu chi phí đã duyệt.</div>';drawPie(categoryPie,d.categories||[],'name','total');drawColumn(projectChart,d.projects||[],'name','total');activeProjectRows.innerHTML=(d.active_projects||[]).map(p=>`<div class="project-line"><header><strong>${esc(p.code)} · ${esc(p.name)}</strong><span>${money(p.budget_used_percent)}%</span></header><div class="progress"><div class="fill" style="width:${Math.min(100,Math.round(p.budget_used_percent||p.progress||0))}%"></div></div><div class="muted">Đã duyệt ${money(p.spent)} / ngân sách ${money(p.budget)} · tiến độ ${money(p.progress)}% · ${money(p.work_item_count)} hạng mục</div></div>`).join('')||'<div class="empty">Chưa có dự án active.</div>';const sync=d.sync||{};syncBox.innerHTML=`<strong>Real-time sync</strong><span>Chế độ: ${esc(sync.mode||'')}</span><span>Chi phí cập nhật: ${esc(sync.last_expense_update||'chưa có')}</span><span>Chứng từ cập nhật: ${esc(sync.last_document_update||'chưa có')}</span><span>Chờ duyệt: ${money(s.pending_expense_count||0)} phiếu · ${money(s.pending_expenses||0)}</span>`;lowStockRows.innerHTML=(d.low_stock||[]).map(x=>`<tr><td>${esc(x.code)}</td><td>${esc(x.name)}</td><td class="num">${money(x.quantity)} ${esc(x.unit)}</td><td class="num">${money(x.min_quantity)}</td></tr>`).join('')||'<tr><td colspan="4" class="empty">Không có cảnh báo tồn kho.</td></tr>';if(state.approvals)renderApprovals()}
+    function renderExpenses(){const q=(expenseSearch.value||'').toLowerCase();const rows=state.expenses.filter(e=>JSON.stringify(e).toLowerCase().includes(q));expenseRows.innerHTML=rows.map(e=>`<tr><td>${esc(e.expense_date)}</td><td>${esc(e.project_name||'')}</td><td>${esc(e.category_name||'')}</td><td>${esc(e.description||'')}</td><td class="num">${money(e.amount)}</td><td><span class="status ${e.status==='pending'?'low':''}">${esc(e.status)}</span></td></tr>`).join('')||'<tr><td colspan="6" class="empty">Chưa có chi phí.</td></tr>'}
+    function renderApprovals(){const a=state.approvals||{},s=a.summary||{},d=state.dashboard||{},stats=d.stats||{};approvalPendingCount.textContent=s.pending_count||0;approvalPendingAmount.textContent=money(s.pending_amount);approvedOfficialTotal.textContent=money(stats.total_expenses);approvalRows.innerHTML=(a.pending||[]).map(e=>`<tr><td>${esc(e.expense_date)}</td><td>${esc(e.project_code)} ${esc(e.project_name)}</td><td>${esc(e.category_name)}</td><td>${esc(e.description)}</td><td class="num">${money(e.amount)}</td><td>${esc(e.created_by_name||e.created_by||'')}</td><td><button class="secondary" type="button" data-expense-approve="${e.id}">Duyệt</button> <button class="secondary" type="button" data-expense-reject="${e.id}">Từ chối</button></td></tr>`).join('')||'<tr><td colspan="7" class="empty">Không có chi phí chờ duyệt.</td></tr>';document.querySelectorAll('[data-expense-approve]').forEach(btn=>btn.addEventListener('click',()=>setExpenseApproval(btn.dataset.expenseApprove,'approved')));document.querySelectorAll('[data-expense-reject]').forEach(btn=>btn.addEventListener('click',()=>setExpenseApproval(btn.dataset.expenseReject,'rejected')))}
+    async function setExpenseApproval(id,action){try{await api(`/api/expenses/${id}/approval`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action})});await Promise.all([loadDashboard(),loadExpenses(),loadApprovals(),loadProjectAccounting(),loadAccounting()]);toast(action==='approved'?'Đã duyệt chi phí':'Đã từ chối chi phí')}catch(err){toast(err.message)}}
     function renderInventory(){const ws=state.inventoryWorkspace||{},sum=ws.summary||{};if(typeof invStockValue!=='undefined'){invStockValue.textContent=money(sum.stock_value);invMaterialCount.textContent=sum.material_count||0;invSmartAlerts.textContent=sum.smart_alert_count||0;invStandardCount.textContent=sum.standard_count||0}const q=(inventorySearch.value||'').toLowerCase();const rows=state.inventory.filter(i=>JSON.stringify(i).toLowerCase().includes(q));inventoryRows.innerHTML=rows.map(i=>`<tr><td>${esc(i.code)}</td><td>${esc(i.name)}</td><td>${esc(i.category)}</td><td class="num">${money(i.quantity)} ${esc(i.unit)}</td><td class="num">${money(i.average_cost||i.unit_price)}</td><td class="num">${money(i.min_quantity||0)}</td><td><span class="status ${Number(i.quantity||0)<=Number(i.min_quantity||0)&&Number(i.min_quantity||0)>0?'low':''}">${esc(i.status)}</span></td></tr>`).join('')||'<tr><td colspan="7" class="empty">Chưa có vật tư.</td></tr>';smartStockRows.innerHTML=(ws.alerts||[]).map(a=>`<tr><td><span class="status ${a.priority==='critical'?'low':''}">${esc(a.priority||'warning')}</span></td><td><strong>${esc(a.project_code||'Kho')}</strong> ${esc(a.project_name||'')}<br><span class="muted">${esc(a.item_code||'')} ${esc(a.item_name||'')}</span></td><td>${esc(a.material_code||a.code||'')} ${esc(a.material_name||a.name||'')}</td><td class="num">${money(a.needed_qty||a.min_quantity)} ${esc(a.unit||'')}</td><td class="num">${money(a.available_qty??a.quantity)} ${esc(a.unit||'')}</td><td class="num">${money(a.shortage_qty)} ${esc(a.unit||'')}</td><td><button class="secondary" type="button" data-po-alert='${esc(JSON.stringify(a))}'>${esc(a.suggestion||'Tạo PO')}</button></td></tr>`).join('')||'<tr><td colspan="7" class="empty">Không có cảnh báo vật tư.</td></tr>';valuationRows.innerHTML=(ws.valuation_methods||[]).map(v=>`<tr><td>${esc(v.code)}</td><td>${esc(v.name)}</td><td><span class="status ${v.status==='planned'?'low':''}">${esc(v.status)}</span></td></tr>`).join('')||'<tr><td colspan="3" class="empty">Chưa có cấu hình tính giá.</td></tr>';poRows.innerHTML=(ws.purchase_orders||[]).map(p=>`<tr><td>${esc(p.po_number)}</td><td>${esc(p.supplier_name||'')}</td><td>${esc(p.order_date||'')}</td><td class="num">${money(p.total_amount)}</td><td><span class="status">${esc(p.status)}</span></td></tr>`).join('')||'<tr><td colspan="5" class="empty">Chưa có đơn mua hàng mở.</td></tr>';historyRows.innerHTML=state.history.map(h=>`<tr><td>${esc(h.transaction_date)}</td><td>${esc(h.material_code||h.code)}</td><td>${esc(h.material_name||h.name)}</td><td>${esc(h.transaction_type)}</td><td class="num">${money(h.quantity)}</td><td>${esc(h.project_code||'')} ${esc(h.project_name||'')}</td><td>${esc(h.notes)}</td></tr>`).join('')||'<tr><td colspan="7" class="empty">Chưa có giao dịch kho.</td></tr>';document.querySelectorAll('[data-po-alert]').forEach(btn=>btn.addEventListener('click',async()=>{try{const alert=JSON.parse(btn.dataset.poAlert);await api('/api/purchase-orders/from-alert',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(alert)});await loadInventory();toast('Đã tạo đơn mua hàng nháp')}catch(err){toast(err.message)}}))}
     function renderProjects(){projectRows.innerHTML=state.projects.map(p=>`<tr><td>${esc(p.code)}</td><td>${esc(p.name)}</td><td>${esc(p.location)}</td><td class="num">${money(p.budget)}</td><td><span class="status">${esc(p.status)}</span></td></tr>`).join('')||'<tr><td colspan="5" class="empty">Chưa có dự án.</td></tr>'}
     function renderProjectAccounting(){const pa=state.projectAccounting||{},d=pa.dashboard||{};paActive.textContent=d.active_projects||0;paPlanned.textContent=money(d.total_planned);paSpent.textContent=money(d.total_spent);paRevenue.textContent=money(d.total_revenue);paProfit.textContent=money(d.profit);fillContractSelects();const q=(contractSearch.value||'').toLowerCase();const contracts=(pa.contracts||[]).filter(c=>JSON.stringify(c).toLowerCase().includes(q));contractRows.innerHTML=contracts.map(c=>`<tr><td>${esc(c.project_code)} ${esc(c.project_name)}</td><td>${esc(c.contract_type)}</td><td>${esc(c.contract_no)}</td><td>${esc(c.partner_name)}</td><td class="num">${money(c.contract_value)}</td><td class="num">${money(c.billed)}</td><td><span class="status">${esc(c.status)}</span></td></tr>`).join('')||'<tr><td colspan="7" class="empty">Chưa có hợp đồng.</td></tr>';billingRows.innerHTML=(pa.billings||[]).map(b=>`<tr><td>${esc(b.billing_date)}</td><td>${esc(b.contract_no)}</td><td>${esc(b.milestone_name)}</td><td class="num">${money(b.net_amount)}</td><td><span class="status">${esc(b.status)}</span></td></tr>`).join('')||'<tr><td colspan="5" class="empty">Chưa có nghiệm thu.</td></tr>';revenueRows.innerHTML=(pa.revenues||[]).map(r=>`<tr><td>${esc(r.revenue_date)}</td><td>${esc(r.project_code)} ${esc(r.project_name)}</td><td>${esc(r.contract_no)}</td><td class="num">${money(r.amount)}</td><td class="num">${money(r.vat_amount)}</td></tr>`).join('')||'<tr><td colspan="5" class="empty">Chưa có doanh thu.</td></tr>';costPlanRows.innerHTML=(pa.cost_plan_actual||[]).map(x=>{const diff=Number(x.planned||0)-Number(x.actual||0);return `<tr><td>${esc(x.project_code)} ${esc(x.project_name)}</td><td>${esc(x.category)}</td><td class="num">${money(x.planned)}</td><td class="num">${money(x.actual)}</td><td class="num">${money(diff)}</td></tr>`}).join('')||'<tr><td colspan="5" class="empty">Chưa có dự toán.</td></tr>';projectPlRows.innerHTML=(pa.project_pl||[]).map(x=>`<tr><td>${esc(x.code)} ${esc(x.name)}</td><td class="num">${money(x.revenue)}</td><td class="num">${money(x.cost)}</td><td class="num">${money(x.profit)}</td></tr>`).join('')||'<tr><td colspan="4" class="empty">Chưa có P/L công trình.</td></tr>';const costing=pa.costing||{},cs=costing.summary||{};costingActual.textContent=money(cs.actual);costingPlanned.textContent=money(cs.planned);costingVariance.textContent=money(cs.variance);costingOverrun.textContent=cs.overrun_count||0;costingSummaryText.textContent=`Đã dùng ${pct(cs.used_percent)} dự toán · lãi gộp ${money(cs.gross_profit)}`;costingRows.innerHTML=(costing.projects||[]).map(p=>{const b=p.cost_buckets||{};return `<tr><td><strong>${esc(p.code)} ${esc(p.name)}</strong><br><span class="muted">Tiến độ ${money(p.progress)}% · dùng ${pct(p.used_percent)}</span></td><td class="num">${money(b.direct_material)}</td><td class="num">${money(b.direct_labor)}</td><td class="num">${money(b.machine)}</td><td class="num">${money(b.overhead)}</td><td class="num">${money(p.actual)}</td><td class="num">${money(p.planned)}</td><td><span class="status ${p.status==='overrun'?'low':''}">${esc(p.status)}</span></td></tr>`}).join('')||'<tr><td colspan="8" class="empty">Chưa có dữ liệu giá thành.</td></tr>'}
@@ -2753,7 +2928,7 @@ INDEX_HTML = r"""<!doctype html>
     reloadUsersBtn.addEventListener('click',()=>loadUsers());
     offlineSearch.addEventListener('input',renderOfflineData);schemaSearch.addEventListener('input',renderOfflineSchema);schemaJsonBtn.addEventListener('click',()=>{window.location.href='/api/offline-schema/export.json'});offlineReloadBtn.addEventListener('click',()=>loadOfflineData());offlineJsonBtn.addEventListener('click',()=>{window.location.href='/api/offline-data/export.json?limit_per_table=5000'});offlineCsvBtn.addEventListener('click',()=>{const t=state.offlineTable||{};if(!t.name)return toast('Chưa chọn bảng');window.location.href=`/api/offline-data/${encodeURIComponent(t.name)}.csv?limit=5000&q=${encodeURIComponent(offlineTableSearch.value||'')}`});offlinePrevBtn.addEventListener('click',()=>{const t=state.offlineTable||{};if(t.name&&Number(t.page)>1)loadOfflineTable(t.name,Number(t.page)-1)});offlineNextBtn.addEventListener('click',()=>{const t=state.offlineTable||{};if(t.name)loadOfflineTable(t.name,Number(t.page||1)+1)});offlineTableSearch.addEventListener('change',()=>{const t=state.offlineTable||{};if(t.name)loadOfflineTable(t.name,1)});
     reportMonth.value=new Date().toISOString().slice(0,7);reportMonth.addEventListener('change',()=>loadReports());csvExportBtn.addEventListener('click',()=>{window.location.href=`/api/export/monthly-report.csv?month=${encodeURIComponent(reportMonth.value)}`});sheetsExportBtn.addEventListener('click',async()=>{try{const r=await api('/api/export/sheets',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({month:reportMonth.value})});toast(r.url?'Đã xuất Google Sheets':'Đã gửi yêu cầu xuất')}catch(err){toast(err.message)}});
-    expenseSearch.addEventListener('input',renderExpenses);inventorySearch.addEventListener('input',renderInventory);reloadInventoryWorkspaceBtn.addEventListener('click',()=>loadInventory());contractSearch.addEventListener('input',renderProjectAccounting);documentSearch.addEventListener('input',renderDocuments);formSearch.addEventListener('input',renderForms);accountSearch.addEventListener('input',renderAccounting);journalSearch.addEventListener('input',renderAccounting);financeSearch.addEventListener('input',renderFinance);
+    expenseSearch.addEventListener('input',renderExpenses);reloadApprovalsBtn.addEventListener('click',()=>loadApprovals());inventorySearch.addEventListener('input',renderInventory);reloadInventoryWorkspaceBtn.addEventListener('click',()=>loadInventory());contractSearch.addEventListener('input',renderProjectAccounting);documentSearch.addEventListener('input',renderDocuments);formSearch.addEventListener('input',renderForms);accountSearch.addEventListener('input',renderAccounting);journalSearch.addEventListener('input',renderAccounting);financeSearch.addEventListener('input',renderFinance);
     expenseForm.expense_date.value=new Date().toISOString().slice(0,10);
     diaryForm.diary_date.value=new Date().toISOString().slice(0,10);
     documentForm.doc_date.value=new Date().toISOString().slice(0,10);
@@ -2761,7 +2936,7 @@ INDEX_HTML = r"""<!doctype html>
     billingForm.billing_date.value=new Date().toISOString().slice(0,10);
     revenueForm.revenue_date.value=new Date().toISOString().slice(0,10);
     bankForm.transaction_date.value=new Date().toISOString().slice(0,10);
-    expenseForm.addEventListener('submit',async e=>{e.preventDefault();const data=Object.fromEntries(new FormData(expenseForm).entries());try{await api('/api/expenses',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});expenseForm.reset();expenseForm.expense_date.value=new Date().toISOString().slice(0,10);await Promise.all([loadDashboard(),loadExpenses()]);toast('Đã lưu chi phí')}catch(err){toast(err.message)}});
+    expenseForm.addEventListener('submit',async e=>{e.preventDefault();const data=Object.fromEntries(new FormData(expenseForm).entries());try{await api('/api/expenses',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});expenseForm.reset();expenseForm.expense_date.value=new Date().toISOString().slice(0,10);await Promise.all([loadDashboard(),loadExpenses(),loadApprovals()]);toast('Đã đưa chi phí vào hàng chờ duyệt')}catch(err){toast(err.message)}});
     inventoryTransactionForm.addEventListener('submit',async e=>{e.preventDefault();const data=Object.fromEntries(new FormData(inventoryTransactionForm).entries());try{await api('/api/inventory/transactions',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});inventoryTransactionForm.reset();await Promise.all([loadDashboard(),loadInventory(),loadAccounting()]);toast('Đã ghi phiếu kho')}catch(err){toast(err.message)}});
     materialStandardForm.addEventListener('submit',async e=>{e.preventDefault();const data=Object.fromEntries(new FormData(materialStandardForm).entries());try{await api('/api/material-standards',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});materialStandardForm.reset();materialStandardForm.basis_unit.value='m2';materialStandardForm.tolerance_percent.value='15';await loadInventory();toast('Đã lưu định mức vật tư')}catch(err){toast(err.message)}});
     projectForm.addEventListener('submit',async e=>{e.preventDefault();const data=Object.fromEntries(new FormData(projectForm).entries());try{await api('/api/projects',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});projectForm.reset();await Promise.all([loadCatalogs(),loadDashboard()]);toast('Đã lưu dự án')}catch(err){toast(err.message)}});
