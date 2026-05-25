@@ -34,7 +34,6 @@ from modules.construction import ConstructionManager
 from modules.controls import ApprovalThresholdManager, AuditLogManager
 from modules.fiscal_lock import FiscalPeriodLockManager
 from modules.invoices import DocumentManager
-from modules.material_controls import MaterialControlManager
 from modules.materials import MaterialManager
 from modules.notification_center import NotificationCenter
 from modules.project_accounting import ProjectAccountingManager
@@ -292,6 +291,32 @@ def inventory_workspace_snapshot() -> dict[str, Any]:
             {"code": "periodic_average", "name": "Binh quan cuoi ky", "status": "planned"},
         ],
     }
+
+
+def save_material_standard_web(
+    material_id: int,
+    work_item_id: int | None = None,
+    basis_unit: str = "m2",
+    standard_qty_per_unit: float = 0,
+    tolerance_percent: float = 15,
+    notes: str = "",
+) -> None:
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        INSERT INTO material_standards
+        (work_item_id, material_id, basis_unit, standard_qty_per_unit, tolerance_percent, notes, active)
+        VALUES (?, ?, ?, ?, ?, ?, 1)
+        ON CONFLICT(work_item_id, material_id, basis_unit) DO UPDATE SET
+            standard_qty_per_unit = excluded.standard_qty_per_unit,
+            tolerance_percent = excluded.tolerance_percent,
+            notes = excluded.notes,
+            active = 1
+        """,
+        (work_item_id, material_id, basis_unit, standard_qty_per_unit, tolerance_percent, notes),
+    )
+    conn.commit()
 
 
 def offline_schema_snapshot() -> dict[str, Any]:
@@ -1498,7 +1523,7 @@ def create_app():
     @api_error
     def create_material_standard():
         data = request.get_json(force=True)
-        MaterialControlManager().save_standard(
+        save_material_standard_web(
             int(data["material_id"]),
             int(data["work_item_id"]) if data.get("work_item_id") else None,
             data.get("basis_unit") or "m2",
