@@ -2062,6 +2062,24 @@ def create_app():
         )
         return jsonify([row_to_dict(row, keys) for row in ConstructionManager().get_work_items()])
 
+    @app.post("/api/construction/work-items")
+    @api_error
+    def create_construction_work_item():
+        data = request.get_json(force=True)
+        item_id = ConstructionManager().add_work_item(
+            data.get("project_id") or None,
+            data.get("item_code", ""),
+            data.get("item_name", ""),
+            data.get("unit", ""),
+            float(data.get("planned_quantity") or 0),
+            float(data.get("completed_quantity") or 0),
+            float(data.get("unit_price") or 0),
+            data.get("status", "planned"),
+            data.get("notes", ""),
+        )
+        AuditLogManager().log("construction_work_item", item_id, "created", session.get("user_id"), new_value=data)
+        return jsonify({"id": item_id, "status": "created"})
+
     @app.post("/api/construction/work-items/<int:work_item_id>/progress")
     @api_error
     def update_construction_work_item_progress(work_item_id):
@@ -2839,6 +2857,21 @@ INDEX_HTML = r"""<!doctype html>
           <div class="tablewrap"><table><thead><tr><th>Dự án</th><th>Mã HM</th><th>Hạng mục</th><th>KL KH</th><th>Hoàn thành</th><th>Chi phí thực tế</th><th>TT</th></tr></thead><tbody id="workRows"></tbody></table></div>
         </div>
         <div class="card">
+          <h3>Tạo hạng mục công trường</h3>
+          <form class="form" id="workItemForm">
+            <label>Dự án<select name="project_id" id="workItemProject" required></select></label>
+            <label>Mã hạng mục<input name="item_code" placeholder="VD: HM-01"></label>
+            <label>Tên hạng mục<input name="item_name" required placeholder="VD: Móng, cột, dầm sàn"></label>
+            <label>Đơn vị<input name="unit" placeholder="m3, m2, tấn"></label>
+            <label>Khối lượng kế hoạch<input name="planned_quantity" type="number" min="0" step="0.01"></label>
+            <label>Khối lượng đã làm<input name="completed_quantity" type="number" min="0" step="0.01"></label>
+            <label>Đơn giá dự toán<input name="unit_price" type="number" min="0" step="1000"></label>
+            <label>Trạng thái<select name="status"><option value="planned">Kế hoạch</option><option value="in_progress">Đang thi công</option><option value="completed">Hoàn thành</option><option value="paused">Tạm dừng</option></select></label>
+            <label class="wide">Ghi chú<textarea name="notes"></textarea></label>
+            <div class="wide actions"><button class="primary" type="submit">Tạo hạng mục</button></div>
+          </form>
+        </div>
+        <div class="card">
           <h3>Cập nhật tiến độ hạng mục</h3>
           <form class="form" id="workProgressForm">
             <label>Hạng mục<select name="work_item_id" id="progressWorkItem" required></select></label>
@@ -3118,7 +3151,7 @@ INDEX_HTML = r"""<!doctype html>
     async function loadFinance(){state.finance=await api('/api/finance-center');renderFinance()}
     async function loadSettings(){state.settings=await api('/api/settings');renderSettings()}
     async function loadUsers(){try{state.users=await api('/api/users');renderUsers()}catch(err){state.users=[];renderUsers(err.message)}}
-    function fillSelects(){const projectOptions='<option value="">Không gắn dự án</option>'+state.projects.map(p=>`<option value="${p.id}">${esc(p.code)} - ${esc(p.name)}</option>`).join('');const requiredProjectOptions=state.projects.map(p=>`<option value="${p.id}">${esc(p.code)} - ${esc(p.name)}</option>`).join('');const categoryOptions=state.categories.map(c=>`<option value="${c.id}">${esc(c.code)} - ${esc(c.name)}</option>`).join('');expenseProject.innerHTML=projectOptions;diaryProject.innerHTML=projectOptions;siteProject.innerHTML=projectOptions;documentProject.innerHTML=projectOptions;contractProject.innerHTML=requiredProjectOptions;costPlanProject.innerHTML=requiredProjectOptions;revenueProject.innerHTML=requiredProjectOptions;expenseCategory.innerHTML=categoryOptions;documentCategory.innerHTML='<option value="">Chọn danh mục</option>'+categoryOptions;costPlanCategory.innerHTML=categoryOptions;fillContractSelects()}
+    function fillSelects(){const projectOptions='<option value="">Không gắn dự án</option>'+state.projects.map(p=>`<option value="${p.id}">${esc(p.code)} - ${esc(p.name)}</option>`).join('');const requiredProjectOptions=state.projects.map(p=>`<option value="${p.id}">${esc(p.code)} - ${esc(p.name)}</option>`).join('');const categoryOptions=state.categories.map(c=>`<option value="${c.id}">${esc(c.code)} - ${esc(c.name)}</option>`).join('');expenseProject.innerHTML=projectOptions;diaryProject.innerHTML=projectOptions;siteProject.innerHTML=projectOptions;documentProject.innerHTML=projectOptions;contractProject.innerHTML=requiredProjectOptions;costPlanProject.innerHTML=requiredProjectOptions;revenueProject.innerHTML=requiredProjectOptions;if(typeof workItemProject!=='undefined')workItemProject.innerHTML=requiredProjectOptions;expenseCategory.innerHTML=categoryOptions;documentCategory.innerHTML='<option value="">Chọn danh mục</option>'+categoryOptions;costPlanCategory.innerHTML=categoryOptions;fillContractSelects()}
     function fillInventorySelects(){const ws=state.inventoryWorkspace||{};const mats=(ws.materials||state.inventory||[]);const work=(ws.work_items||state.workItems||[]);const matOptions='<option value="">Chọn vật tư</option>'+mats.map(m=>`<option value="${m.id}">${esc(m.code)} - ${esc(m.name)} (${money(m.quantity)} ${esc(m.unit||'')})</option>`).join('');const projectOptions='<option value="">Kho chung</option>'+state.projects.map(p=>`<option value="${p.id}">${esc(p.code)} - ${esc(p.name)}</option>`).join('');const workOptions='<option value="">Không gắn hạng mục</option>'+work.map(w=>`<option value="${w.id}">${esc(w.project_code)} · ${esc(w.item_code)} ${esc(w.item_name)}</option>`).join('');const progressOptions='<option value="">Chọn hạng mục</option>'+work.map(w=>`<option value="${w.id}" data-planned="${Number(w.planned_quantity||0)}" data-completed="${Number(w.completed_quantity||0)}" data-percent="${Number(w.percent_complete||0)}">${esc(w.project_code)} · ${esc(w.item_code)} ${esc(w.item_name)} (${money(w.percent_complete)}%)</option>`).join('');if(typeof inventoryMaterialSelect!=='undefined'){inventoryMaterialSelect.innerHTML=matOptions;standardMaterialSelect.innerHTML=matOptions;inventoryProjectSelect.innerHTML=projectOptions;inventoryWorkItemSelect.innerHTML=workOptions;standardWorkItemSelect.innerHTML=workOptions}if(typeof siteReceiptMaterial!=='undefined')siteReceiptMaterial.innerHTML=matOptions;if(typeof progressWorkItem!=='undefined')progressWorkItem.innerHTML=progressOptions}
     function fillContractSelects(){const rows=(state.projectAccounting&&state.projectAccounting.contracts)||[];const options='<option value="">Chọn hợp đồng</option>'+rows.map(c=>`<option value="${c.id}">${esc(c.contract_no)} - ${esc(c.partner_name)}</option>`).join('');if(typeof billingContract!=='undefined'){billingContract.innerHTML=options;revenueContract.innerHTML=options}}
     function renderOfflineData(){const d=state.offlineData||{},s=d.summary||{};odTables.textContent=s.table_count||0;odActiveTables.textContent=s.active_table_count||0;odRecords.textContent=money(s.record_count);const q=(offlineSearch.value||'').toLowerCase();const tables=(d.tables||[]).filter(t=>JSON.stringify(t).toLowerCase().includes(q));offlineTableRows.innerHTML=tables.map(t=>`<tr><td><strong>${esc(t.label)}</strong></td><td>${esc(t.name)}</td><td class="num">${money(t.count)}</td><td><button class="secondary" type="button" data-offline-table="${esc(t.name)}">Xem</button></td></tr>`).join('')||'<tr><td colspan="4" class="empty">Chưa có dữ liệu.</td></tr>';document.querySelectorAll('[data-offline-table]').forEach(btn=>btn.addEventListener('click',()=>{offlineTableSearch.value='';loadOfflineTable(btn.dataset.offlineTable)}));if(!state.offlineTable&&tables.length){loadOfflineTable(tables.find(t=>t.count)?.name||tables[0].name)}}
@@ -3168,6 +3201,7 @@ INDEX_HTML = r"""<!doctype html>
     costPlanForm.addEventListener('submit',async e=>{e.preventDefault();const data=Object.fromEntries(new FormData(costPlanForm).entries());try{await api('/api/project-accounting/cost-plans',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});costPlanForm.reset();await loadProjectAccounting();toast('Đã lưu dự toán')}catch(err){toast(err.message)}});
     billingForm.addEventListener('submit',async e=>{e.preventDefault();const data=Object.fromEntries(new FormData(billingForm).entries());try{await api('/api/project-accounting/billings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});billingForm.reset();billingForm.vat_rate.value='10';billingForm.retention_rate.value='5';billingForm.billing_date.value=new Date().toISOString().slice(0,10);await Promise.all([loadProjectAccounting(),loadFinance()]);toast('Đã lưu nghiệm thu')}catch(err){toast(err.message)}});
     revenueForm.addEventListener('submit',async e=>{e.preventDefault();const data=Object.fromEntries(new FormData(revenueForm).entries());try{await api('/api/project-accounting/revenues',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});revenueForm.reset();revenueForm.revenue_date.value=new Date().toISOString().slice(0,10);await Promise.all([loadProjectAccounting(),loadFinance()]);toast('Đã lưu doanh thu')}catch(err){toast(err.message)}});
+    workItemForm.addEventListener('submit',async e=>{e.preventDefault();const data=Object.fromEntries(new FormData(workItemForm).entries());try{await api('/api/construction/work-items',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});workItemForm.reset();await Promise.all([loadConstruction(),loadInventory(),loadDashboard(),loadProjectAccounting()]);toast('Đã tạo hạng mục công trường')}catch(err){toast(err.message)}});
     progressWorkItem.addEventListener('change',()=>{const o=progressWorkItem.selectedOptions[0];if(!o)return;workProgressForm.completed_quantity.value=o.dataset.completed||'';workProgressForm.percent_complete.value=o.dataset.percent||''});
     workProgressForm.addEventListener('submit',async e=>{e.preventDefault();const data=Object.fromEntries(new FormData(workProgressForm).entries()),workItemId=data.work_item_id;delete data.work_item_id;try{await api(`/api/construction/work-items/${workItemId}/progress`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});workProgressForm.reset();await Promise.all([loadConstruction(),loadInventory(),loadDashboard(),loadProjectAccounting()]);toast('Đã cập nhật tiến độ hạng mục')}catch(err){toast(err.message)}});
     diaryForm.addEventListener('submit',async e=>{e.preventDefault();const data=Object.fromEntries(new FormData(diaryForm).entries());try{await api('/api/construction/diaries',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});diaryForm.reset();diaryForm.diary_date.value=new Date().toISOString().slice(0,10);await loadConstruction();toast('Đã lưu nhật ký')}catch(err){toast(err.message)}});
