@@ -319,6 +319,91 @@ def save_material_standard_web(
     conn.commit()
 
 
+def project_costing_snapshot(project_id: int | None = None) -> dict[str, Any]:
+    conn = get_connection()
+    cursor = conn.cursor()
+    params: list[Any] = []
+    where = "WHERE p.code != 'CHUNG'"
+    if project_id:
+        where += " AND p.id = ?"
+        params.append(project_id)
+    cursor.execute(
+        f"""
+        SELECT p.id, p.code, p.name, COALESCE(p.budget, 0) AS project_budget,
+               COALESCE((SELECT SUM(planned_amount) FROM project_cost_plans cp WHERE cp.project_id = p.id), 0) AS planned_total,
+               COALESCE((SELECT SUM(amount) FROM project_revenues r WHERE r.project_id = p.id), 0) AS revenue_total,
+               COALESCE((SELECT SUM(amount) FROM expenses e WHERE e.project_id = p.id), 0) AS expense_total,
+               COALESCE((SELECT SUM(it.quantity * COALESCE(m.average_cost, m.unit_price, 0))
+                         FROM inventory_transactions it
+                         JOIN materials m ON m.id = it.material_id
+                         WHERE it.project_id = p.id AND it.transaction_type = 'export'), 0) AS material_cost,
+               COALESCE((SELECT SUM((COALESCE(work_days, 0) * COALESCE(daily_rate, 0))
+                                  + (COALESCE(quantity_completed, 0) * COALESCE(piece_rate, 0)))
+                         FROM timesheets t WHERE t.project_id = p.id), 0) AS labor_cost,
+               COALESCE((SELECT SUM(COALESCE(fuel_cost, 0)) FROM equipment_usage eu WHERE eu.project_id = p.id), 0) AS machine_cost,
+               COALESCE((SELECT AVG(COALESCE(percent_complete, 0)) FROM construction_work_items w WHERE w.project_id = p.id), 0) AS progress
+        FROM projects p
+        {where}
+        ORDER BY p.code
+        """,
+        params,
+    )
+    projects = []
+    totals = {
+        "planned": 0.0,
+        "actual": 0.0,
+        "revenue": 0.0,
+        "variance": 0.0,
+        "overrun_count": 0,
+    }
+    for row in cursor.fetchall():
+        data = row_to_dict(row)
+        material = float(data["material_cost"] or 0)
+        labor = float(data["labor_cost"] or 0)
+        machine = float(data["machine_cost"] or 0)
+        expense_total = float(data["expense_total"] or 0)
+        direct_known = material + labor + machine
+        overhead = max(0.0, expense_total - direct_known)
+        actual = direct_known + overhead
+        planned = float(data["planned_total"] or data["project_budget"] or 0)
+        variance = planned - actual
+        used_percent = (actual / planned * 100) if planned else 0
+        revenue = float(data["revenue_total"] or 0)
+        gross_profit = revenue - actual
+        status = "overrun" if planned and actual > planned else "watch" if planned and used_percent >= 85 else "ok"
+        if status == "overrun":
+            totals["overrun_count"] += 1
+        totals["planned"] += planned
+        totals["actual"] += actual
+        totals["revenue"] += revenue
+        totals["variance"] += variance
+        projects.append(
+            {
+                "id": data["id"],
+                "code": data["code"],
+                "name": data["name"],
+                "budget": float(data["project_budget"] or 0),
+                "planned": planned,
+                "actual": actual,
+                "variance": variance,
+                "used_percent": used_percent,
+                "revenue": revenue,
+                "gross_profit": gross_profit,
+                "progress": float(data["progress"] or 0),
+                "status": status,
+                "cost_buckets": {
+                    "direct_material": material,
+                    "direct_labor": labor,
+                    "machine": machine,
+                    "overhead": overhead,
+                },
+            }
+        )
+    totals["gross_profit"] = totals["revenue"] - totals["actual"]
+    totals["used_percent"] = (totals["actual"] / totals["planned"] * 100) if totals["planned"] else 0
+    return {"summary": totals, "projects": projects}
+
+
 def offline_schema_snapshot() -> dict[str, Any]:
     conn = get_connection()
     cursor = conn.cursor()
@@ -2004,6 +2089,7 @@ def create_app():
                     for row in mgr.get_cost_plan_vs_actual_report(project_id=project_id)
                 ],
                 "project_pl": mgr.get_project_pl_report(project_id=project_id),
+                "costing": project_costing_snapshot(int(project_id) if project_id else None),
                 "contract_progress": [
                     row_to_named_dict(
                         row,
@@ -2354,6 +2440,16 @@ INDEX_HTML = r"""<!doctype html>
           <div class="card"><h3>Dự toán vs thực tế</h3><div class="tablewrap"><table><thead><tr><th>Dự án</th><th>Danh mục</th><th>Dự toán</th><th>Thực tế</th><th>Chênh lệch</th></tr></thead><tbody id="costPlanRows"></tbody></table></div></div>
           <div class="card"><h3>P/L công trình</h3><div class="tablewrap"><table><thead><tr><th>Dự án</th><th>Doanh thu</th><th>Chi phí</th><th>Lãi/lỗ</th></tr></thead><tbody id="projectPlRows"></tbody></table></div></div>
         </div>
+        <div class="grid kpis">
+          <div class="card kpi"><div class="label">Giá thành tập hợp</div><div class="value" id="costingActual">0</div></div>
+          <div class="card kpi"><div class="label">Dự toán giá thành</div><div class="value" id="costingPlanned">0</div></div>
+          <div class="card kpi"><div class="label">Chênh lệch</div><div class="value" id="costingVariance">0</div></div>
+          <div class="card kpi"><div class="label">Công trình vượt</div><div class="value" id="costingOverrun">0</div></div>
+        </div>
+        <div class="card">
+          <div class="toolbar"><h3>Giá thành đích danh theo công trình</h3><span class="muted" id="costingSummaryText"></span></div>
+          <div class="tablewrap"><table><thead><tr><th>Công trình</th><th>NVL trực tiếp</th><th>Nhân công</th><th>Máy thi công</th><th>Chi phí chung</th><th>Tổng giá thành</th><th>Dự toán</th><th>Cảnh báo</th></tr></thead><tbody id="costingRows"></tbody></table></div>
+        </div>
       </section>
 
       <section class="view" id="construction">
@@ -2638,7 +2734,7 @@ INDEX_HTML = r"""<!doctype html>
     function renderExpenses(){const q=(expenseSearch.value||'').toLowerCase();const rows=state.expenses.filter(e=>JSON.stringify(e).toLowerCase().includes(q));expenseRows.innerHTML=rows.map(e=>`<tr><td>${esc(e.expense_date)}</td><td>${esc(e.project_name||'')}</td><td>${esc(e.category_name||'')}</td><td>${esc(e.description||'')}</td><td class="num">${money(e.amount)}</td><td><span class="status">${esc(e.status)}</span></td></tr>`).join('')||'<tr><td colspan="6" class="empty">Chưa có chi phí.</td></tr>'}
     function renderInventory(){const ws=state.inventoryWorkspace||{},sum=ws.summary||{};if(typeof invStockValue!=='undefined'){invStockValue.textContent=money(sum.stock_value);invMaterialCount.textContent=sum.material_count||0;invSmartAlerts.textContent=sum.smart_alert_count||0;invStandardCount.textContent=sum.standard_count||0}const q=(inventorySearch.value||'').toLowerCase();const rows=state.inventory.filter(i=>JSON.stringify(i).toLowerCase().includes(q));inventoryRows.innerHTML=rows.map(i=>`<tr><td>${esc(i.code)}</td><td>${esc(i.name)}</td><td>${esc(i.category)}</td><td class="num">${money(i.quantity)} ${esc(i.unit)}</td><td class="num">${money(i.average_cost||i.unit_price)}</td><td class="num">${money(i.min_quantity||0)}</td><td><span class="status ${Number(i.quantity||0)<=Number(i.min_quantity||0)&&Number(i.min_quantity||0)>0?'low':''}">${esc(i.status)}</span></td></tr>`).join('')||'<tr><td colspan="7" class="empty">Chưa có vật tư.</td></tr>';smartStockRows.innerHTML=(ws.alerts||[]).map(a=>`<tr><td><span class="status ${a.priority==='critical'?'low':''}">${esc(a.priority||'warning')}</span></td><td><strong>${esc(a.project_code||'Kho')}</strong> ${esc(a.project_name||'')}<br><span class="muted">${esc(a.item_code||'')} ${esc(a.item_name||'')}</span></td><td>${esc(a.material_code||a.code||'')} ${esc(a.material_name||a.name||'')}</td><td class="num">${money(a.needed_qty||a.min_quantity)} ${esc(a.unit||'')}</td><td class="num">${money(a.available_qty??a.quantity)} ${esc(a.unit||'')}</td><td class="num">${money(a.shortage_qty)} ${esc(a.unit||'')}</td><td><button class="secondary" type="button" data-po-alert='${esc(JSON.stringify(a))}'>${esc(a.suggestion||'Tạo PO')}</button></td></tr>`).join('')||'<tr><td colspan="7" class="empty">Không có cảnh báo vật tư.</td></tr>';valuationRows.innerHTML=(ws.valuation_methods||[]).map(v=>`<tr><td>${esc(v.code)}</td><td>${esc(v.name)}</td><td><span class="status ${v.status==='planned'?'low':''}">${esc(v.status)}</span></td></tr>`).join('')||'<tr><td colspan="3" class="empty">Chưa có cấu hình tính giá.</td></tr>';poRows.innerHTML=(ws.purchase_orders||[]).map(p=>`<tr><td>${esc(p.po_number)}</td><td>${esc(p.supplier_name||'')}</td><td>${esc(p.order_date||'')}</td><td class="num">${money(p.total_amount)}</td><td><span class="status">${esc(p.status)}</span></td></tr>`).join('')||'<tr><td colspan="5" class="empty">Chưa có đơn mua hàng mở.</td></tr>';historyRows.innerHTML=state.history.map(h=>`<tr><td>${esc(h.transaction_date)}</td><td>${esc(h.material_code||h.code)}</td><td>${esc(h.material_name||h.name)}</td><td>${esc(h.transaction_type)}</td><td class="num">${money(h.quantity)}</td><td>${esc(h.project_code||'')} ${esc(h.project_name||'')}</td><td>${esc(h.notes)}</td></tr>`).join('')||'<tr><td colspan="7" class="empty">Chưa có giao dịch kho.</td></tr>';document.querySelectorAll('[data-po-alert]').forEach(btn=>btn.addEventListener('click',async()=>{try{const alert=JSON.parse(btn.dataset.poAlert);await api('/api/purchase-orders/from-alert',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(alert)});await loadInventory();toast('Đã tạo đơn mua hàng nháp')}catch(err){toast(err.message)}}))}
     function renderProjects(){projectRows.innerHTML=state.projects.map(p=>`<tr><td>${esc(p.code)}</td><td>${esc(p.name)}</td><td>${esc(p.location)}</td><td class="num">${money(p.budget)}</td><td><span class="status">${esc(p.status)}</span></td></tr>`).join('')||'<tr><td colspan="5" class="empty">Chưa có dự án.</td></tr>'}
-    function renderProjectAccounting(){const pa=state.projectAccounting||{},d=pa.dashboard||{};paActive.textContent=d.active_projects||0;paPlanned.textContent=money(d.total_planned);paSpent.textContent=money(d.total_spent);paRevenue.textContent=money(d.total_revenue);paProfit.textContent=money(d.profit);fillContractSelects();const q=(contractSearch.value||'').toLowerCase();const contracts=(pa.contracts||[]).filter(c=>JSON.stringify(c).toLowerCase().includes(q));contractRows.innerHTML=contracts.map(c=>`<tr><td>${esc(c.project_code)} ${esc(c.project_name)}</td><td>${esc(c.contract_type)}</td><td>${esc(c.contract_no)}</td><td>${esc(c.partner_name)}</td><td class="num">${money(c.contract_value)}</td><td class="num">${money(c.billed)}</td><td><span class="status">${esc(c.status)}</span></td></tr>`).join('')||'<tr><td colspan="7" class="empty">Chưa có hợp đồng.</td></tr>';billingRows.innerHTML=(pa.billings||[]).map(b=>`<tr><td>${esc(b.billing_date)}</td><td>${esc(b.contract_no)}</td><td>${esc(b.milestone_name)}</td><td class="num">${money(b.net_amount)}</td><td><span class="status">${esc(b.status)}</span></td></tr>`).join('')||'<tr><td colspan="5" class="empty">Chưa có nghiệm thu.</td></tr>';revenueRows.innerHTML=(pa.revenues||[]).map(r=>`<tr><td>${esc(r.revenue_date)}</td><td>${esc(r.project_code)} ${esc(r.project_name)}</td><td>${esc(r.contract_no)}</td><td class="num">${money(r.amount)}</td><td class="num">${money(r.vat_amount)}</td></tr>`).join('')||'<tr><td colspan="5" class="empty">Chưa có doanh thu.</td></tr>';costPlanRows.innerHTML=(pa.cost_plan_actual||[]).map(x=>{const diff=Number(x.planned||0)-Number(x.actual||0);return `<tr><td>${esc(x.project_code)} ${esc(x.project_name)}</td><td>${esc(x.category)}</td><td class="num">${money(x.planned)}</td><td class="num">${money(x.actual)}</td><td class="num">${money(diff)}</td></tr>`}).join('')||'<tr><td colspan="5" class="empty">Chưa có dự toán.</td></tr>';projectPlRows.innerHTML=(pa.project_pl||[]).map(x=>`<tr><td>${esc(x.code)} ${esc(x.name)}</td><td class="num">${money(x.revenue)}</td><td class="num">${money(x.cost)}</td><td class="num">${money(x.profit)}</td></tr>`).join('')||'<tr><td colspan="4" class="empty">Chưa có P/L công trình.</td></tr>'}
+    function renderProjectAccounting(){const pa=state.projectAccounting||{},d=pa.dashboard||{};paActive.textContent=d.active_projects||0;paPlanned.textContent=money(d.total_planned);paSpent.textContent=money(d.total_spent);paRevenue.textContent=money(d.total_revenue);paProfit.textContent=money(d.profit);fillContractSelects();const q=(contractSearch.value||'').toLowerCase();const contracts=(pa.contracts||[]).filter(c=>JSON.stringify(c).toLowerCase().includes(q));contractRows.innerHTML=contracts.map(c=>`<tr><td>${esc(c.project_code)} ${esc(c.project_name)}</td><td>${esc(c.contract_type)}</td><td>${esc(c.contract_no)}</td><td>${esc(c.partner_name)}</td><td class="num">${money(c.contract_value)}</td><td class="num">${money(c.billed)}</td><td><span class="status">${esc(c.status)}</span></td></tr>`).join('')||'<tr><td colspan="7" class="empty">Chưa có hợp đồng.</td></tr>';billingRows.innerHTML=(pa.billings||[]).map(b=>`<tr><td>${esc(b.billing_date)}</td><td>${esc(b.contract_no)}</td><td>${esc(b.milestone_name)}</td><td class="num">${money(b.net_amount)}</td><td><span class="status">${esc(b.status)}</span></td></tr>`).join('')||'<tr><td colspan="5" class="empty">Chưa có nghiệm thu.</td></tr>';revenueRows.innerHTML=(pa.revenues||[]).map(r=>`<tr><td>${esc(r.revenue_date)}</td><td>${esc(r.project_code)} ${esc(r.project_name)}</td><td>${esc(r.contract_no)}</td><td class="num">${money(r.amount)}</td><td class="num">${money(r.vat_amount)}</td></tr>`).join('')||'<tr><td colspan="5" class="empty">Chưa có doanh thu.</td></tr>';costPlanRows.innerHTML=(pa.cost_plan_actual||[]).map(x=>{const diff=Number(x.planned||0)-Number(x.actual||0);return `<tr><td>${esc(x.project_code)} ${esc(x.project_name)}</td><td>${esc(x.category)}</td><td class="num">${money(x.planned)}</td><td class="num">${money(x.actual)}</td><td class="num">${money(diff)}</td></tr>`}).join('')||'<tr><td colspan="5" class="empty">Chưa có dự toán.</td></tr>';projectPlRows.innerHTML=(pa.project_pl||[]).map(x=>`<tr><td>${esc(x.code)} ${esc(x.name)}</td><td class="num">${money(x.revenue)}</td><td class="num">${money(x.cost)}</td><td class="num">${money(x.profit)}</td></tr>`).join('')||'<tr><td colspan="4" class="empty">Chưa có P/L công trình.</td></tr>';const costing=pa.costing||{},cs=costing.summary||{};costingActual.textContent=money(cs.actual);costingPlanned.textContent=money(cs.planned);costingVariance.textContent=money(cs.variance);costingOverrun.textContent=cs.overrun_count||0;costingSummaryText.textContent=`Đã dùng ${pct(cs.used_percent)} dự toán · lãi gộp ${money(cs.gross_profit)}`;costingRows.innerHTML=(costing.projects||[]).map(p=>{const b=p.cost_buckets||{};return `<tr><td><strong>${esc(p.code)} ${esc(p.name)}</strong><br><span class="muted">Tiến độ ${money(p.progress)}% · dùng ${pct(p.used_percent)}</span></td><td class="num">${money(b.direct_material)}</td><td class="num">${money(b.direct_labor)}</td><td class="num">${money(b.machine)}</td><td class="num">${money(b.overhead)}</td><td class="num">${money(p.actual)}</td><td class="num">${money(p.planned)}</td><td><span class="status ${p.status==='overrun'?'low':''}">${esc(p.status)}</span></td></tr>`}).join('')||'<tr><td colspan="8" class="empty">Chưa có dữ liệu giá thành.</td></tr>'}
     function renderConstruction(){workRows.innerHTML=state.workItems.map(w=>`<tr><td>${esc(w.project_code)} ${esc(w.project_name)}</td><td>${esc(w.item_code)}</td><td>${esc(w.item_name)}</td><td class="num">${money(w.planned_quantity)} ${esc(w.unit)}</td><td class="num">${money(w.percent_complete)}%</td><td class="num">${money(w.actual_expense)}</td><td><span class="status">${esc(w.status)}</span></td></tr>`).join('')||'<tr><td colspan="7" class="empty">Chưa có hạng mục.</td></tr>';diaryRows.innerHTML=state.diaries.map(d=>`<tr><td>${esc(d.diary_date)}</td><td>${esc(d.project_code)} ${esc(d.project_name)}</td><td>${esc(d.weather)}</td><td>${esc(d.work_content)}</td><td>${esc(d.reporter)}</td></tr>`).join('')||'<tr><td colspan="5" class="empty">Chưa có nhật ký.</td></tr>'}
     function renderDocuments(){const q=(documentSearch.value||'').toLowerCase();const rows=state.documents.filter(d=>JSON.stringify(d).toLowerCase().includes(q));documentRows.innerHTML=rows.map(d=>`<tr><td>${esc(d.doc_date)}</td><td>${esc(d.doc_type)}</td><td>${esc(d.doc_number)}</td><td>${esc(d.supplier_name)}</td><td class="num">${money(d.amount)}</td><td>${esc(d.project_name)}</td><td><span class="status">${esc(d.status)}</span></td></tr>`).join('')||'<tr><td colspan="7" class="empty">Chưa có chứng từ.</td></tr>'}
     function renderForms(){const q=(formSearch.value||'').toLowerCase();const rows=state.forms.filter(f=>JSON.stringify(f).toLowerCase().includes(q));formRows.innerHTML=rows.map(f=>`<tr><td>${esc(f.form_code)}</td><td>${esc(f.form_name)}</td><td>${esc(f.scope)}</td><td>${esc(f.file_path)}</td></tr>`).join('')||'<tr><td colspan="4" class="empty">Chưa có biểu mẫu.</td></tr>'}
