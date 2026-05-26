@@ -1,8 +1,6 @@
 """Cash flow forecast and liquidity alerts."""
 
 from datetime import date, timedelta
-import tkinter as tk
-from tkinter import ttk
 
 from database import get_connection
 
@@ -47,6 +45,9 @@ class CashFlowAlertManager:
         }
 
     def display_cash_flow_alerts(self, parent):
+        import tkinter as tk
+        from tkinter import ttk
+
         data = self.get_forecast()
         summary = tk.Frame(parent, bg="#FFFFFF")
         summary.pack(fill="x", padx=10, pady=8)
