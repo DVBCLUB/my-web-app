@@ -550,6 +550,46 @@ def import_offline_csv(table_name: str, data: dict[str, Any], actor_id: int | No
     }
 
 
+def offline_import_history(limit: int = 20) -> list[dict[str, Any]]:
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT al.created_at, al.actor_id, COALESCE(u.username, '') AS username, al.new_value
+            FROM audit_log al
+            LEFT JOIN users u ON u.id = al.actor_id
+            WHERE al.entity_type = 'offline_data' AND al.action = 'csv_imported'
+            ORDER BY al.id DESC
+            LIMIT ?
+            """,
+            (max(1, min(int(limit or 20), 100)),),
+        )
+        rows = []
+        for row in cursor.fetchall():
+            detail: dict[str, Any] = {}
+            try:
+                detail = json.loads(row["new_value"] or "{}")
+            except Exception:
+                detail = {"raw": row["new_value"]}
+            table_name = str(detail.get("table") or "")
+            rows.append(
+                {
+                    "created_at": row["created_at"],
+                    "actor_id": row["actor_id"],
+                    "username": row["username"],
+                    "table": table_name,
+                    "label": OFFLINE_DATA_TABLES.get(table_name, table_name),
+                    "created": int(detail.get("created") or 0),
+                    "updated": int(detail.get("updated") or 0),
+                    "skipped_count": len(detail.get("skipped") or []),
+                }
+            )
+        return rows
+    finally:
+        conn.close()
+
+
 def inventory_workspace_snapshot() -> dict[str, Any]:
     conn = get_connection()
     cursor = conn.cursor()
@@ -2884,6 +2924,11 @@ def create_app():
     def offline_quality():
         return jsonify(offline_data_quality_snapshot())
 
+    @app.get("/api/offline-import-history")
+    @api_error
+    def offline_import_history_api():
+        return jsonify(offline_import_history(int(request.args.get("limit") or 20)))
+
     @app.get("/api/offline-quality/export.json")
     @api_error
     def offline_quality_export_json():
@@ -3336,6 +3381,8 @@ INDEX_HTML = r"""<!doctype html>
           <div class="tablewrap"><table><thead><tr><th>Nghiệp vụ</th><th>Sẵn sàng</th><th>Bảng có dữ liệu</th><th>Dòng</th><th>Việc tiếp theo</th></tr></thead><tbody id="offlineReadinessRows"></tbody></table></div>
           <h3>Backlog chuyển dữ liệu ưu tiên</h3>
           <div class="tablewrap"><table><thead><tr><th>Ưu tiên</th><th>Nghiệp vụ</th><th>Bảng</th><th>Hành động</th><th>Mở</th></tr></thead><tbody id="offlineBacklogRows"></tbody></table></div>
+          <h3>Lịch sử nhập CSV gần đây</h3>
+          <div class="tablewrap"><table><thead><tr><th>Thời điểm</th><th>Bảng</th><th>Tạo mới</th><th>Cập nhật</th><th>Người nhập</th></tr></thead><tbody id="offlineImportHistoryRows"></tbody></table></div>
         </div>
         <div class="grid two">
           <div class="card">
@@ -3889,7 +3936,7 @@ INDEX_HTML = r"""<!doctype html>
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
   <script src="https://unpkg.com/lucide@latest"></script>
   <script>
-    const state={auth:null,users:[],offlineData:null,offlineSchema:null,offlineQuality:null,offlineTable:null,dashboard:null,expenses:[],approvals:null,inventory:[],history:[],inventoryWorkspace:null,projects:[],categories:[],projectAccounting:null,workItems:[],diaries:[],siteIntake:null,documents:[],forms:[],reports:null,accounting:null,finance:null,settings:null};
+    const state={auth:null,users:[],offlineData:null,offlineSchema:null,offlineQuality:null,offlineImportHistory:[],offlineTable:null,dashboard:null,expenses:[],approvals:null,inventory:[],history:[],inventoryWorkspace:null,projects:[],categories:[],projectAccounting:null,workItems:[],diaries:[],siteIntake:null,documents:[],forms:[],reports:null,accounting:null,finance:null,settings:null};
     const money=v=>new Intl.NumberFormat('vi-VN',{maximumFractionDigits:0}).format(Number(v||0));
     const esc=v=>String(v??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
     const toast=t=>{const el=document.getElementById('toast');el.textContent=t;el.style.display='block';setTimeout(()=>el.style.display='none',2800)};
@@ -3946,7 +3993,7 @@ INDEX_HTML = r"""<!doctype html>
     async function boot(){const me=await api('/api/auth/me');state.auth=me.user||null;if(!me.authenticated){showLogin();return}hideLogin();userChip.textContent=`${state.auth.full_name||state.auth.username} · ${state.auth.role}`;await loadAll();applyRouteFromLocation()}
     async function loadAll(){await Promise.all([loadDashboard(),loadOfflineData(),loadCatalogs(),loadExpenses(),loadApprovals(),loadInventory(),loadProjects(),loadProjectAccounting(),loadConstruction(),loadSiteIntake(),loadDocuments(),loadForms(),loadReports(),loadAccounting(),loadFinance(),loadSettings(),loadUsers()])}
     async function loadDashboard(){state.dashboard=await api('/api/dashboard');renderDashboard()}
-    async function loadOfflineData(){const [data,schema,quality]=await Promise.all([api('/api/offline-data'),api('/api/offline-schema'),api('/api/offline-quality')]);state.offlineData=data;state.offlineSchema=schema;state.offlineQuality=quality;renderOfflineData();renderOfflineSchema();renderOfflineQuality()}
+    async function loadOfflineData(){const [data,schema,quality,imports]=await Promise.all([api('/api/offline-data'),api('/api/offline-schema'),api('/api/offline-quality'),api('/api/offline-import-history')]);state.offlineData=data;state.offlineSchema=schema;state.offlineQuality=quality;state.offlineImportHistory=imports;renderOfflineData();renderOfflineSchema();renderOfflineQuality()}
     async function loadOfflineTable(name,page=1){const q=offlineTableSearch.value||'';state.offlineTable=await api(`/api/offline-data/${encodeURIComponent(name)}?limit=100&page=${page}&q=${encodeURIComponent(q)}`);renderOfflinePreview()}
     async function loadCatalogs(){const [projects,categories]=await Promise.all([api('/api/projects'),api('/api/categories')]);state.projects=projects;state.categories=categories;fillSelects();renderProjects()}
     async function loadExpenses(){state.expenses=await api('/api/expenses');renderExpenses()}
@@ -3979,7 +4026,8 @@ INDEX_HTML = r"""<!doctype html>
     async function importSelectedOfflineCsv(){const t=state.offlineTable||{},csv=offlineCsvInput.value;if(!t.name)return toast('Chưa chọn bảng');if(!csv.trim())return setOfflineImportStatus('Chưa có CSV để nhập.','bad');if(!confirm(`Nhập CSV vào bảng ${t.name}? Dữ liệu có id trùng sẽ được cập nhật.`))return;try{const r=await api(`/api/offline-data/${encodeURIComponent(t.name)}/import-csv`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({csv})});if(!r.imported){const v=r.validation||{};return setOfflineImportStatus(`CSV chưa hợp lệ: thiếu ${money((v.missing_columns||[]).length)} cột, lỗi bắt buộc ${money((v.blank_required||[]).length)} dòng.`,'bad')}setOfflineImportStatus(`Đã nhập ${money(r.created||0)} dòng mới, cập nhật ${money(r.updated||0)} dòng.`, 'ok');offlineCsvInput.value='';await Promise.all([loadOfflineTable(t.name,1),loadOfflineData(),loadDashboard(),loadFinance()]);toast('Đã nhập CSV offline')}catch(err){setOfflineImportStatus(err.message,'bad');toast(err.message)}}
     async function validateOfflineCsv(table){const csv=prompt(`Dán nội dung CSV cho bảng ${table}`);if(!csv)return;try{const r=await api(`/api/offline-data/${encodeURIComponent(table)}/validate-csv`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({csv})});toast(r.ok?`CSV OK: ${money(r.row_count)} dòng`:`CSV cần sửa: thiếu ${money((r.missing_columns||[]).length)} cột, lỗi bắt buộc ${money((r.blank_required||[]).length)}`)}catch(err){toast(err.message)}}
     async function importOfflineCsv(table){const csv=prompt(`Dán CSV đã kiểm để nhập vào bảng ${table}`);if(!csv)return;if(!confirm(`Nhập CSV vào bảng ${table}? Dữ liệu có id trùng sẽ được cập nhật.`))return;try{const r=await api(`/api/offline-data/${encodeURIComponent(table)}/import-csv`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({csv})});if(!r.imported){const v=r.validation||{};return toast(`CSV chưa hợp lệ: thiếu ${money((v.missing_columns||[]).length)} cột, lỗi bắt buộc ${money((v.blank_required||[]).length)}`)}await Promise.all([loadOfflineData(),loadDashboard(),loadFinance()]);toast(`Đã nhập ${money(r.created||0)} dòng mới, cập nhật ${money(r.updated||0)} dòng`)}catch(err){toast(err.message)}}
-    function renderOfflineQuality(){const q=state.offlineQuality||{},s=q.summary||{};odQualityStatus.textContent=q.ok?'OK':'Cần rà soát';odFkIssues.textContent=s.foreign_key_issue_count||0;odSensitiveCols.textContent=s.sensitive_column_count||0;odEmptyTables.textContent=s.empty_table_count||0;odMissingTables.textContent=s.missing_from_web_count||0;offlineQualityTime.textContent=q.generated_at?`Cập nhật ${fullDate(q.generated_at)}`:'Chưa rà soát';const checks=[['Độ phủ web',s.missing_from_web_count||0,'missing',q.missing_from_web||[]],['Catalog dư',s.stale_web_table_count||0,'stale',q.stale_web_tables||[]],['Khóa ngoại',s.foreign_key_issue_count||0,'foreign_key',q.foreign_key_issues||[]],['Cột bảo mật',s.sensitive_column_count||0,'sensitive',q.sensitive_columns||[]],['Bảng trống',s.empty_table_count||0,'empty',q.empty_tables||[]]];offlineQualityRows.innerHTML=checks.map(([name,count,type,items])=>`<tr><td>${esc(name)}</td><td><span class="status ${count&&type!=='sensitive'?'low':''}">${count?money(count):'OK'}</span></td><td>${renderQualityItems(items,type)}</td></tr>`).join('');offlineReadinessRows.innerHTML=(q.group_readiness||[]).map(g=>`<tr><td><strong>${esc(g.group)}</strong></td><td><div class="progress"><div class="fill ${g.status==='ready'?'good':g.status==='partial'?'warn':'bad'}" style="width:${Math.min(100,Math.round(Number(g.readiness_percent||0)))}%"></div></div><span class="muted">${money(g.readiness_percent)}% · ${esc(g.status)}</span></td><td class="num">${money(g.active_table_count)} / ${money(g.table_count)}</td><td class="num">${money(g.record_count)}</td><td>${esc(g.next_action||'')}</td></tr>`).join('')||'<tr><td colspan="5" class="empty">Chưa có dữ liệu readiness.</td></tr>';offlineBacklogRows.innerHTML=(q.migration_backlog||[]).slice(0,16).map(item=>`<tr><td><span class="status ${item.priority===1?'low':''}">P${money(item.priority)}</span></td><td>${esc(item.group)}</td><td><strong>${esc(item.label)}</strong><br><span class="muted">${esc(item.table)}</span></td><td>${esc(item.action)}</td><td><button class="secondary" type="button" data-view-path="${esc(item.route)}">Mở form</button> ${tableChip(item.table,'Xem bảng')} <button class="secondary" type="button" data-template-table="${esc(item.table)}">CSV mẫu</button> <button class="secondary" type="button" data-validate-table="${esc(item.table)}">Kiểm CSV</button> <button class="secondary" type="button" data-import-table="${esc(item.table)}">Nhập CSV</button></td></tr>`).join('')||'<tr><td colspan="5" class="empty">Không còn backlog chuyển dữ liệu.</td></tr>';offlineBacklogRows.querySelectorAll('[data-view-path]').forEach(btn=>btn.addEventListener('click',()=>{const action=routeActions[btn.dataset.viewPath]||routeActionForPath(btn.dataset.viewPath);switchView(action.view||'offlineData',{path:btn.dataset.viewPath,focus:action.focus})}));offlineBacklogRows.querySelectorAll('[data-template-table]').forEach(btn=>btn.addEventListener('click',()=>{window.location.href=`/api/offline-data/${encodeURIComponent(btn.dataset.templateTable)}/template.csv`}));offlineBacklogRows.querySelectorAll('[data-validate-table]').forEach(btn=>btn.addEventListener('click',()=>validateOfflineCsv(btn.dataset.validateTable)));offlineBacklogRows.querySelectorAll('[data-import-table]').forEach(btn=>btn.addEventListener('click',()=>importOfflineCsv(btn.dataset.importTable)));bindOfflineTableButtons(offlineQualityRows);bindOfflineTableButtons(offlineBacklogRows)}
+    function renderOfflineImportHistory(){offlineImportHistoryRows.innerHTML=(state.offlineImportHistory||[]).map(x=>`<tr><td>${esc(fullDate(x.created_at))}</td><td><strong>${esc(x.label||x.table)}</strong><br><span class="muted">${esc(x.table)}</span></td><td class="num">${money(x.created)}</td><td class="num">${money(x.updated)}</td><td>${esc(x.username||x.actor_id||'')}</td></tr>`).join('')||'<tr><td colspan="5" class="empty">Chưa có lịch sử nhập CSV.</td></tr>'}
+    function renderOfflineQuality(){const q=state.offlineQuality||{},s=q.summary||{};odQualityStatus.textContent=q.ok?'OK':'Cần rà soát';odFkIssues.textContent=s.foreign_key_issue_count||0;odSensitiveCols.textContent=s.sensitive_column_count||0;odEmptyTables.textContent=s.empty_table_count||0;odMissingTables.textContent=s.missing_from_web_count||0;offlineQualityTime.textContent=q.generated_at?`Cập nhật ${fullDate(q.generated_at)}`:'Chưa rà soát';const checks=[['Độ phủ web',s.missing_from_web_count||0,'missing',q.missing_from_web||[]],['Catalog dư',s.stale_web_table_count||0,'stale',q.stale_web_tables||[]],['Khóa ngoại',s.foreign_key_issue_count||0,'foreign_key',q.foreign_key_issues||[]],['Cột bảo mật',s.sensitive_column_count||0,'sensitive',q.sensitive_columns||[]],['Bảng trống',s.empty_table_count||0,'empty',q.empty_tables||[]]];offlineQualityRows.innerHTML=checks.map(([name,count,type,items])=>`<tr><td>${esc(name)}</td><td><span class="status ${count&&type!=='sensitive'?'low':''}">${count?money(count):'OK'}</span></td><td>${renderQualityItems(items,type)}</td></tr>`).join('');offlineReadinessRows.innerHTML=(q.group_readiness||[]).map(g=>`<tr><td><strong>${esc(g.group)}</strong></td><td><div class="progress"><div class="fill ${g.status==='ready'?'good':g.status==='partial'?'warn':'bad'}" style="width:${Math.min(100,Math.round(Number(g.readiness_percent||0)))}%"></div></div><span class="muted">${money(g.readiness_percent)}% · ${esc(g.status)}</span></td><td class="num">${money(g.active_table_count)} / ${money(g.table_count)}</td><td class="num">${money(g.record_count)}</td><td>${esc(g.next_action||'')}</td></tr>`).join('')||'<tr><td colspan="5" class="empty">Chưa có dữ liệu readiness.</td></tr>';offlineBacklogRows.innerHTML=(q.migration_backlog||[]).slice(0,16).map(item=>`<tr><td><span class="status ${item.priority===1?'low':''}">P${money(item.priority)}</span></td><td>${esc(item.group)}</td><td><strong>${esc(item.label)}</strong><br><span class="muted">${esc(item.table)}</span></td><td>${esc(item.action)}</td><td><button class="secondary" type="button" data-view-path="${esc(item.route)}">Mở form</button> ${tableChip(item.table,'Xem bảng')} <button class="secondary" type="button" data-template-table="${esc(item.table)}">CSV mẫu</button> <button class="secondary" type="button" data-validate-table="${esc(item.table)}">Kiểm CSV</button> <button class="secondary" type="button" data-import-table="${esc(item.table)}">Nhập CSV</button></td></tr>`).join('')||'<tr><td colspan="5" class="empty">Không còn backlog chuyển dữ liệu.</td></tr>';renderOfflineImportHistory();offlineBacklogRows.querySelectorAll('[data-view-path]').forEach(btn=>btn.addEventListener('click',()=>{const action=routeActions[btn.dataset.viewPath]||routeActionForPath(btn.dataset.viewPath);switchView(action.view||'offlineData',{path:btn.dataset.viewPath,focus:action.focus})}));offlineBacklogRows.querySelectorAll('[data-template-table]').forEach(btn=>btn.addEventListener('click',()=>{window.location.href=`/api/offline-data/${encodeURIComponent(btn.dataset.templateTable)}/template.csv`}));offlineBacklogRows.querySelectorAll('[data-validate-table]').forEach(btn=>btn.addEventListener('click',()=>validateOfflineCsv(btn.dataset.validateTable)));offlineBacklogRows.querySelectorAll('[data-import-table]').forEach(btn=>btn.addEventListener('click',()=>importOfflineCsv(btn.dataset.importTable)));bindOfflineTableButtons(offlineQualityRows);bindOfflineTableButtons(offlineBacklogRows)}
     function renderDashboard(){const d=state.dashboard||{},s=d.stats||{},t=d.trend||{};kTotal.textContent=money(s.total_expenses);kMonth.textContent=money(s.monthly_expenses);kProjects.textContent=s.total_projects||0;renderDocumentKpi(s.total_documents);kStock.textContent=money(d.stock_value);kMonthTrend.textContent=`${pct(t.month_delta_percent)} so với tháng trước`;kMonthTrend.className=`trend ${Number(t.month_delta||0)<=0?'good':'bad'}`;const max=Math.max(1,...(d.categories||[]).map(x=>x.total||0));categoryBars.innerHTML=(d.categories||[]).map(x=>`<div class="barrow"><strong>${esc(x.name)}</strong><div class="bar"><div class="fill" style="width:${Math.round((x.total||0)/max*100)}%"></div></div><span class="num">${money(x.total)}</span></div>`).join('')||'<div class="empty">Chưa có dữ liệu chi phí đã duyệt.</div>';renderCharts(d);renderActiveProjects();renderSyncBox(d.sync||{},s);renderLowStock(d.low_stock||[]);refreshIcons();if(state.approvals)renderApprovals()}
     function renderExpenses(){const q=(expenseSearch.value||'').toLowerCase();const rows=state.expenses.filter(e=>JSON.stringify(e).toLowerCase().includes(q));expenseRows.innerHTML=rows.map(e=>`<tr><td>${esc(e.expense_date)}</td><td>${esc(e.project_name||'')}</td><td>${esc(e.category_name||'')}</td><td>${esc(e.description||'')}</td><td class="num">${money(e.amount)}</td><td><span class="status ${e.status==='pending'?'low':''}">${esc(e.status)}</span></td></tr>`).join('')||'<tr><td colspan="6" class="empty">Chưa có chi phí.</td></tr>'}
     function renderApprovals(){const a=state.approvals||{},s=a.summary||{},d=state.dashboard||{},stats=d.stats||{};approvalPendingCount.textContent=s.pending_count||0;approvalPendingAmount.textContent=money(s.pending_amount);approvedOfficialTotal.textContent=money(stats.total_expenses);approvalRows.innerHTML=(a.pending||[]).map(e=>`<tr><td>${esc(e.expense_date)}</td><td>${esc(e.project_code)} ${esc(e.project_name)}</td><td>${esc(e.category_name)}</td><td>${esc(e.description)}</td><td class="num">${money(e.amount)}</td><td>${esc(e.created_by_name||e.created_by||'')}</td><td><button class="secondary" type="button" data-expense-approve="${e.id}">Duyệt</button> <button class="secondary" type="button" data-expense-reject="${e.id}">Từ chối</button></td></tr>`).join('')||'<tr><td colspan="7" class="empty">Không có chi phí chờ duyệt.</td></tr>';document.querySelectorAll('[data-expense-approve]').forEach(btn=>btn.addEventListener('click',()=>setExpenseApproval(btn.dataset.expenseApprove,'approved')));document.querySelectorAll('[data-expense-reject]').forEach(btn=>btn.addEventListener('click',()=>setExpenseApproval(btn.dataset.expenseReject,'rejected')))}
