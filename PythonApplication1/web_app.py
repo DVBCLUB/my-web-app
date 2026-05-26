@@ -198,14 +198,25 @@ OFFLINE_MIGRATION_ACTIONS = {
     "fixed_assets": (2, "/accounting", "Dong bo tai san co dinh"),
 }
 
+OFFLINE_IMPORT_BLOCKED_TABLES = {
+    "audit_log",
+    "approval_logs",
+    "powerbi_sync_log",
+    "schema_migrations",
+    "users",
+}
+
 
 def offline_table_columns(table_name: str) -> list[str]:
     if table_name not in OFFLINE_DATA_TABLES:
         raise ValueError("Bang du lieu khong duoc phep truy cap")
     conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute(f'PRAGMA table_info("{table_name}")')
-    return [row["name"] for row in cursor.fetchall()]
+    try:
+        cursor = conn.cursor()
+        cursor.execute(f'PRAGMA table_info("{table_name}")')
+        return [row["name"] for row in cursor.fetchall()]
+    finally:
+        conn.close()
 
 
 def offline_table_rows(table_name: str, limit: int = 50, offset: int = 0, q: str = "") -> dict[str, Any]:
@@ -458,6 +469,84 @@ def validate_offline_csv(table_name: str, data: dict[str, Any]) -> dict[str, Any
         "blank_required": blank_required[:20],
         "row_count": len(rows),
         "sample": rows[:3],
+    }
+
+
+def import_offline_csv(table_name: str, data: dict[str, Any], actor_id: int | None = None) -> dict[str, Any]:
+    if table_name in OFFLINE_IMPORT_BLOCKED_TABLES:
+        raise ValueError("Bang he thong/nhat ky khong cho phep import truc tiep tu CSV")
+    validation = validate_offline_csv(table_name, data)
+    if not validation["ok"]:
+        return {"imported": False, "validation": validation, "created": 0, "updated": 0, "skipped": []}
+    rows = csv_payload_rows(data or {})
+    conn = get_connection()
+    created = 0
+    updated = 0
+    skipped: list[dict[str, Any]] = []
+    try:
+        cursor = conn.cursor()
+        cursor.execute(f'PRAGMA table_info("{table_name}")')
+        schema = [dict(row) for row in cursor.fetchall()]
+        if not schema:
+            raise ValueError(f"Khong tim thay bang {table_name}")
+        columns = {column["name"]: column for column in schema}
+        pk_columns = [column["name"] for column in schema if column["pk"]]
+        writable = set(columns)
+        for index, row in enumerate(rows, start=2):
+            clean: dict[str, Any] = {}
+            for column, raw_value in row.items():
+                if column not in writable:
+                    continue
+                value = (raw_value or "").strip()
+                meta = columns[column]
+                if value == "":
+                    if column in pk_columns or meta["dflt_value"] is not None:
+                        continue
+                    value = None
+                clean[column] = value
+            if not clean:
+                skipped.append({"line": index, "reason": "Dong trong"})
+                continue
+            single_pk = pk_columns[0] if len(pk_columns) == 1 else None
+            pk_value = clean.get(single_pk) if single_pk else None
+            if single_pk and pk_value not in (None, ""):
+                update_columns = [column for column in clean if column != single_pk]
+                if update_columns:
+                    assignments = ", ".join(f'"{column}" = ?' for column in update_columns)
+                    params = [clean[column] for column in update_columns] + [pk_value]
+                    cursor.execute(f'UPDATE "{table_name}" SET {assignments} WHERE "{single_pk}" = ?', params)
+                    if cursor.rowcount:
+                        updated += 1
+                        continue
+            insert_columns = list(clean)
+            placeholders = ", ".join("?" for _ in insert_columns)
+            column_sql = ", ".join(f'"{column}"' for column in insert_columns)
+            cursor.execute(
+                f'INSERT INTO "{table_name}" ({column_sql}) VALUES ({placeholders})',
+                [clean[column] for column in insert_columns],
+            )
+            created += 1
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    AuditLogManager().log(
+        "offline_data",
+        None,
+        "csv_imported",
+        actor_id,
+        new_value={"table": table_name, "created": created, "updated": updated, "skipped": skipped[:20]},
+    )
+    return {
+        "imported": True,
+        "table": table_name,
+        "label": OFFLINE_DATA_TABLES.get(table_name, table_name),
+        "created": created,
+        "updated": updated,
+        "skipped": skipped,
+        "validation": validation,
     }
 
 
@@ -2863,6 +2952,11 @@ def create_app():
     def offline_data_table_validate_csv(table_name):
         return jsonify(validate_offline_csv(table_name, request.get_json(force=True) or {}))
 
+    @app.post("/api/offline-data/<table_name>/import-csv")
+    @api_error
+    def offline_data_table_import_csv(table_name):
+        return jsonify(import_offline_csv(table_name, request.get_json(force=True) or {}, session.get("user_id")))
+
     @app.post("/api/settings")
     @api_error
     def save_settings():
@@ -3875,7 +3969,8 @@ INDEX_HTML = r"""<!doctype html>
     function renderQualityItems(items,type){items=(items||[]).slice(0,8);if(!items.length)return 'Không có vấn đề';if(type==='missing'||type==='stale')return items.map(name=>`<span class="status low">${esc(name)}</span>`).join(' ');if(type==='foreign_key')return items.map(x=>tableChip(x.table,`${x.table}#${x.rowid||''}`)).join(' ');if(type==='sensitive')return items.map(x=>`${tableChip(x.table,`${x.table}.${x.column}`)} <span class="muted">${esc(x.sensitivity==='redacted'?'đã che':'metadata')}</span>`).join(' ');return items.map(x=>tableChip(x.name,x.name)).join(' ')}
     function bindOfflineTableButtons(root=document){root.querySelectorAll('[data-offline-table]').forEach(btn=>btn.addEventListener('click',()=>{offlineTableSearch.value='';loadOfflineTable(btn.dataset.offlineTable);document.getElementById('offlinePreviewTitle')?.scrollIntoView({behavior:'smooth',block:'center'})}))}
     async function validateOfflineCsv(table){const csv=prompt(`Dán nội dung CSV cho bảng ${table}`);if(!csv)return;try{const r=await api(`/api/offline-data/${encodeURIComponent(table)}/validate-csv`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({csv})});toast(r.ok?`CSV OK: ${money(r.row_count)} dòng`:`CSV cần sửa: thiếu ${money((r.missing_columns||[]).length)} cột, lỗi bắt buộc ${money((r.blank_required||[]).length)}`)}catch(err){toast(err.message)}}
-    function renderOfflineQuality(){const q=state.offlineQuality||{},s=q.summary||{};odQualityStatus.textContent=q.ok?'OK':'Cần rà soát';odFkIssues.textContent=s.foreign_key_issue_count||0;odSensitiveCols.textContent=s.sensitive_column_count||0;odEmptyTables.textContent=s.empty_table_count||0;odMissingTables.textContent=s.missing_from_web_count||0;offlineQualityTime.textContent=q.generated_at?`Cập nhật ${fullDate(q.generated_at)}`:'Chưa rà soát';const checks=[['Độ phủ web',s.missing_from_web_count||0,'missing',q.missing_from_web||[]],['Catalog dư',s.stale_web_table_count||0,'stale',q.stale_web_tables||[]],['Khóa ngoại',s.foreign_key_issue_count||0,'foreign_key',q.foreign_key_issues||[]],['Cột bảo mật',s.sensitive_column_count||0,'sensitive',q.sensitive_columns||[]],['Bảng trống',s.empty_table_count||0,'empty',q.empty_tables||[]]];offlineQualityRows.innerHTML=checks.map(([name,count,type,items])=>`<tr><td>${esc(name)}</td><td><span class="status ${count&&type!=='sensitive'?'low':''}">${count?money(count):'OK'}</span></td><td>${renderQualityItems(items,type)}</td></tr>`).join('');offlineReadinessRows.innerHTML=(q.group_readiness||[]).map(g=>`<tr><td><strong>${esc(g.group)}</strong></td><td><div class="progress"><div class="fill ${g.status==='ready'?'good':g.status==='partial'?'warn':'bad'}" style="width:${Math.min(100,Math.round(Number(g.readiness_percent||0)))}%"></div></div><span class="muted">${money(g.readiness_percent)}% · ${esc(g.status)}</span></td><td class="num">${money(g.active_table_count)} / ${money(g.table_count)}</td><td class="num">${money(g.record_count)}</td><td>${esc(g.next_action||'')}</td></tr>`).join('')||'<tr><td colspan="5" class="empty">Chưa có dữ liệu readiness.</td></tr>';offlineBacklogRows.innerHTML=(q.migration_backlog||[]).slice(0,16).map(item=>`<tr><td><span class="status ${item.priority===1?'low':''}">P${money(item.priority)}</span></td><td>${esc(item.group)}</td><td><strong>${esc(item.label)}</strong><br><span class="muted">${esc(item.table)}</span></td><td>${esc(item.action)}</td><td><button class="secondary" type="button" data-view-path="${esc(item.route)}">Mở form</button> ${tableChip(item.table,'Xem bảng')} <button class="secondary" type="button" data-template-table="${esc(item.table)}">CSV mẫu</button> <button class="secondary" type="button" data-validate-table="${esc(item.table)}">Kiểm CSV</button></td></tr>`).join('')||'<tr><td colspan="5" class="empty">Không còn backlog chuyển dữ liệu.</td></tr>';offlineBacklogRows.querySelectorAll('[data-view-path]').forEach(btn=>btn.addEventListener('click',()=>{const action=routeActions[btn.dataset.viewPath]||routeActionForPath(btn.dataset.viewPath);switchView(action.view||'offlineData',{path:btn.dataset.viewPath,focus:action.focus})}));offlineBacklogRows.querySelectorAll('[data-template-table]').forEach(btn=>btn.addEventListener('click',()=>{window.location.href=`/api/offline-data/${encodeURIComponent(btn.dataset.templateTable)}/template.csv`}));offlineBacklogRows.querySelectorAll('[data-validate-table]').forEach(btn=>btn.addEventListener('click',()=>validateOfflineCsv(btn.dataset.validateTable)));bindOfflineTableButtons(offlineQualityRows);bindOfflineTableButtons(offlineBacklogRows)}
+    async function importOfflineCsv(table){const csv=prompt(`Dán CSV đã kiểm để nhập vào bảng ${table}`);if(!csv)return;if(!confirm(`Nhập CSV vào bảng ${table}? Dữ liệu có id trùng sẽ được cập nhật.`))return;try{const r=await api(`/api/offline-data/${encodeURIComponent(table)}/import-csv`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({csv})});if(!r.imported){const v=r.validation||{};return toast(`CSV chưa hợp lệ: thiếu ${money((v.missing_columns||[]).length)} cột, lỗi bắt buộc ${money((v.blank_required||[]).length)}`)}await Promise.all([loadOfflineData(),loadDashboard(),loadFinance()]);toast(`Đã nhập ${money(r.created||0)} dòng mới, cập nhật ${money(r.updated||0)} dòng`)}catch(err){toast(err.message)}}
+    function renderOfflineQuality(){const q=state.offlineQuality||{},s=q.summary||{};odQualityStatus.textContent=q.ok?'OK':'Cần rà soát';odFkIssues.textContent=s.foreign_key_issue_count||0;odSensitiveCols.textContent=s.sensitive_column_count||0;odEmptyTables.textContent=s.empty_table_count||0;odMissingTables.textContent=s.missing_from_web_count||0;offlineQualityTime.textContent=q.generated_at?`Cập nhật ${fullDate(q.generated_at)}`:'Chưa rà soát';const checks=[['Độ phủ web',s.missing_from_web_count||0,'missing',q.missing_from_web||[]],['Catalog dư',s.stale_web_table_count||0,'stale',q.stale_web_tables||[]],['Khóa ngoại',s.foreign_key_issue_count||0,'foreign_key',q.foreign_key_issues||[]],['Cột bảo mật',s.sensitive_column_count||0,'sensitive',q.sensitive_columns||[]],['Bảng trống',s.empty_table_count||0,'empty',q.empty_tables||[]]];offlineQualityRows.innerHTML=checks.map(([name,count,type,items])=>`<tr><td>${esc(name)}</td><td><span class="status ${count&&type!=='sensitive'?'low':''}">${count?money(count):'OK'}</span></td><td>${renderQualityItems(items,type)}</td></tr>`).join('');offlineReadinessRows.innerHTML=(q.group_readiness||[]).map(g=>`<tr><td><strong>${esc(g.group)}</strong></td><td><div class="progress"><div class="fill ${g.status==='ready'?'good':g.status==='partial'?'warn':'bad'}" style="width:${Math.min(100,Math.round(Number(g.readiness_percent||0)))}%"></div></div><span class="muted">${money(g.readiness_percent)}% · ${esc(g.status)}</span></td><td class="num">${money(g.active_table_count)} / ${money(g.table_count)}</td><td class="num">${money(g.record_count)}</td><td>${esc(g.next_action||'')}</td></tr>`).join('')||'<tr><td colspan="5" class="empty">Chưa có dữ liệu readiness.</td></tr>';offlineBacklogRows.innerHTML=(q.migration_backlog||[]).slice(0,16).map(item=>`<tr><td><span class="status ${item.priority===1?'low':''}">P${money(item.priority)}</span></td><td>${esc(item.group)}</td><td><strong>${esc(item.label)}</strong><br><span class="muted">${esc(item.table)}</span></td><td>${esc(item.action)}</td><td><button class="secondary" type="button" data-view-path="${esc(item.route)}">Mở form</button> ${tableChip(item.table,'Xem bảng')} <button class="secondary" type="button" data-template-table="${esc(item.table)}">CSV mẫu</button> <button class="secondary" type="button" data-validate-table="${esc(item.table)}">Kiểm CSV</button> <button class="secondary" type="button" data-import-table="${esc(item.table)}">Nhập CSV</button></td></tr>`).join('')||'<tr><td colspan="5" class="empty">Không còn backlog chuyển dữ liệu.</td></tr>';offlineBacklogRows.querySelectorAll('[data-view-path]').forEach(btn=>btn.addEventListener('click',()=>{const action=routeActions[btn.dataset.viewPath]||routeActionForPath(btn.dataset.viewPath);switchView(action.view||'offlineData',{path:btn.dataset.viewPath,focus:action.focus})}));offlineBacklogRows.querySelectorAll('[data-template-table]').forEach(btn=>btn.addEventListener('click',()=>{window.location.href=`/api/offline-data/${encodeURIComponent(btn.dataset.templateTable)}/template.csv`}));offlineBacklogRows.querySelectorAll('[data-validate-table]').forEach(btn=>btn.addEventListener('click',()=>validateOfflineCsv(btn.dataset.validateTable)));offlineBacklogRows.querySelectorAll('[data-import-table]').forEach(btn=>btn.addEventListener('click',()=>importOfflineCsv(btn.dataset.importTable)));bindOfflineTableButtons(offlineQualityRows);bindOfflineTableButtons(offlineBacklogRows)}
     function renderDashboard(){const d=state.dashboard||{},s=d.stats||{},t=d.trend||{};kTotal.textContent=money(s.total_expenses);kMonth.textContent=money(s.monthly_expenses);kProjects.textContent=s.total_projects||0;renderDocumentKpi(s.total_documents);kStock.textContent=money(d.stock_value);kMonthTrend.textContent=`${pct(t.month_delta_percent)} so với tháng trước`;kMonthTrend.className=`trend ${Number(t.month_delta||0)<=0?'good':'bad'}`;const max=Math.max(1,...(d.categories||[]).map(x=>x.total||0));categoryBars.innerHTML=(d.categories||[]).map(x=>`<div class="barrow"><strong>${esc(x.name)}</strong><div class="bar"><div class="fill" style="width:${Math.round((x.total||0)/max*100)}%"></div></div><span class="num">${money(x.total)}</span></div>`).join('')||'<div class="empty">Chưa có dữ liệu chi phí đã duyệt.</div>';renderCharts(d);renderActiveProjects();renderSyncBox(d.sync||{},s);renderLowStock(d.low_stock||[]);refreshIcons();if(state.approvals)renderApprovals()}
     function renderExpenses(){const q=(expenseSearch.value||'').toLowerCase();const rows=state.expenses.filter(e=>JSON.stringify(e).toLowerCase().includes(q));expenseRows.innerHTML=rows.map(e=>`<tr><td>${esc(e.expense_date)}</td><td>${esc(e.project_name||'')}</td><td>${esc(e.category_name||'')}</td><td>${esc(e.description||'')}</td><td class="num">${money(e.amount)}</td><td><span class="status ${e.status==='pending'?'low':''}">${esc(e.status)}</span></td></tr>`).join('')||'<tr><td colspan="6" class="empty">Chưa có chi phí.</td></tr>'}
     function renderApprovals(){const a=state.approvals||{},s=a.summary||{},d=state.dashboard||{},stats=d.stats||{};approvalPendingCount.textContent=s.pending_count||0;approvalPendingAmount.textContent=money(s.pending_amount);approvedOfficialTotal.textContent=money(stats.total_expenses);approvalRows.innerHTML=(a.pending||[]).map(e=>`<tr><td>${esc(e.expense_date)}</td><td>${esc(e.project_code)} ${esc(e.project_name)}</td><td>${esc(e.category_name)}</td><td>${esc(e.description)}</td><td class="num">${money(e.amount)}</td><td>${esc(e.created_by_name||e.created_by||'')}</td><td><button class="secondary" type="button" data-expense-approve="${e.id}">Duyệt</button> <button class="secondary" type="button" data-expense-reject="${e.id}">Từ chối</button></td></tr>`).join('')||'<tr><td colspan="7" class="empty">Không có chi phí chờ duyệt.</td></tr>';document.querySelectorAll('[data-expense-approve]').forEach(btn=>btn.addEventListener('click',()=>setExpenseApproval(btn.dataset.expenseApprove,'approved')));document.querySelectorAll('[data-expense-reject]').forEach(btn=>btn.addEventListener('click',()=>setExpenseApproval(btn.dataset.expenseReject,'rejected')))}
