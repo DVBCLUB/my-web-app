@@ -12,6 +12,41 @@ from typing import Optional, Dict, List, Any, Tuple
 logger = get_logger(__name__)
 
 
+def normalize_expense_date(value: Any) -> str:
+    """Chuẩn hóa ngày chi phí về dạng YYYY-MM-DD trước khi lưu DB.
+
+    Web/mobile/browser có thể gửi ngày dưới nhiều dạng khác nhau:
+    - YYYY-MM-DD từ input type=date.
+    - ISO datetime như 2026-05-27T00:00:00.000Z.
+    - DD/MM/YYYY hoặc DD-MM-YYYY do người dùng Việt Nam nhập/dán tay.
+
+    Lưu thống nhất YYYY-MM-DD để lọc kỳ, khóa kỳ và báo cáo không bị lệch.
+    """
+    if value is None or value == "":
+        return datetime.now().date().isoformat()
+
+    raw = str(value).strip()
+    if not raw:
+        return datetime.now().date().isoformat()
+
+    # Native HTML date input already sends this format.
+    if len(raw) >= 10 and raw[4:5] == "-" and raw[7:8] == "-":
+        return raw[:10]
+
+    # Common Vietnamese manual input.
+    for fmt in ("%d/%m/%Y", "%d-%m-%Y", "%Y/%m/%d"):
+        try:
+            return datetime.strptime(raw[:10], fmt).date().isoformat()
+        except ValueError:
+            pass
+
+    # Last resort for ISO datetime strings accepted by Python.
+    try:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00")).date().isoformat()
+    except ValueError as exc:
+        raise ValueError("Ngày chi không hợp lệ. Vui lòng nhập theo YYYY-MM-DD hoặc DD/MM/YYYY.") from exc
+
+
 class ExpenseManager(ConnectionPerRequestMixin):
     """Quản lý chi phí công ty."""
 
@@ -26,12 +61,13 @@ class ExpenseManager(ConnectionPerRequestMixin):
                    contract_id: Optional[int] = None) -> int:
         """Thêm chi phí mới."""
         try:
+            expense_date = normalize_expense_date(expense_date)
             project_id = int(project_id) if project_id else None
             category_id = int(category_id)
             work_item_id = int(work_item_id) if work_item_id else None
             contract_id = int(contract_id) if contract_id else None
             extra_fields = extra_fields or {}
-            fiscal_period = str(expense_date)[:7] if expense_date else None
+            fiscal_period = expense_date[:7]
             assert_date_not_locked(expense_date, 'them chi phi')
             cursor = self.conn.cursor()
             cursor.execute('''
@@ -77,6 +113,7 @@ class ExpenseManager(ConnectionPerRequestMixin):
                                category_id: int, description: str,
                                amount: float, exclude_id: Optional[int] = None) -> Optional[Dict[str, Any]]:
         """Tìm dòng chi phí có cùng ngày, dự án, loại, mô tả và số tiền."""
+        expense_date = normalize_expense_date(expense_date)
         cursor = self.conn.cursor()
         params = [
             expense_date,
@@ -120,13 +157,14 @@ class ExpenseManager(ConnectionPerRequestMixin):
                        contract_id: Optional[int] = None) -> None:
         if self.is_expense_posted(expense_id):
             raise ValueError('Chi phí đã ghi sổ. Cần bỏ ghi trước khi sửa.')
+        expense_date = normalize_expense_date(expense_date)
         assert_date_not_locked(expense_date, 'sua chi phi')
         project_id = int(project_id) if project_id else None
         category_id = int(category_id)
         work_item_id = int(work_item_id) if work_item_id else None
         contract_id = int(contract_id) if contract_id else None
         extra_fields = extra_fields or {}
-        fiscal_period = str(expense_date)[:7] if expense_date else None
+        fiscal_period = expense_date[:7]
         cursor = self.conn.cursor()
         cursor.execute('''
             UPDATE expenses SET
@@ -276,6 +314,7 @@ class ExpenseManager(ConnectionPerRequestMixin):
     def create_journal_entry(self, entry_date, description, debit_acc, 
                             credit_acc, amount, expense_id, created_by):
         """Tạo bút toán."""
+        entry_date = normalize_expense_date(entry_date)
         assert_date_not_locked(entry_date, 'tao but toan')
         cursor = self.conn.cursor()
         cursor.execute('''

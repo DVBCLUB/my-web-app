@@ -1,0 +1,35 @@
+name: Patch expense date UI
+
+on:
+  push:
+    branches:
+      - fix-expense-date-normalization
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    if: github.actor != 'github-actions[bot]'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix-expense-date-normalization
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Patch web_app expense date input
+        run: python tools/patch_expense_date_ui.py
+      - name: Commit patched UI
+        run: |
+          if git diff --quiet; then
+            echo "No UI patch changes needed"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add PythonApplication1/web_app.py
+          git commit -m "Fix expense date input mask"
+          git push
