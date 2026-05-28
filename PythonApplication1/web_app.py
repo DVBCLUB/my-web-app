@@ -3486,6 +3486,15 @@ def create_app():
         return jsonify([row_to_dict(row) for row in rows])
 
 
+    @app.get("/api/construction-accounting/rules")
+    @api_error
+    def construction_accounting_rules():
+        rules_path = Path(__file__).resolve().parent / "data" / "construction_accounting_rules.json"
+        if not rules_path.exists():
+            return jsonify({"version": "missing", "cost_groups": [], "reports": []})
+        return jsonify(json.loads(rules_path.read_text(encoding="utf-8")))
+
+
     @app.get("/healthz")
     def healthz():
         return jsonify({
@@ -3681,6 +3690,24 @@ INDEX_HTML = r"""<!doctype html>
             <label class="wide">Nội dung<textarea name="description" placeholder="Nội dung chi phí"></textarea></label>
             <div class="wide actions"><button class="primary" type="submit">Lưu chi phí</button><button class="secondary" type="reset">Xóa form</button></div>
           </form>
+        </div>
+        <div class="card" id="constructionRuleCard">
+          <div class="toolbar"><h3>Checklist chứng từ & hạch toán xây dựng</h3><select id="ruleGroupSelect"></select></div>
+          <div class="grid two">
+            <div>
+              <p class="section-kicker" id="ruleCode">Nhóm chi phí</p>
+              <h3 id="ruleName">Chọn danh mục chi phí để xem gợi ý</h3>
+              <p class="muted" id="ruleAccounts">Tài khoản gợi ý sẽ hiện tại đây.</p>
+              <h3>Chứng từ cần có</h3>
+              <ul id="ruleDocs" class="muted"></ul>
+            </div>
+            <div>
+              <h3>Cảnh báo thuế/kế toán</h3>
+              <ul id="ruleWarnings" class="muted"></ul>
+              <h3>Kiểm soát nên bật</h3>
+              <ul id="ruleControls" class="muted"></ul>
+            </div>
+          </div>
         </div>
         <div class="grid kpis">
           <div class="card kpi"><div class="label">Chờ duyệt</div><div class="value" id="approvalPendingCount">0</div></div>
@@ -4282,7 +4309,7 @@ INDEX_HTML = r"""<!doctype html>
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
   <script src="https://unpkg.com/lucide@latest"></script>
   <script>
-    const state={auth:null,users:[],offlineData:null,offlineSchema:null,offlineQuality:null,offlineImportHistory:[],offlineTable:null,dashboard:null,expenses:[],approvals:null,inventory:[],history:[],inventoryWorkspace:null,projects:[],categories:[],projectAccounting:null,workItems:[],diaries:[],siteIntake:null,documents:[],importedInvoices:[],forms:[],reports:null,accounting:null,finance:null,settings:null};
+    const state={auth:null,users:[],offlineData:null,offlineSchema:null,offlineQuality:null,offlineImportHistory:[],offlineTable:null,dashboard:null,expenses:[],approvals:null,inventory:[],history:[],inventoryWorkspace:null,projects:[],categories:[],projectAccounting:null,workItems:[],diaries:[],siteIntake:null,documents:[],importedInvoices:[],forms:[],reports:null,accounting:null,finance:null,settings:null,constructionRules:null};
     const money=v=>new Intl.NumberFormat('vi-VN',{maximumFractionDigits:0}).format(Number(v||0));
     const esc=v=>String(v??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
     const toast=t=>{const el=document.getElementById('toast');el.textContent=t;el.style.display='block';setTimeout(()=>el.style.display='none',2800)};
@@ -4332,6 +4359,33 @@ INDEX_HTML = r"""<!doctype html>
     function renderDocumentKpi(total){kDocs.textContent=total||0;kDocsAction.className='trend';kDocsAction.innerHTML=Number(total||0)===0?'<div class="kpi-empty">Chưa có chứng từ<br><button class="mini-cta" type="button" data-view-jump="documents" data-view-path="/documents/create" data-focus="documentForm">+ Tạo chứng từ mới</button></div>':'Hồ sơ kế toán'}
     function renderActiveProjects(){const d=state.dashboard||{},q=(activeProjectSearch?.value||'').toLowerCase();const all=d.active_projects||[],filtered=all.filter(p=>JSON.stringify(p).toLowerCase().includes(q));const shown=filtered.slice(0,3);activeProjectRows.innerHTML=shown.map(p=>{const pctVal=Number(p.budget_used_percent||p.progress||0),cls=budgetClass(pctVal);return `<div class="project-line"><header><strong>${esc(p.code)} · ${esc(p.name)}</strong><span>${money(pctVal)}%</span></header><div class="progress"><div class="fill ${cls}" style="width:${Math.min(100,Math.round(pctVal))}%"></div></div><div class="muted">Đã duyệt ${money(p.spent)} / ngân sách ${money(p.budget)} · tiến độ ${money(p.progress)}% · ${money(p.work_item_count)} hạng mục</div></div>`}).join('')||'<div class="empty-state">Chưa có dự án active.</div>';if(filtered.length>3)activeProjectRows.insertAdjacentHTML('beforeend',`<div class="project-footer"><a href="#" data-view-jump="projects" data-view-path="/projects">Xem thêm ${money(filtered.length-3)} dự án đang chạy...</a></div>`)}
     function renderSyncBox(sync={},stats={}){const last=sync.last_expense_update||sync.last_document_update,age=last?Date.now()-new Date(last).getTime():Infinity,cls=age<86400000?'':age<604800000?'warn':'bad';syncBox.innerHTML=`<div class="sync-title"><span class="sync-dot ${cls}"></span><span>Real-time sync</span></div><span>Chế độ: ${esc(sync.mode||'SQLite shared')}</span><span title="${esc(relativeTime(sync.last_expense_update))}">Chi phí cập nhật: ${esc(fullDate(sync.last_expense_update))}</span><span title="${esc(relativeTime(sync.last_document_update))}">Chứng từ cập nhật: ${esc(fullDate(sync.last_document_update))}</span><span>Chờ duyệt: ${money(stats.pending_expense_count||0)} phiếu · ${money(stats.pending_expenses||0)}</span>`}
+    function inferRuleCode(){
+      if(ruleGroupSelect&&ruleGroupSelect.value)return ruleGroupSelect.value;
+      const txt=`${expenseCategory?.selectedOptions?.[0]?.textContent||''}`.toLowerCase();
+      if(/thầu|thau|sub/.test(txt))return 'SUBCONTRACTOR';
+      if(/máy|may|dầu|dau|nhiên liệu|nhien lieu|ca máy|ca may/.test(txt))return 'MACHINE';
+      if(/nhân công|nhan cong|lương|luong|khoán|khoan/.test(txt))return 'LABOR';
+      if(/vật tư|vat tu|vật liệu|vat lieu|thép|thep|xi măng|xi mang|cát|cat|đá|da/.test(txt))return 'MATERIALS';
+      if(/chung|quản lý|quan ly|văn phòng|van phong|công trường|cong truong/.test(txt))return 'OVERHEAD';
+      return 'MATERIALS';
+    }
+    function listHtml(items=[]){return items.map(x=>`<li>${esc(x)}</li>`).join('')||'<li>Chưa có checklist.</li>'}
+    function renderConstructionAccountingRules(){
+      if(!document.getElementById('constructionRuleCard'))return;
+      const groups=(state.constructionRules||{}).cost_groups||[];
+      if(!groups.length){ruleName.textContent='Chưa có bộ quy tắc';return}
+      if(ruleGroupSelect&&!ruleGroupSelect.options.length){ruleGroupSelect.innerHTML=groups.map(g=>`<option value="${esc(g.code)}">${esc(g.name)}</option>`).join('')}
+      const code=inferRuleCode();
+      const rule=groups.find(g=>g.code===code)||groups[0];
+      if(ruleGroupSelect)ruleGroupSelect.value=rule.code;
+      ruleCode.textContent=rule.code;
+      ruleName.textContent=rule.name;
+      const acc=rule.accounting_accounts||{};
+      ruleAccounts.textContent=`Nợ: ${(acc.debit||[]).join(', ')} · Có: ${(acc.credit||[]).join(', ')}`;
+      ruleDocs.innerHTML=listHtml(rule.required_documents||[]);
+      ruleWarnings.innerHTML=listHtml(rule.tax_warnings||[]);
+      ruleControls.innerHTML=listHtml(rule.suggested_controls||[]);
+    }
     function renderLowStock(rows=[]){lowStockRows.innerHTML=rows.length?rows.map(x=>`<tr><td>${esc(x.code)}</td><td>${esc(x.name)}</td><td class="num">${money(x.quantity)} ${esc(x.unit)}</td><td class="num">${money(x.min_quantity)}</td></tr>`).join(''):'<tr><td colspan="4"><div class="empty-state ok">✓ Tồn kho an toàn. Tuyệt vời!</div></td></tr>'}
     function drawPie(canvas,rows,labelKey,valueKey){const ctx=canvas.getContext('2d'),w=canvas.clientWidth,h=canvas.clientHeight,dpr=window.devicePixelRatio||1;canvas.width=w*dpr;canvas.height=h*dpr;ctx.scale(dpr,dpr);ctx.clearRect(0,0,w,h);const total=rows.reduce((s,r)=>s+Number(r[valueKey]||0),0);let start=-Math.PI/2;const cx=w*.32,cy=h*.48,r=Math.min(w,h)*.32;if(!total){ctx.fillStyle=getComputedStyle(document.body).getPropertyValue('--muted');ctx.fillText('Chưa có dữ liệu',20,30);return}rows.forEach((row,i)=>{const val=Number(row[valueKey]||0),end=start+Math.PI*2*val/total;ctx.beginPath();ctx.moveTo(cx,cy);ctx.arc(cx,cy,r,start,end);ctx.closePath();ctx.fillStyle=palette[i%palette.length];ctx.fill();start=end});ctx.font='12px Inter,Segoe UI';rows.slice(0,7).forEach((row,i)=>{const y=22+i*24;ctx.fillStyle=palette[i%palette.length];ctx.fillRect(w*.62,y-10,10,10);ctx.fillStyle=getComputedStyle(document.body).getPropertyValue('--ink');ctx.fillText(`${row[labelKey]} · ${Math.round(Number(row[valueKey]||0)/total*100)}%`,w*.62+16,y)})}
     function drawColumn(canvas,rows,labelKey,valueKey){const ctx=canvas.getContext('2d'),w=canvas.clientWidth,h=canvas.clientHeight,dpr=window.devicePixelRatio||1;canvas.width=w*dpr;canvas.height=h*dpr;ctx.scale(dpr,dpr);ctx.clearRect(0,0,w,h);const max=Math.max(1,...rows.map(r=>Number(r[valueKey]||0)));const pad=30,barW=Math.max(18,(w-pad*2)/(rows.length||1)-12);ctx.font='12px Inter,Segoe UI';rows.forEach((row,i)=>{const x=pad+i*(barW+12),bh=(h-70)*Number(row[valueKey]||0)/max,y=h-38-bh;ctx.fillStyle=palette[i%palette.length];ctx.fillRect(x,y,barW,bh);ctx.fillStyle=getComputedStyle(document.body).getPropertyValue('--muted');ctx.fillText(String(row[labelKey]||'').slice(0,10),x,h-16)})}
@@ -4347,7 +4401,7 @@ INDEX_HTML = r"""<!doctype html>
     function switchView(id,options={}){document.querySelectorAll('.view').forEach(v=>v.classList.toggle('active',v.id===id));document.querySelectorAll('.navbtn').forEach(b=>b.classList.toggle('active',b.dataset.view===id));document.getElementById('pageTitle').textContent=viewTitles[id]||'FT ERP';document.getElementById('side').classList.remove('open');if(options.push!==false){const path=options.path||viewRoutes[id]||'/';if(window.location.pathname!==path)history.pushState({view:id},'',path)}if(id==='offlineData'&&!state.offlineData)loadOfflineData();focusPanel(options.focus)}
     function applyRouteFromLocation(){const action=routeAction();switchView(action.view,{push:false,focus:action.focus});if(action.path&&window.location.pathname!==action.path)history.replaceState({view:action.view},'',action.path)}
     async function boot(){const me=await api('/api/auth/me');state.auth=me.user||null;if(!me.authenticated){showLogin();return}hideLogin();setUserChip(state.auth);await loadAll();applyRouteFromLocation()}
-    async function loadAll(){await Promise.all([loadDashboard(),loadCatalogs(),loadExpenses(),loadApprovals(),loadInventory(),loadProjects(),loadProjectAccounting(),loadConstruction(),loadSiteIntake(),loadDocuments(),loadDocumentIntake(),loadForms(),loadReports(),loadAccounting(),loadFinance(),loadSettings(),loadUsers()])}
+    async function loadAll(){await Promise.all([loadDashboard(),loadCatalogs(),loadExpenses(),loadApprovals(),loadInventory(),loadProjects(),loadProjectAccounting(),loadConstruction(),loadSiteIntake(),loadDocuments(),loadDocumentIntake(),loadForms(),loadReports(),loadAccounting(),loadFinance(),loadSettings(),loadUsers(),loadConstructionAccountingRules()])}
     async function loadDashboard(){state.dashboard=await api('/api/dashboard');renderDashboard()}
     async function loadOfflineData(){const [data,schema,quality,imports]=await Promise.all([api('/api/offline-data'),api('/api/offline-schema'),api('/api/offline-quality'),api('/api/offline-import-history')]);state.offlineData=data;state.offlineSchema=schema;state.offlineQuality=quality;state.offlineImportHistory=imports;renderOfflineData();renderOfflineSchema();renderOfflineQuality()}
     async function loadOfflineTable(name,page=1){const q=offlineTableSearch.value||'';state.offlineTable=await api(`/api/offline-data/${encodeURIComponent(name)}?limit=100&page=${page}&q=${encodeURIComponent(q)}`);renderOfflinePreview()}
@@ -4466,6 +4520,8 @@ INDEX_HTML = r"""<!doctype html>
     userForm.addEventListener('submit',async e=>{e.preventDefault();const data=Object.fromEntries(new FormData(userForm).entries());try{await api('/api/users',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});userForm.reset();await loadUsers();toast('Đã tạo người dùng')}catch(err){toast(err.message)}});
     passwordForm.addEventListener('submit',async e=>{e.preventDefault();const data=Object.fromEntries(new FormData(passwordForm).entries());try{await api('/api/auth/change-password',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});passwordForm.reset();toast('Đã đổi mật khẩu')}catch(err){toast(err.message)}});
     if(expenseForm&&expenseForm.expense_date){expenseForm.expense_date.value=toDisplayDate(localIsoDate());bindDateMask(expenseForm.expense_date)};
+    if(window.expenseCategory)expenseCategory.addEventListener('change',()=>{if(ruleGroupSelect)ruleGroupSelect.value='';renderConstructionAccountingRules()});
+    if(window.ruleGroupSelect)ruleGroupSelect.addEventListener('change',renderConstructionAccountingRules);
     backupBtn.addEventListener('click',async()=>{try{const r=await api('/api/backups',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});await loadSettings();toast(r.message||'Đã sao lưu')}catch(err){toast(err.message)}});
     driveBackupBtn.addEventListener('click',async()=>{const data=Object.fromEntries(new FormData(driveBackupForm).entries());try{driveBackupStatus.textContent='Đang tạo backup và upload Drive...';const r=await api('/api/backups/drive',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});driveBackupStatus.innerHTML=r.file&&r.file.webViewLink?`Đã sao lưu Drive: <a href="${esc(r.file.webViewLink)}" target="_blank" rel="noopener">${esc(r.file.name)}</a>`:(r.message||'Đã sao lưu Drive');await loadSettings();toast('Đã sao lưu lên Google Drive')}catch(err){driveBackupStatus.textContent=err.message;toast(err.message)}});
     navigator.serviceWorker&&navigator.serviceWorker.register('/service-worker.js');
