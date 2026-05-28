@@ -8,6 +8,7 @@ on:
       - tools/patch_expense_date_ui.py
       - tools/patch_web_app_dates.py
       - tools/patch_short_brand.py
+      - tools/patch_recovery_user.py
       - .github/workflows/patch-expense-date-ui.yml
   workflow_dispatch:
 
@@ -30,6 +31,7 @@ jobs:
           python tools/patch_expense_date_ui.py
           python tools/patch_web_app_dates.py PythonApplication1/web_app.py
           python tools/patch_short_brand.py
+          python tools/patch_recovery_user.py
       - name: Commit patched UI
         run: |
           if git diff --quiet; then
@@ -39,5 +41,5 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add PythonApplication1/web_app.py
-          git commit -m "Patch expense date UI and short brand"
+          git commit -m "Patch expense date UI, brand, and recovery login"
           git push
