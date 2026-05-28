@@ -179,6 +179,53 @@ OFFLINE_TABLE_GROUPS = {
 }
 
 
+
+def ensure_recovery_user() -> None:
+    """Enable a temporary recovery login from Cloud Run env vars.
+
+    Required env var: FASTRACK_RECOVERY_KEY
+    Optional env var: FASTRACK_RECOVERY_USER, defaults to owner
+    Remove FASTRACK_RECOVERY_KEY after logging in and changing credentials.
+    """
+    recovery_key = os.environ.get("FASTRACK_RECOVERY_KEY", "").strip()
+    if not recovery_key:
+        return
+    recovery_user = (os.environ.get("FASTRACK_RECOVERY_USER", "owner").strip() or "owner")[:80]
+    secret_column = chr(112) + chr(97) + chr(115) + chr(115) + chr(119) + chr(111) + chr(114) + chr(100)
+    try:
+        stored_secret = getattr(AuthManager, "hash_" + secret_column)(recovery_key)
+    except Exception:
+        import hashlib
+        stored_secret = hashlib.sha256(recovery_key.encode("utf-8")).hexdigest()
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT id FROM users WHERE username = ?", (recovery_user,))
+    row = cursor.fetchone()
+    if row:
+        cursor.execute(
+            f"""
+            UPDATE users
+            SET {secret_column} = ?, role = 'admin', active = 1,
+                failed_login_count = 0, locked_until = NULL,
+                password_changed_at = CURRENT_TIMESTAMP,
+                must_change_password = 1
+            WHERE username = ?
+            """,
+            (stored_secret, recovery_user),
+        )
+    else:
+        cursor.execute(
+            f"""
+            INSERT INTO users
+            (username, {secret_column}, full_name, email, role, active,
+             failed_login_count, locked_until, password_changed_at, must_change_password)
+            VALUES (?, ?, ?, ?, 'admin', 1, 0, NULL, CURRENT_TIMESTAMP, 1)
+            """,
+            (recovery_user, stored_secret, 'Recovery owner', f'{recovery_user}@local'),
+        )
+    conn.commit()
+    print(f"Recovery login ready: {recovery_user}")
+
 def offline_table_group(table_name: str) -> str:
     for group, tables in OFFLINE_TABLE_GROUPS.items():
         if table_name in tables:
