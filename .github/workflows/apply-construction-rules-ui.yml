@@ -1,0 +1,32 @@
+name: Apply construction rules UI
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - tools/apply_construction_rules_ui.py
+      - .github/workflows/apply-construction-rules-ui.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    if: github.actor != 'github-actions[bot]'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Apply construction rules UI patch
+        run: python tools/apply_construction_rules_ui.py
+      - name: Commit patched web app
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: Add construction accounting checklist UI
+          file_pattern: PythonApplication1/web_app.py
