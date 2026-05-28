@@ -3447,7 +3447,7 @@ INDEX_HTML = r"""<!doctype html>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <link rel="manifest" href="/manifest.json">
-  <title>FasTrack ERP Web</title>
+  <title>FT ERP</title>
   <style>
     :root{--bg:#f4f6f8;--panel:#fff;--ink:#172033;--muted:#667085;--line:#dde3ea;--brand:#1e3a5f;--accent:#0f766e;--warn:#b45309;--danger:#b42318;--good:#15803d;--soft:#eef6ff}
     body.dark{--bg:#0f172a;--panel:#111c32;--ink:#e5edf7;--muted:#9aa8bb;--line:#26354f;--brand:#60a5fa;--accent:#2dd4bf;--soft:#16233a}
@@ -3463,7 +3463,7 @@ INDEX_HTML = r"""<!doctype html>
 <body>
   <div class="authgate" id="authGate">
     <div class="loginbox">
-      <h2>Đăng nhập FasTrack ERP</h2>
+      <h2>Đăng nhập FT ERP</h2>
       <p class="muted">Dùng tài khoản nội bộ để vào bản web và ghi audit log.</p>
       <form id="loginForm">
         <label>Tài khoản<input name="username" autocomplete="username" required></label>
@@ -3473,10 +3473,10 @@ INDEX_HTML = r"""<!doctype html>
       <p class="muted">Liên hệ quản trị viên nếu cần cấp quyền truy cập.</p>
     </div>
   </div>
-  <div class="mobilebar"><strong>FasTrack ERP</strong><button id="menuBtn" title="Mở menu">☰</button></div>
+  <div class="mobilebar"><strong>FT ERP</strong><button id="menuBtn" title="Mở menu">☰</button></div>
   <div class="shell">
     <aside class="side" id="side">
-      <div class="brand"><span class="mark">FT</span><span>FasTrack ERP</span></div>
+      <div class="brand"><span class="mark">FT</span><span>FT ERP</span></div>
       <nav>
         <button class="navbtn active" data-view="dashboard">Tổng quan</button>
         <button class="navbtn" data-view="expenses">Chi phí</button>
@@ -3495,7 +3495,7 @@ INDEX_HTML = r"""<!doctype html>
     </aside>
     <main class="main">
       <div class="topbar">
-        <div><h1 id="pageTitle">Tổng quan</h1><div class="muted" id="subtitle">Quản trị chi phí, công trình, kho và chứng từ trên web.</div></div>
+        <div><h1 id="pageTitle">Tổng quan</h1><div class="muted" id="subtitle">Quản lý chi phí, kho, chứng từ.</div></div>
         <div class="actions"><span class="userchip" id="userChip">Chưa đăng nhập</span><button class="theme-toggle" id="themeBtn" title="Đổi giao diện" aria-label="Đổi giao diện"><i data-lucide="moon"></i></button><button class="secondary" id="logoutBtn">Đăng xuất</button><button class="secondary" id="refreshBtn">Tải lại</button><button class="primary cta" data-view-jump="expenses" data-view-path="/expenses/create" data-focus="expenseForm">Thêm chi phí</button></div>
       </div>
 
@@ -4251,13 +4251,13 @@ INDEX_HTML = r"""<!doctype html>
     async function api(url,options={}){const token=localStorage.getItem('fastrack_auth_token');options={...options,headers:{...(options.headers||{})}};if(token)options.headers.Authorization=`Bearer ${token}`;const r=await fetch(url,options);const data=await r.json();if(r.status===401){localStorage.removeItem('fastrack_auth_token');showLogin();throw new Error(data.error||'Cần đăng nhập')}if(!r.ok)throw new Error(data.error||'Có lỗi xảy ra');return data}
     function showLogin(){authGate.classList.remove('hidden')}
     function hideLogin(){authGate.classList.add('hidden')}
-    const viewTitles={dashboard:'Tổng quan',offlineData:'Đồng bộ dữ liệu',expenses:'Chi phí',inventory:'Vật tư kho',projects:'Dự án',projectAccounting:'Kế toán công trình',construction:'Công trường',documents:'Chứng từ',forms:'Biểu mẫu',reports:'Báo cáo',accounting:'Sổ sách kế toán',finance:'Kiểm soát & tài chính',security:'Bảo mật',settings:'Cài đặt',deploy:'Thiết lập web'};
+    const viewTitles={dashboard:'FT ERP',offlineData:'Đồng bộ dữ liệu',expenses:'Chi phí',inventory:'Vật tư kho',projects:'Dự án',projectAccounting:'Kế toán công trình',construction:'Công trường',documents:'Chứng từ',forms:'Biểu mẫu',reports:'Báo cáo',accounting:'Sổ sách kế toán',finance:'Kiểm soát & tài chính',security:'Bảo mật',settings:'Cài đặt',deploy:'Thiết lập web'};
     const viewRoutes={dashboard:'/',offlineData:'/settings/offline-data',expenses:'/expenses',inventory:'/inventory',projects:'/projects',projectAccounting:'/project-accounting',construction:'/construction',documents:'/documents',forms:'/forms',reports:'/reports',accounting:'/accounting',finance:'/finance',security:'/security',settings:'/settings',deploy:'/settings/domain'};
     const routeActions={'/documents/create':{view:'documents',focus:'documentForm'},'/projects/create':{view:'projects',focus:'projectForm'},'/expenses/create':{view:'expenses',focus:'expenseForm'},'/inventory/materials/create':{view:'inventory',focus:'materialForm'},'/inventory/transactions/create':{view:'inventory',focus:'inventoryTransactionForm'},'/project-accounting/contracts/create':{view:'projectAccounting',focus:'contractForm'},'/construction/site-intake/create':{view:'construction',focus:'siteIntakeForm'},'/construction/work-items/create':{view:'construction',focus:'workItemForm'},'/accounting/mappings':{view:'accounting',focus:'accountMappingForm'}};
     function routeActionForPath(path){return routeActions[path]||{view:Object.entries(viewRoutes).find(([,route])=>route===path)?.[0]||'offlineData'}}
     function routeAction(){const path=window.location.pathname.replace(/\/$/,'')||'/';if(path==='/offline-data')return{view:'offlineData',path:'/settings/offline-data'};if(path==='/deploy')return{view:'deploy',path:'/settings/domain'};return routeActions[path]||{view:Object.entries(viewRoutes).find(([,route])=>route===path)?.[0]||'dashboard'}}
     function focusPanel(id){if(!id)return;setTimeout(()=>{const el=document.getElementById(id);if(!el)return;el.scrollIntoView({behavior:'smooth',block:'start'});const input=el.querySelector('input,select,textarea,button');if(input)input.focus({preventScroll:true})},120)}
-    function switchView(id,options={}){document.querySelectorAll('.view').forEach(v=>v.classList.toggle('active',v.id===id));document.querySelectorAll('.navbtn').forEach(b=>b.classList.toggle('active',b.dataset.view===id));document.getElementById('pageTitle').textContent=viewTitles[id]||'FasTrack ERP';document.getElementById('side').classList.remove('open');if(options.push!==false){const path=options.path||viewRoutes[id]||'/';if(window.location.pathname!==path)history.pushState({view:id},'',path)}if(id==='offlineData'&&!state.offlineData)loadOfflineData();focusPanel(options.focus)}
+    function switchView(id,options={}){document.querySelectorAll('.view').forEach(v=>v.classList.toggle('active',v.id===id));document.querySelectorAll('.navbtn').forEach(b=>b.classList.toggle('active',b.dataset.view===id));document.getElementById('pageTitle').textContent=viewTitles[id]||'FT ERP';document.getElementById('side').classList.remove('open');if(options.push!==false){const path=options.path||viewRoutes[id]||'/';if(window.location.pathname!==path)history.pushState({view:id},'',path)}if(id==='offlineData'&&!state.offlineData)loadOfflineData();focusPanel(options.focus)}
     function applyRouteFromLocation(){const action=routeAction();switchView(action.view,{push:false,focus:action.focus});if(action.path&&window.location.pathname!==action.path)history.replaceState({view:action.view},'',action.path)}
     async function boot(){const me=await api('/api/auth/me');state.auth=me.user||null;if(!me.authenticated){showLogin();return}hideLogin();setUserChip(state.auth);await loadAll();applyRouteFromLocation()}
     async function loadAll(){await Promise.all([loadDashboard(),loadCatalogs(),loadExpenses(),loadApprovals(),loadInventory(),loadProjects(),loadProjectAccounting(),loadConstruction(),loadSiteIntake(),loadDocuments(),loadDocumentIntake(),loadForms(),loadReports(),loadAccounting(),loadFinance(),loadSettings(),loadUsers()])}
