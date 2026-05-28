@@ -1,0 +1,1 @@
+web: cd PythonApplication1 && mkdir -p /tmp/fastrack && if [ ! -f "${ACCOUNTING_DB_PATH:-/tmp/fastrack/accounting.db}" ] && [ -f data/accounting.db ]; then cp data/accounting.db "${ACCOUNTING_DB_PATH:-/tmp/fastrack/accounting.db}"; fi && gunicorn --bind :$PORT --workers 2 --threads 8 --timeout 120 'web_app:create_app()'
