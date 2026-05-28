@@ -1,0 +1,144 @@
+{
+  "version": "2026-05-28",
+  "name": "Construction accounting rules for FT ERP",
+  "cost_groups": [
+    {
+      "code": "MATERIALS",
+      "name": "Chi phí vật liệu trực tiếp",
+      "accounting_accounts": {
+        "debit": ["621", "154"],
+        "credit": ["111", "112", "331", "152"]
+      },
+      "required_documents": [
+        "Hợp đồng/đơn đặt hàng hoặc báo giá được duyệt",
+        "Hóa đơn GTGT hợp lệ",
+        "Phiếu nhập kho hoặc biên bản giao nhận tại công trình",
+        "Phiếu xuất kho cho công trình/hạng mục",
+        "Biên bản nghiệm thu khối lượng vật tư nếu giao thẳng công trình",
+        "Bảng phân bổ vật tư theo công trình/hạng mục"
+      ],
+      "tax_warnings": [
+        "Đối chiếu tên vật tư, đơn vị tính, số lượng giữa hóa đơn, phiếu nhập/xuất và nghiệm thu.",
+        "Nếu vật tư giao thẳng công trình cần chứng từ giao nhận tại hiện trường.",
+        "Kiểm tra nhà cung cấp có rủi ro hóa đơn, MST, trạng thái hoạt động."
+      ],
+      "suggested_controls": [
+        "Không cho hạch toán nếu thiếu công trình hoặc hạng mục.",
+        "Cảnh báo nếu đơn giá mua vượt định mức hoặc giá mua gần nhất.",
+        "Cảnh báo nếu xuất vật tư vượt dự toán còn lại."
+      ]
+    },
+    {
+      "code": "LABOR",
+      "name": "Chi phí nhân công trực tiếp",
+      "accounting_accounts": {
+        "debit": ["622", "154"],
+        "credit": ["334", "111", "112", "338"]
+      },
+      "required_documents": [
+        "Hợp đồng lao động hoặc hợp đồng giao khoán",
+        "Bảng chấm công theo công trình/hạng mục",
+        "Bảng lương hoặc bảng thanh toán khoán",
+        "Biên bản nghiệm thu khối lượng khoán nếu có",
+        "Chứng từ chi tiền hoặc ủy nhiệm chi",
+        "Hồ sơ khấu trừ thuế TNCN/BHXH nếu thuộc diện áp dụng"
+      ],
+      "tax_warnings": [
+        "Khoán cá nhân có thể phát sinh khấu trừ thuế TNCN theo từng trường hợp.",
+        "Cần thống nhất giữa hợp đồng, nghiệm thu, bảng thanh toán và chứng từ chi.",
+        "Không gom chi phí nhân công không rõ công trình/hạng mục."
+      ],
+      "suggested_controls": [
+        "Bắt buộc nhập người nhận tiền và căn cứ thanh toán.",
+        "Cảnh báo nếu thiếu bảng chấm công hoặc nghiệm thu khoán.",
+        "Theo dõi riêng lao động thời vụ, khoán đội, nhân sự nội bộ."
+      ]
+    },
+    {
+      "code": "MACHINE",
+      "name": "Chi phí máy thi công",
+      "accounting_accounts": {
+        "debit": ["623", "154"],
+        "credit": ["111", "112", "331", "152", "214", "334"]
+      },
+      "required_documents": [
+        "Hợp đồng thuê máy hoặc hồ sơ máy nội bộ",
+        "Nhật trình máy/ca máy",
+        "Phiếu cấp dầu hoặc hóa đơn nhiên liệu",
+        "Biên bản xác nhận khối lượng/giờ máy",
+        "Hóa đơn thuê máy nếu thuê ngoài",
+        "Bảng phân bổ chi phí máy theo công trình"
+      ],
+      "tax_warnings": [
+        "Chi phí dầu cần đối chiếu định mức tiêu hao và nhật trình máy.",
+        "Máy nội bộ cần phân bổ khấu hao, nhân công lái máy, nhiên liệu hợp lý.",
+        "Thuê máy cần đủ hợp đồng, nghiệm thu, hóa đơn, thanh toán."
+      ],
+      "suggested_controls": [
+        "Tạo định mức lít dầu/giờ máy hoặc lít/km.",
+        "Cảnh báo nếu chi phí dầu vượt định mức.",
+        "Tách máy thuê ngoài và máy sở hữu nội bộ."
+      ]
+    },
+    {
+      "code": "SUBCONTRACTOR",
+      "name": "Chi phí thầu phụ",
+      "accounting_accounts": {
+        "debit": ["627", "154", "632"],
+        "credit": ["331", "111", "112"]
+      },
+      "required_documents": [
+        "Hợp đồng thầu phụ",
+        "Dự toán/phụ lục phạm vi công việc",
+        "Biên bản nghiệm thu khối lượng hoàn thành",
+        "Biên bản xác nhận giá trị thanh toán",
+        "Hóa đơn GTGT",
+        "Hồ sơ bảo lãnh/bảo hành/giữ lại nếu có",
+        "Chứng từ thanh toán không dùng tiền mặt nếu thuộc diện bắt buộc"
+      ],
+      "tax_warnings": [
+        "Giá trị nghiệm thu, hóa đơn và thanh toán phải khớp theo từng đợt.",
+        "Theo dõi giữ lại bảo hành, tạm ứng và bù trừ công nợ.",
+        "Không ghi nhận vượt giá trị hợp đồng/phụ lục đã duyệt."
+      ],
+      "suggested_controls": [
+        "Cảnh báo nếu nghiệm thu vượt giá trị hợp đồng còn lại.",
+        "Theo dõi tạm ứng, thu hồi tạm ứng, giữ lại bảo hành.",
+        "Khóa thanh toán nếu thiếu hóa đơn hoặc nghiệm thu."
+      ]
+    },
+    {
+      "code": "OVERHEAD",
+      "name": "Chi phí chung công trình",
+      "accounting_accounts": {
+        "debit": ["627", "154"],
+        "credit": ["111", "112", "331", "334", "338", "242", "214"]
+      },
+      "required_documents": [
+        "Đề nghị thanh toán/đề xuất chi phí",
+        "Hóa đơn/chứng từ hợp lệ",
+        "Bảng phân bổ chi phí theo công trình nếu dùng chung",
+        "Quyết định/căn cứ phân bổ",
+        "Chứng từ thanh toán"
+      ],
+      "tax_warnings": [
+        "Chi phí dùng chung phải có tiêu thức phân bổ hợp lý và nhất quán.",
+        "Chi phí tiếp khách, công tác, văn phòng công trường cần đúng quy chế nội bộ.",
+        "Tránh đưa chi phí quản lý doanh nghiệp vào giá vốn công trình nếu không đủ căn cứ."
+      ],
+      "suggested_controls": [
+        "Bắt buộc chọn tiêu thức phân bổ nếu chi phí dùng chung.",
+        "Cảnh báo chi phí không có công trình nhưng chọn nhóm chi phí công trình.",
+        "Theo dõi chi phí chung theo tháng và theo công trình."
+      ]
+    }
+  ],
+  "reports": [
+    "Báo cáo chi phí theo công trình/hạng mục",
+    "So sánh dự toán - thực tế - còn lại",
+    "Bảng tổng hợp 621/622/623/627 theo công trình",
+    "Theo dõi tạm ứng và quyết toán tạm ứng",
+    "Theo dõi thầu phụ: hợp đồng - nghiệm thu - hóa đơn - thanh toán",
+    "Cảnh báo thiếu chứng từ theo từng khoản chi"
+  ]
+}
