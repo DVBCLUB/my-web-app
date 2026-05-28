@@ -3,7 +3,10 @@ name: Patch expense date UI
 on:
   push:
     branches:
-      - fix-expense-date-normalization
+      - main
+    paths:
+      - tools/patch_expense_date_ui.py
+      - .github/workflows/patch-expense-date-ui.yml
   workflow_dispatch:
 
 permissions:
@@ -16,7 +19,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: fix-expense-date-normalization
+          ref: main
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
