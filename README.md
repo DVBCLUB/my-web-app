@@ -18,6 +18,16 @@ Cloud Run chạy entrypoint:
 app:create_app()
 ```
 
+## CI hiện tại
+
+GitHub Actions chỉ dùng để kiểm tra chất lượng code:
+
+```text
+GitHub Actions -> make install-dev -> make preflight
+```
+
+CI không deploy. Deploy vẫn do Cloud Run source trigger xử lý.
+
 ## Cấu trúc hiện tại
 
 ```text
@@ -61,6 +71,12 @@ Rà repo có file lớn/module phình to:
 make audit
 ```
 
+Chạy kiểm tra chặt trước khi push/sửa lớn:
+
+```bash
+make preflight
+```
+
 Chạy smoke test nhanh:
 
 ```bash
@@ -94,8 +110,8 @@ make test
 ```text
 1. Không thêm workflow deploy trùng.
 2. Không thêm script patch tạm.
-3. Chạy make audit.
-4. Chạy make smoke.
-5. Dockerfile vẫn chạy app:create_app().
+3. Chạy make preflight.
+4. Dockerfile vẫn chạy app:create_app().
+5. GitHub CI xanh.
 6. Cloud Run revision xanh sau deploy.
 ```
