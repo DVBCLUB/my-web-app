@@ -4,7 +4,25 @@ Keep Docker/Cloud Run pointing here. During refactor, this module stays stable
 while code is gradually moved out of web_app.py into smaller modules.
 """
 
-from web_app import create_app
+from web_app import create_app as create_legacy_app
+
+
+def create_app():
+    """Create the Flask app and register extracted blueprints.
+
+    web_app.py remains the legacy monolith for now. New or extracted routes
+    should be registered here so the monolith can shrink safely over time.
+    """
+    app = create_legacy_app()
+    try:
+        from routes.system_routes import system_bp
+
+        app.register_blueprint(system_bp)
+    except ValueError:
+        # Legacy web_app.py may still define the same routes during migration.
+        # Keep deploys safe; the duplicate legacy routes continue to work.
+        pass
+    return app
 
 
 __all__ = ["create_app"]
