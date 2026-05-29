@@ -1,13 +1,56 @@
+# Git / editor state
 .git
-.venv
+.github
 .vs
 .vscode
+.idea
+
+# Python local/runtime files
+.venv
+venv
 **/__pycache__/
-**/*.pyc
+**/*.py[cod]
+**/*.pyo
+**/.pytest_cache/
+.pytest_cache
+.coverage
+htmlcov
+
+# Local env/secrets
+.env
+.env.*
+*.local
+
+# SQLite runtime sidecars and local copies
 PythonApplication1/data/*.db-shm
 PythonApplication1/data/*.db-wal
+PythonApplication1/data/*.sqlite-shm
+PythonApplication1/data/*.sqlite-wal
+
+# Generated/runtime outputs
 PythonApplication1/logs/
 PythonApplication1/backups/
+PythonApplication1/output/
 PythonApplication1/reports/
 PythonApplication1/documents/generated_forms/
+PythonApplication1/generated/
+PythonApplication1/tmp/
+
+# Large user/export files should not be baked into image
+*.bak
+*.backup
+*.tmp
+*.log
+*.zip
+*.rar
+*.7z
+*.xlsx
+*.xlsm
+*.xls
+*.docx
+*.pdf
+
+# OS shortcuts/cache
+.DS_Store
+Thumbs.db
 FasTrack ERP.lnk
