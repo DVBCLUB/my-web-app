@@ -5,22 +5,26 @@ Add new route modules here instead of growing app.py or web_app.py.
 
 from __future__ import annotations
 
-from flask import Flask
+from importlib import import_module
+from typing import Iterable
+
+from flask import Blueprint, Flask
 
 
-def iter_blueprints():
+BLUEPRINT_IMPORTS: tuple[tuple[str, str], ...] = (
+    ("routes.system_routes", "system_bp"),
+    ("routes.construction_rules_routes", "construction_rules_bp"),
+)
+
+
+def iter_blueprints() -> Iterable[Blueprint]:
     """Yield blueprints that have been extracted from the legacy monolith."""
-    try:
-        from routes.system_routes import system_bp
-        yield system_bp
-    except Exception:
-        pass
-
-    try:
-        from routes.construction_rules_routes import construction_rules_bp
-        yield construction_rules_bp
-    except Exception:
-        pass
+    for module_name, attr_name in BLUEPRINT_IMPORTS:
+        try:
+            module = import_module(module_name)
+            yield getattr(module, attr_name)
+        except Exception:
+            continue
 
 
 def register_blueprints(app: Flask) -> None:
