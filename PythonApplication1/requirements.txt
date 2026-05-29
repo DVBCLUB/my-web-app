@@ -13,5 +13,3 @@ pypdf==3.17.0
 pytesseract==0.3.10
 pypdfium2==5.8.0
 bcrypt==4.0.1
-pytest==7.4.3
-pytest-cov==4.1.0
