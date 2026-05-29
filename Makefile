@@ -1,14 +1,18 @@
-.PHONY: help audit test smoke install-dev
+.PHONY: help audit audit-strict test smoke install-dev
 
 help:
 	@echo "FT ERP maintenance commands"
-	@echo "  make audit       - scan large files and large Python modules"
-	@echo "  make test        - run pytest from repository root"
-	@echo "  make smoke       - run minimal smoke tests only"
-	@echo "  make install-dev - install development/test requirements"
+	@echo "  make audit        - scan large files and large Python modules"
+	@echo "  make audit-strict - fail if unexpected oversized files/modules appear"
+	@echo "  make test         - run pytest from repository root"
+	@echo "  make smoke        - run minimal smoke tests only"
+	@echo "  make install-dev  - install development/test requirements"
 
 audit:
 	python tools/repo_audit.py
+
+audit-strict:
+	python tools/repo_audit.py --fail-on-large
 
 test:
 	pytest
