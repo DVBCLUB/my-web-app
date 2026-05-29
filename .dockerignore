@@ -5,6 +5,13 @@
 .vscode
 .idea
 
+# Dev-only repo files not needed in Cloud Run image
+docs/
+tools/
+pytest.ini
+PythonApplication1/tests/
+PythonApplication1/requirements-dev.txt
+
 # Python local/runtime files
 .venv
 venv
