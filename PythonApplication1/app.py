@@ -14,14 +14,24 @@ def create_app():
     should be registered here so the monolith can shrink safely over time.
     """
     app = create_legacy_app()
+    extracted_blueprints = []
     try:
         from routes.system_routes import system_bp
-
-        app.register_blueprint(system_bp)
-    except ValueError:
-        # Legacy web_app.py may still define the same routes during migration.
-        # Keep deploys safe; the duplicate legacy routes continue to work.
+        extracted_blueprints.append(system_bp)
+    except Exception:
         pass
+    try:
+        from routes.construction_rules_routes import construction_rules_bp
+        extracted_blueprints.append(construction_rules_bp)
+    except Exception:
+        pass
+    for blueprint in extracted_blueprints:
+        try:
+            app.register_blueprint(blueprint)
+        except ValueError:
+            # Legacy web_app.py may still define the same routes during migration.
+            # Keep deploys safe; the duplicate legacy routes continue to work.
+            pass
     return app
 
 
