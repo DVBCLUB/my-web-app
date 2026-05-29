@@ -6,10 +6,9 @@ monolith and makes it reusable by future frontend modules.
 
 from __future__ import annotations
 
-import json
-from pathlib import Path
-
 from flask import Blueprint, jsonify
+
+from modules.construction_rules import find_cost_group, load_construction_accounting_rules
 
 
 construction_rules_bp = Blueprint("construction_rules", __name__)
@@ -17,7 +16,12 @@ construction_rules_bp = Blueprint("construction_rules", __name__)
 
 @construction_rules_bp.get("/api/construction-accounting/rules")
 def construction_accounting_rules():
-    data_path = Path(__file__).resolve().parents[1] / "data" / "construction_accounting_rules.json"
-    if not data_path.exists():
-        return jsonify({"version": "missing", "cost_groups": [], "reports": []})
-    return jsonify(json.loads(data_path.read_text(encoding="utf-8")))
+    return jsonify(load_construction_accounting_rules())
+
+
+@construction_rules_bp.get("/api/construction-accounting/rules/<code>")
+def construction_accounting_rule_detail(code: str):
+    group = find_cost_group(code)
+    if not group:
+        return jsonify({"error": "Không tìm thấy nhóm quy tắc"}), 404
+    return jsonify(group)
