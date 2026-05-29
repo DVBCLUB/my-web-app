@@ -1,20 +1,52 @@
+# Python cache/test artifacts
 __pycache__/
+**/__pycache__/
 *.py[cod]
 *$py.class
-
 .pytest_cache/
 .coverage
 htmlcov/
 
-PythonApplication1/logs/*.log
-PythonApplication1/backups/
-PythonApplication1/output/
-PythonApplication1/reports/
-
+# Virtual environments / env files
 .env
+.env.*
 .venv/
 venv/
 
+# Editor/OS files
+.vs/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.lnk
+
+# Logs and runtime outputs
+*.log
+PythonApplication1/logs/
+PythonApplication1/backups/
+PythonApplication1/output/
+PythonApplication1/reports/
+PythonApplication1/generated/
+PythonApplication1/tmp/
+PythonApplication1/documents/generated_forms/
+
+# SQLite sidecars generated at runtime
+*.db-shm
+*.db-wal
+*.sqlite-shm
+*.sqlite-wal
+
+# Exported/temporary office files
+*.bak
+*.backup
+*.tmp
+~$*
+*.zip
+*.rar
+*.7z
+
+# Node/Firebase local state
 node_modules/
 firebase-debug.log
 .firebase/
