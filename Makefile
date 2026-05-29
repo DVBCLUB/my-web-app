@@ -1,9 +1,10 @@
-.PHONY: help audit audit-strict test smoke install-dev
+.PHONY: help audit audit-strict preflight test smoke install-dev
 
 help:
 	@echo "FT ERP maintenance commands"
 	@echo "  make audit        - scan large files and large Python modules"
 	@echo "  make audit-strict - fail if unexpected oversized files/modules appear"
+	@echo "  make preflight    - run audit-strict and smoke tests"
 	@echo "  make test         - run pytest from repository root"
 	@echo "  make smoke        - run minimal smoke tests only"
 	@echo "  make install-dev  - install development/test requirements"
@@ -13,6 +14,9 @@ audit:
 
 audit-strict:
 	python tools/repo_audit.py --fail-on-large
+
+preflight:
+	python tools/preflight.py
 
 test:
 	pytest
